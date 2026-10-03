@@ -51,10 +51,12 @@ export async function indexVault(db: pg.Pool, vault: string) {
     const { fm, body } = own ? parseNote(raw) : { fm: {} as Fm, body: raw };
     const rel = relative(vault, path).replace(/\\/g, '/');
     const title = basename(path, '.md');
-    const ts = st.mtime.toISOString();
+    // daily/ notes (daily.ts): sources.kind 'daily' → ranked below chats (search.ts tier −1), dated by their day, not the 03:30 write
+    const daily = own && fmStr(fm.memhub) === 'daily';
+    const ts = (daily && isoOr(fmStr(fm.valid_at), null)) || st.mtime.toISOString();
     const uuid = 'obs:' + createHash('sha256').update(path).digest('hex').slice(0, 24);
     await store(db, {
-      tool: 'obsidian', path, kind: 'note', sessionId: `${name}/${rel}`, project,
+      tool: 'obsidian', path, kind: daily ? 'daily' : 'note', sessionId: `${name}/${rel}`, project,
       size: st.size, mtimeMs: st.mtimeMs, sha256: createHash('sha256').update(raw).digest('hex'),
       label: name, replace: true,
     }, [{ uuid, parentUuid: null, seq: 0, role: 'note', ts, text: clean(`# ${title}\n${body}`) }],

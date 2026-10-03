@@ -2,6 +2,7 @@
 //  - words list: candidates = chunks containing any RARE query term, scored by Σ IDF of matched terms (BM25-lite)
 //  - bigram list: short Thai/digit runs as exact phrases (ภ.ง.ด.53, ภงด, short words ICU mangles)
 //  - vector list: bge-m3 cosine via HNSW (skipped if Ollama is down → keyword-only, never an error)
+// then priors and a soft boost for relative time in the query (timeWindow)
 import type pg from 'pg';
 import { embedQuery, toVec } from './embed.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
@@ -13,15 +14,17 @@ export type Hit = {
   uses: number; last: Date | null; status: string | null;                                     // recalls by distinct sessions
   fid: string | null; kind: string | null; fact_project: string | null; superseded_by: string | null; review_target: string | null;
   changed_to: string[] | null;                                     // raw chat whose fact was later superseded: the current end(s) of the chain
-  src_kind: string;                        // main | subagent | headless | note | doc
+  src_kind: string;                        // main | subagent | headless | note | daily | doc
   tool: string;                            // claude | codex | … | obsidian | github
   ev_of: string[] | null;                  // raw chat: ids of candidate facts distilled from its turns
   evidence?: Hit[];                        // fact: its source chat chunks among the results (shown under it, no slot of their own)
 };
 export type Result = { hits: Hit[]; semantic: boolean }; // semantic=false → vector leg skipped (keyword-only)
 // before: hide chunks newer than this (the caller's own live session is already in its context).
-export type SearchOpts = { project?: string; since?: string; limit?: number; currentProject?: string; before?: Date; semantic?: boolean; perSession?: number;
+// since/until: ISO dates (dateRange), a hard filter in every leg.
+export type SearchOpts = { project?: string; since?: string; until?: string; limit?: number; currentProject?: string; before?: Date; semantic?: boolean; perSession?: number;
   tier?: number;      // priority boost τ (default RANK.tier); dream's neighbour lookup passes 0 = pure similarity
+  now?: Date;         // anchor of relative time in the query (timeWindow); default before ?? now (eval: the frozen clock)
   showPrivate?: boolean }; // include PRIVATE_TOOLS (Gmail/Docs/Maps timeline): only for a caller guard.privateOk allows
 
 const EMBED_TIMEOUT_MS = 300; // hot path: GPU busy → keyword-only rather than stall Claude (a cold model is waited for: embedQuery)
@@ -35,7 +38,8 @@ const PER_SESSION = 3;       // diversity: a long session must not fill every sl
 //   p_imp = 1 for pinned / rule / feedback facts, (importance−1)/9 for other facts, 0 for raw chats/notes/cards
 //   status: superseded ×0.5, pending ×0.8, rejected excluded.  Design + sources: docs/research/phase4-design.md §2
 //   tier (priority order, ลุงจืด 2026-10-02): rule/feedback/pinned/hand-saved +2 · other facts +1 · cards, chats of any app
-//     and kind, GitHub docs (repo card/commits/issues), Obsidian notes, superseded facts 0.  τ = 0.1 → ×1.21: a chat found by more legs still wins.  Eval (tune split):
+//     and kind, GitHub docs (repo card/commits/issues), Obsidian notes, superseded facts 0 · daily notes −1 (daily.ts: a
+//     digest of chats already indexed; tier 0 let it take slots from the chats it lists).  τ = 0.1 → ×1.21: a chat found by more legs still wins.  Eval (tune split):
 //     boosting cards pushed the exact turn below its session summary; boosting OLD facts put more of them in the top 10;
 //     down-weighting subagent/headless runs (−1/−2) lost 3 of 10 questions whose answer lives in such a run.
 //   curated slot: the best active non-card fact among the top 24 rows scoring ≥ slotRatio × the top result moves up to
@@ -55,6 +59,7 @@ export const RANK = {
   pending: 0.8,
   slot: Number(process.env.MEMHUB_RANK_SLOT ?? 2),
   slotRatio: Number(process.env.MEMHUB_RANK_SLOT_RATIO ?? 0.5),
+  daily: Number(process.env.MEMHUB_RANK_DAILY ?? -1),         // tier of daily notes (daily.ts): below chats
   foldDup: Number(process.env.MEMHUB_RANK_FOLD_DUP ?? 0.5), // a source chat repeating ≥ this share of its fact (char 5-grams) folds
 };
 
@@ -62,7 +67,7 @@ const LATIN = /^[a-z][a-z0-9_]{2,}$/;
 const RARE_FRACTION = 0.05; // terms in >5% of chunks don't select candidates (they still add score)
 
 // Keyword legs, run while Ollama embeds the query: $1 words tsquery, $2 bigram tsquery, $3 project, $4 since, $5 before,
-// $6/$7 every query term's tsquery / IDF, $8 tools to hide.
+// $6/$7 every query term's tsquery / IDF, $8 tools to hide, $9 until (exclusive end: dateRange).
 const PF = `pf AS (SELECT source_id FROM facts WHERE $3::text IS NOT NULL AND (project LIKE '%' || $3 || '%' OR scope = 'global'))`;
 // hidden sources (PRIVATE_TOOLS for a non-Claude caller) leave every leg, so they never take one of its 60 candidate slots
 const HIDE = (p: string) => `hide AS (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY(${p}::text[]))`; // hide_as: importer.indexFile
@@ -73,20 +78,21 @@ w AS (
     SELECT id, ts, (SELECT sum(x.idf) FROM unnest($6::tsquery[], $7::float8[]) x(q, idf) WHERE words @@ x.q) s
     FROM chunks
     WHERE $1::text IS NOT NULL AND words @@ $1::tsquery
-      AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5)
+      AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
       AND source_id NOT IN (SELECT id FROM hide)
   ) z ORDER BY r LIMIT 60),
 b AS (
   SELECT id, row_number() OVER (ORDER BY ts_rank_cd(bigrams, $2::tsquery, 1) DESC, ts DESC) r
   FROM chunks
   WHERE $2::text IS NOT NULL AND bigrams @@ $2::tsquery
-    AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5)
+    AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
     AND source_id NOT IN (SELECT id FROM hide)
   ORDER BY r LIMIT 60)
 SELECT 'w' leg, id, r FROM w UNION ALL SELECT 'b', id, r FROM b`;
 
 // Vector leg + RRF + priors. The keyword legs come in as (id, rank) arrays in the slots SQL_KEYWORD's own inputs had:
-// $1/$2 words, $8/$9 bigrams; $15 tools to hide (the keyword legs already left them out).
+// $1/$2 words, $8/$9 bigrams; $15 tools to hide (the keyword legs already left them out); $16-$19 timeWindow() boost, $20 the daily-note tier;
+// $21 until: filter only — $7 (before) stays the recency anchor, so a date range never re-ranks by age.
 const SQL = `
 WITH ${PF}, ${HIDE('$15')},
 w AS (SELECT * FROM unnest($1::text[], $2::bigint[]) x(id, r)),
@@ -96,6 +102,7 @@ v AS (
     SELECT id, embedding <=> $10::halfvec d FROM chunks
     WHERE $10::text IS NOT NULL AND embedding IS NOT NULL
       AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($7::timestamptz IS NULL OR ts < $7)
+      AND ($21::timestamptz IS NULL OR ts < $21)
       AND source_id NOT IN (SELECT id FROM hide)
     ORDER BY embedding <=> $10::halfvec LIMIT 60) s),
 f AS (SELECT id, sum(1.0 / (60 + r)) s FROM (SELECT * FROM w UNION ALL SELECT * FROM b UNION ALL SELECT * FROM v) x GROUP BY id),
@@ -106,7 +113,7 @@ x AS (
   SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header AS header, c.text, c.source_id, c.seq_from, c.seq_to, s.status, s.tool,
          s.kind src_kind, coalesce(u.n, 0)::int uses, u.last, fa.fid, fa.kind, fa.project fact_project, fa.superseded_by, fa.review_target,
          fa.source_uuids, f.s rrf,
-         CASE WHEN fa.fid IS NULL OR fa.kind = 'card' OR s.status = 'superseded' THEN 0
+         CASE WHEN s.kind = 'daily' THEN $20::float8 WHEN fa.fid IS NULL OR fa.kind = 'card' OR s.status = 'superseded' THEN 0
               WHEN fa.pinned OR fa.user_owned OR fa.run IS NULL OR fa.kind IN ('rule', 'feedback') THEN 2 ELSE 1 END tier,
          CASE WHEN $5::text <> '' AND (c.project = $5 OR fa.project = $5) THEN 1.3 ELSE 1 END proj,
          greatest(extract(epoch FROM coalesce($7, now()) - greatest(c.ts, u.last)) / 86400, 1.0 / 24) t1,
@@ -117,8 +124,10 @@ x AS (
   LEFT JOIN u ON u.id = c.id LEFT JOIN facts fa ON fa.source_id = c.source_id
   WHERE s.status IS DISTINCT FROM 'rejected'),
 y AS (SELECT x.*, rrf * proj * (1 + $11::float8 * (1 - (1 - sa / (sa + 1)) * (1 - p_imp)))
-                  * CASE status WHEN 'superseded' THEN $12::float8 WHEN 'pending' THEN $13::float8 ELSE 1 END base
-      FROM (SELECT x.*, power(t1, -0.5) + CASE WHEN uses > 0 AND tn > t1 THEN 2 * uses / (sqrt(tn) + sqrt(t1)) ELSE 0 END sa FROM x) x),
+                  * CASE status WHEN 'superseded' THEN $12::float8 WHEN 'pending' THEN $13::float8 ELSE 1 END
+                  * CASE WHEN ts >= $16 AND ts < $17 THEN 1 + $18::float8 ELSE 1 END * (1 + $19::float8 * (1 - pr)) base -- timeWindow()
+      FROM (SELECT x.*, power(t1, -0.5) + CASE WHEN uses > 0 AND tn > t1 THEN 2 * uses / (sqrt(tn) + sqrt(t1)) ELSE 0 END sa,
+                   percent_rank() OVER (ORDER BY ts DESC NULLS LAST) pr FROM x) x),
 ev AS (  -- candidate raw chat → the best candidate active fact distilled from its turns (one per chat: no sibling lift)
   SELECT DISTINCT ON (ry.id) fy.id fact_id, ry.id raw_id, ry.base FROM y fy CROSS JOIN unnest(fy.source_uuids) su(uuid) JOIN turns t ON t.uuid = su.uuid
   JOIN y ry ON ry.source_id = t.source_id AND t.seq BETWEEN ry.seq_from AND ry.seq_to AND ry.fid IS NULL AND ry.tool <> 'obsidian'
@@ -140,9 +149,30 @@ FROM z y
 ORDER BY score DESC, tier DESC, y.ts DESC
 LIMIT $6`;
 
+const ISO = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+/** since/until → SQL bounds, or a clear error (a pg cast error says nothing to the calling AI). A value without a zone is
+ *  ลุงจืด's day/clock (Asia/Bangkok, like timeWindow, daily and lint), not pg's session zone (UTC): he works past midnight.
+ *  A date-only until is inclusive: ts < the next local midnight. Date part only for since ≤ until. */
+export function dateRange(since?: string, until?: string): { since: string | null; until: string | null } {
+  for (const [k, x] of [['since', since], ['until', until]]) {
+    const d = x?.slice(0, 10) ?? '';
+    if (x && (x.length > 30 || !ISO.test(x) || Number.isNaN(Date.parse(x)) || new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) !== d)) {
+      throw new Error(`${k} must be an ISO date like 2026-09-01 (got ${JSON.stringify(x.slice(0, 30))})`);
+    }
+  }
+  if (since && until && since.slice(0, 10) > until.slice(0, 10)) throw new Error(`since ${since} is after until ${until}`);
+  const end = until && until.length === 10 ? new Date(Date.parse(`${until}T00:00:00Z`) + 864e5).toISOString().slice(0, 10) : until;
+  const local = (x?: string) => !x ? null : /(?:Z|[+-]\d{2}:?\d{2})$/.test(x.slice(10)) ? x : `${x.length === 10 ? `${x}T00:00:00` : x}+07:00`;
+  return { since: local(since), until: local(end) };
+}
+
 export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Promise<Result> {
+  const { since, until } = dateRange(o.since, o.until); // first: bad input fails before the embedder or the DB is asked
   const limit = Math.min(Math.max(o.limit ?? 6, 1), 20); // MCP schema caps callers at 8; eval uses up to 20
-  const terms = queryTerms(query);
+  // tier 0 = dream's similarity-only neighbour lookup: no time boost, terms untouched
+  const tw = o.tier === 0 ? { recent: false, rest: query } : timeWindow(query, o.now ?? o.before ?? new Date());
+  let kq = tw.rest, terms = queryTerms(kq);
+  if (!terms.length) terms = queryTerms((kq = query)); // only a time phrase ('เมื่อวานทำอะไร'): keep its words, as before
   const vec = o.semantic === false ? null : embedQuery(query, EMBED_TIMEOUT_MS).then((e) => e && toVec(e));
   // One round trip: corpus size, document frequencies, and English stems (redaction → redact:* also finds redacted).
   // Corpus stats leave PRIVATE_TOOLS out (here and in term_df): Claude-only data never shifts another app's ranking.
@@ -167,15 +197,15 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   if (!cand.length) cand = [...scored].sort((a, b) => a.df - b.df).slice(0, 3);
   const wq = cand.length ? cand.map((t) => t.lit).join(' | ') : null;
 
-  const project = o.project?.toLowerCase() || null, since = o.since || null, before = o.before ?? null;
+  const project = o.project?.toLowerCase() || null, before = o.before ?? null;
   const hide = o.showPrivate ? [] : [...PRIVATE_TOOLS];
-  const [legs, v] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(query), project, since, before,
-    scored.map((t) => t.lit), scored.map((t) => t.idf), hide]), vec]);
+  const [legs, v] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(kq), project, since, before,
+    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until]), vec]);
   const w = legs.rows.filter((r) => r.leg === 'w'), b = legs.rows.filter((r) => r.leg === 'b');
   const rows = (await db.query(SQL, [
     w.map((r) => r.id), w.map((r) => r.r), project, since, o.currentProject ?? '', Math.max(limit, 8) * 3, // ≥ 24 rows: same curated slot at every limit
     before, b.map((r) => r.id), b.map((r) => r.r), v,
-    RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide,
+    RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide, tw.from ?? null, tw.to ?? null, tw.from ? T_WIN : 0, tw.recent ? T_REC : 0, RANK.daily, until,
   ])).rows;
   const ci = rows.slice(0, 24).findIndex((r) => r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active');
   if (ci >= RANK.slot && Number(rows[ci].score) >= RANK.slotRatio * Number(rows[0].score)) rows.splice(RANK.slot - 1, 0, ...rows.splice(ci, 1));
@@ -195,6 +225,61 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     hits.push({ ...r, score: Number(r.score) });
   }
   return { hits, semantic: v !== null };
+}
+
+// Relative time → a soft boost on the fused rows (never a filter): ts in the window ×(1 + T_WIN); recency words ×(1 + T_REC·(1 −
+// percent_rank by ts desc)). Anchor = o.now ?? o.before ?? now. Relative phrases leave the keyword terms (วาน,
+// ปี, เดือน were junk "rare" terms); month names and years stay (dated text spells them; stripping them too cost the private
+// set 1 q @1). The MCP anchors at the real now (o.now); its before = server start only hides its own session.
+const T_WIN = 0.2, T_REC = 0.2; // eval (tune): fine time=relative direct@1 +2 q; 0.4 / 0.4 the same @1, −1 q @10
+const TZ = 7 * 3600e3; // ลุงจืด's local day: Asia/Bangkok, no DST
+const TH_MONTH = 'มกรา กุมภา มีนา เมษา พฤษภา มิถุนา กรกฎา สิงหา กันยา ตุลา พฤศจิกา ธันวา'.split(' '); // + คม/ยน/พันธ์ = full name
+const TH_MON = 'ม.ค. ก.พ. มี.ค. เม.ย. พ.ค. มิ.ย. ก.ค. ส.ค. ก.ย. ต.ค. พ.ย. ธ.ค.'.split(' ');
+const MON = TH_MON.join('|').replace(/\./g, '\\.');
+const EN_MONTH = 'january february march april may june july august september october november december'.split(' ');
+const NUM: Record<string, number> = { หนึ่ง: 1, สอง: 2, สาม: 3, สี่: 4, ห้า: 5, หก: 6, a: 1, one: 1, two: 2, three: 3 };
+// English time words only as whole words: never inside an identifier, path or URL (calculateStatement, latest_buy_impulse, posttoday.com)
+const W = (s: string) => String.raw`(?<![\w.:/-])(?:${s})(?![\w.:/-])`;
+const YEAR = String.raw`(?:\s*(?:ปี|พ\.ศ\.|ค\.ศ\.)?\s*((?:20|25)\d\d)|(?=\s*ปี\s*(นี้|ที่แล้ว|ก่อน)))?`; // มกราปีนี้: the month of that year
+// ตุลาการ (judiciary) is no month; an abbreviation (ก.พ. = also the civil service office) only next to a day/year number or เดือน
+const MONTH_RE = new RegExp(String.raw`(?:(?:ต้น|กลาง|ปลาย)?เดือน\s*)?(?:(${TH_MONTH.join('|').replace('ตุลา', 'ตุลา(?!การ)')})(?:คม|ยน|พันธ์)?`
+  + String.raw`|(?:(?<=\d\s*|เดือน\s*)|(?=(?:${MON})\s*\d))(${MON})`
+  + String.raw`|\b(${EN_MONTH.join('|')})\b(?=\s*\d)|\b(${EN_MONTH.filter((x) => x !== 'may').join('|')})\b)` + YEAR);
+const AGO_RE = new RegExp(String.raw`(?<![\w.])(\d+|${Object.keys(NUM).join('|')})\s*(?:(วัน|สัปดาห์|อาทิตย์|เดือน|ปี)\s*(?:ที่แล้ว|ก่อน)|${W(String.raw`(day|week|month|year)s?\s+ago`)})`);
+const ce = (y: string) => (Number(y) > 2400 ? Number(y) - 543 : Number(y)); // พ.ศ. → ค.ศ.
+export function timeWindow(q: string, now: Date): { from?: Date; to?: Date; recent: boolean; rest: string } {
+  let rest = q, from: Date | undefined, to: Date | undefined; // not lower-cased: words() splits camelCase identifiers
+  const L = new Date(now.getTime() + TZ), y = L.getUTCFullYear(), m = L.getUTCMonth(), d = L.getUTCDate(), dow = (L.getUTCDay() + 6) % 7;
+  const at = (yy: number, mm: number, dd: number) => new Date(Date.UTC(yy, mm, dd) - TZ); // local midnight
+  const take = (re: RegExp, f: (x: string[]) => [Date, Date] | undefined, strip = true) => {
+    const x = rest.match(new RegExp(re.source, 'i')); if (!x) return;
+    if (!from) [from, to] = f(x.map((g) => g?.toLowerCase())) ?? []; // the first phrase wins; a matched relative phrase leaves the terms,
+    if (strip) rest = rest.replace(x[0], ` ${x.slice(1).filter((g) => /^\d{4}$/.test(g ?? '')).join(' ')} `); // except a year (ภาษีปี 2568)
+  };
+  const REC = new RegExp(`ครั้งก่อน|ครั้งที่แล้ว|ครั้งล่าสุด|ล่าสุด|${W('last time|latest|recently|most recent')}`, 'gi');
+  const recent = REC.test(rest);
+  rest = rest.replace(REC, ' ');
+  const k01 = (x: string[]) => (x[1] === 'นี้' || x[2] === 'this' ? 0 : 1);
+  take(AGO_RE, (x) => { // N units ago → that unit ±1 (soft)
+    const k = NUM[x[1]] ?? Number(x[1]), u = x[2] ?? x[3];
+    if (k > 200) return; // '99999999999 days ago' would be an Invalid Date (pg rejects it)
+    return u === 'วัน' || u === 'day' ? [at(y, m, d - k - 1), at(y, m, d - k + 2)]
+      : u === 'เดือน' || u === 'month' ? [at(y, m - k - 1, 1), at(y, m - k + 2, 1)]
+        : u === 'ปี' || u === 'year' ? [at(y - k, 0, 1), at(y - k + 1, 0, 1)] : [at(y, m, d - 7 * k - 7), at(y, m, d - 7 * k + 7)];
+  });
+  take(/เมื่อวานซืน/, () => [at(y, m, d - 2), at(y, m, d - 1)]);
+  take(new RegExp(`เมื่อวาน|${W('yesterday')}`), () => [at(y, m, d - 1), at(y, m, d)]);
+  take(new RegExp(`วันนี้|${W('today')}`), () => [at(y, m, d), at(y, m, d + 1)]);
+  take(MONTH_RE, (x) => {
+    const mm = x[1] ? TH_MONTH.indexOf(x[1]) : x[2] ? TH_MON.indexOf(x[2]) : EN_MONTH.indexOf(x[3] ?? x[4]);
+    const yy = x[5] ? ce(x[5]) : x[6] ? y - k01([, x[6]] as string[]) : mm <= m ? y : y - 1; // no year: the latest such month
+    return [at(yy, mm, 1), at(yy, mm + 1, 1)];
+  }, false); // month names stay terms: dated text (timeline, notes) spells them out
+  take(new RegExp(`(?:สัปดาห์|อาทิตย์)\\s*(นี้|ที่แล้ว|ก่อน)|${W('(this|last) week')}`), (x) => [at(y, m, d - dow - 7 * k01(x)), at(y, m, d - dow - 7 * k01(x) + 7)]);
+  take(new RegExp(`เดือน\\s*(นี้|ที่แล้ว|ก่อน)|${W('(this|last) month')}`), (x) => [at(y, m - k01(x), 1), at(y, m - k01(x) + 1, 1)]);
+  take(new RegExp(`ปี\\s*(นี้|ที่แล้ว|ก่อน)|${W('(this|last) year')}`), (x) => [at(y - k01(x), 0, 1), at(y - k01(x) + 1, 0, 1)]);
+  take(/(?:ปี|พ\.ศ\.|ค\.ศ\.|\bin)\s*((?:20|25)\d\d)\b/, (x) => [at(ce(x[1]), 0, 1), at(ce(x[1]) + 1, 0, 1)]);
+  return { from, to, recent, rest };
 }
 
 /** Share of a's character 5-grams (whitespace dropped, normalized) that also occur in b — Thai has no word spaces. */
@@ -241,7 +326,7 @@ export const privateLabel = (h: Pick<Hit, 'tool' | 'project' | 'session_id'>) =>
 /** `[id] 2026-09-12 19d proj-a | decision cur | used 7x, last 2d` — old vs new and how often it was recalled. */
 export function hitLine(h: Hit, now = Date.now()): string {
   const proj = projectName(h.fact_project ?? h.project ?? '') || 'global';
-  let what = h.kind ? (h.kind === 'card' ? 'session card' : h.kind) : PRIVATE_TOOLS.has(h.tool) ? privateLabel(h) : h.project?.startsWith('obsidian/') ? 'note'
+  let what = h.kind ? (h.kind === 'card' ? 'session card' : h.kind) : PRIVATE_TOOLS.has(h.tool) ? privateLabel(h) : h.project?.startsWith('obsidian/') ? (h.src_kind === 'daily' ? 'daily note' : 'note')
     : h.tool === 'github' ? `github ${/#\d+$/.test(h.session_id) ? 'issue/PR' : h.session_id.endsWith(':commits') ? 'commits' : 'repo'}`
     : h.src_kind === 'subagent' || h.src_kind === 'headless' ? `${h.src_kind} chat` : 'chat';
   if (h.status === 'superseded') what += ` OLD -> [${h.superseded_by ?? '?'}]`;

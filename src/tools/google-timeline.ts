@@ -55,6 +55,19 @@ export function sync(archiveDir: string): Record<string, number | string> {
 
 export const isTranscript = (path: string) => /[\\/]timeline\.json$/.test(path); // the merged file, not exports/<id>-<name>.json
 
+// The phone is the only copy and Google auto-deletes Timeline after 3 months by default (when it is first turned on):
+// an export older than STALE_DAYS means the next gap is near. Only the age is ever printed: no place, no date.
+export const STALE_DAYS = 30;
+/** Whole days since the newest visit/activity end in the merged export; null = no export yet. */
+export function dataAgeDays(archiveDir: string, now = Date.now()): number | null {
+  let segs = null; // a read error (EBUSY / EPERM / a directory) = unknown age: the hourly sync calls this before it indexes
+  try { segs = json(readFileSync(join(archiveDir, 'timeline.json'), 'utf8')); } catch { /* no export / unreadable */ }
+  const newest = Array.isArray(segs) ? segs.reduce((n, s) => Math.max(n, Date.parse(s?.endTime) || 0), 0) : 0;
+  return newest ? Math.floor((now - newest) / 864e5) : null;
+}
+export const staleWarning = (age: number | null) => (age !== null && age > STALE_DAYS
+  ? `WARNING google-timeline: newest data point is ${age} days old (> ${STALE_DAYS}): export Timeline from the phone again (README: Google Maps Timeline)` : null);
+
 // ---------------- Thai text helpers ----------------
 const TM = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
 const TMF = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];

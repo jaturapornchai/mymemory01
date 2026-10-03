@@ -174,3 +174,18 @@ CREATE TABLE IF NOT EXISTS handoffs (
 CREATE INDEX IF NOT EXISTS handoffs_open ON handoffs (project, created_at) WHERE status = 'open';
 GRANT SELECT, INSERT, UPDATE ON handoffs TO memhub_ro;
 GRANT USAGE ON SEQUENCE handoffs_id_seq TO memhub_ro;
+
+-- What each SessionStart hook injected (session-start.ts): ids only, never the text, so ลุงจืด can see what an AI was given
+-- (cli stats --injected). Written by the hook, so memhub_ro may insert here (like access_log).
+CREATE TABLE IF NOT EXISTS injections (
+  id      bigserial PRIMARY KEY,
+  ts      timestamptz NOT NULL DEFAULT now(),
+  client  text NOT NULL,                     -- --app: claude-code | codex | gemini | zcode
+  project text,                              -- normalized cwd
+  session text,                              -- the new chat's session id
+  ids     text[] NOT NULL,                   -- in shown order: F…/S… rule + card fids, #N handoffs, session:<id> unsummarized chats
+  chars   int NOT NULL                       -- additionalContext length (budget 2000)
+);
+CREATE INDEX IF NOT EXISTS injections_ts ON injections (ts);
+GRANT INSERT ON injections TO memhub_ro;
+GRANT USAGE ON SEQUENCE injections_id_seq TO memhub_ro;

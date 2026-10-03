@@ -88,6 +88,7 @@ const EXPECT: [string, number[]][] = [
   ['transcript หาย', [3]],
   ['snippets ids', [2]],
   ['ภาษี', [4, 0]],
+  ['ภาษี เมื่อวาน', [4, 0]], // a time phrase only boosts: nothing here is from yesterday, nothing is filtered out
   ['ค้นภาษาไทย', [1]],
   ['cleanupPeriodDays', [3]],
 ];

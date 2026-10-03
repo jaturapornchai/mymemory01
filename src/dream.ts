@@ -3,7 +3,7 @@
 // LLM = Claude only (claude -p with Anthropic auth, or answered by Claude agents through request/result files).
 // Design + sources: docs/research/phase4-design.md §3–5.
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type pg from 'pg';
@@ -12,10 +12,10 @@ import { ROOT } from './db.ts';
 import { backfill } from './embed.ts';
 import { offsiteBackend } from './guard.ts';
 import { projectName } from './importer.ts';
-import { fileName, type Fm, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
+import { fileName, type Fm, fmStr, isEdited, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { search } from './search.ts';
-import { commitBatch } from './vault-git.ts';
+import { beforeMachineWrite, commitBatch } from './vault-git.ts';
 
 export const RUNS_DIR = process.env.MEMHUB_DREAM_RUNS ?? join(homedir(), 'ai-archive', 'raw', 'memhub-dream');
 const PROMPT = (name: string) => readFileSync(join(ROOT, 'prompts', `${name}.md`), 'utf8');
@@ -475,7 +475,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
   // Index what was written (later batches dedupe against it), then mark the sessions done.
   await indexVault(db, MEMORY_VAULT);
   await resolveLinks(db);
-  await backfill(db, 32, () => {}).catch(() => 0);
+  await backfill(db, 8, () => {}).catch(() => 0);
   for (const d of b.digests) await markDone(db, d.sessionId, { run: o.run, card: d.card, upto: d.upto });
   log(`dream batch: ${b.digests.length} sessions, ${cands.length} candidate facts`);
   return { sessions: b.digests.map((d) => d.sessionId), candidates: cands.map((c) => ({ n: c.n, text: c.text, kind: c.kind, uuids: c.uuids, op: ops.get(c.n)?.op, target: ops.get(c.n)?.target?.fid })) };
@@ -526,6 +526,56 @@ export async function rebuildCoaccess(db: pg.Pool) {
     COMMIT;`);
 }
 
+/** SQL on `facts f`: no cited turn is indexed any more (forgotten / gone). obs: = a note citing itself, not a chat. */
+export const ORPHAN = `NOT EXISTS (SELECT 1 FROM unnest(f.source_uuids) u WHERE u LIKE 'obs:%' OR EXISTS (SELECT 1 FROM turns t WHERE t.uuid = u))`;
+
+/**
+ * forget cascade (importer.forget, after its delete): facts/cards that cited the forgotten chats. keep = cited turns still
+ * indexed → the note stays, its provenance trimmed to keep. Nothing left → the note file is deleted (indexVault then drops and
+ * tombstones it, as when ลุงจืด deletes one), unless he edited/pinned/wrote it: never touched, listed in hubs/_review.md instead.
+ */
+export async function retireForgotten(db: pg.Pool, facts: { fid: string; path: string; keep: string[] }[], what: string) {
+  const out = { retired: [] as string[], trimmed: [] as string[], review: [] as string[] };
+  const vault = MEMORY_VAULT.replace(/\\/g, '/');
+  const projects = new Set<string>((await db.query(`SELECT DISTINCT coalesce(project, '') p FROM facts WHERE fid = ANY($1)`, [facts.map((f) => f.fid)])).rows.map((r) => r.p));
+  try {
+    for (const f of facts) {
+      const rel = f.path.replace(/\\/g, '/').slice(vault.length + 1);
+      const file = join(MEMORY_VAULT, rel);
+      if (!existsSync(file)) continue; // deleted meanwhile: indexVault below drops it
+      const { fm, body } = parseNote(readFileSync(file, 'utf8'));
+      // = existingFacts' "hand", + owned (indexFact's user_owned): a NOOP never adds provenance to an owned fact, so a rule he
+      // restated in later chats still cites only the first one; deleting it would tombstone the rule for good → _review instead
+      const hand = isEdited(fm, body) || fmStr(fm.pinned) === 'true' || !fmStr(fm.run) || ['rule', 'feedback'].includes(fmStr(fm.kind)) || fmStr(fm.owner) === 'user';
+      const label = `${f.fid} ${basename(rel, '.md')}`;
+      if (!f.keep.length && !hand) {
+        beforeMachineWrite(MEMORY_VAULT, rel); // vault history: this deletion is the forget commit, not "ลุงจืด แก้เอง"
+        try { unlinkSync(file); out.retired.push(label); } catch (e) { console.warn(`forget: kept ${rel}: ${(e as Error).message}`); }
+        continue;
+      }
+      if (f.keep.length && !hand) writeNote(rel, { source_uuids: f.keep });
+      // his file stays as he left it; the index forgets the session either way (timeline / related read session_ids)
+      await db.query(`UPDATE facts SET source_uuids = CASE WHEN cardinality($2::text[]) > 0 THEN $2::text[] ELSE source_uuids END,
+        session_ids = coalesce((SELECT array_agg(DISTINCT session_id) FROM turns WHERE uuid = ANY($2::text[])), '{}') WHERE fid = $1`, [f.fid, f.keep]);
+      (f.keep.length ? out.trimmed : out.review).push(label);
+    }
+    await indexVault(db, MEMORY_VAULT);
+    // a project this forget left with no notes: writeHubs skips it, so its hub would keep listing the forgotten titles
+    const left = new Set((await db.query(`SELECT DISTINCT coalesce(project, '') p FROM facts WHERE coalesce(project, '') = ANY($1)`, [[...projects]])).rows.map((r) => r.p));
+    for (const p of [...projects].filter((x) => !left.has(x))) {
+      const hub = `hubs/${hubName(p || 'global')}.md`;
+      const { fm, body } = existsSync(join(MEMORY_VAULT, hub)) ? parseNote(readFileSync(join(MEMORY_VAULT, hub), 'utf8')) : { fm: {} as Fm, body: '' };
+      if (fm.memhub !== 'hub' || fm.project !== p || isEdited(fm, body)) continue; // another project's hub (same slug) / his edit
+      beforeMachineWrite(MEMORY_VAULT, hub);
+      try { unlinkSync(join(MEMORY_VAULT, hub)); } catch (e) { console.warn(`forget: kept ${hub}: ${(e as Error).message}`); }
+    }
+    await writeHubs(db); // hubs stop linking retired notes; _review.md gains the edited ones
+  } finally {
+    commitBatch(MEMORY_VAULT, `forget ${what}: -${out.retired.length} notes, ${out.trimmed.length} trimmed, ${out.review.length} to review`);
+  }
+  return out;
+}
+
 /** hubs/<project> hub.md (pinned, ใช้บ่อย, ใหม่, ถูกแทนที่, recent cards) + hubs/_review.md. SQL only, no LLM. */
 async function writeHubs(db: pg.Pool) {
   const rel = (p: string) => basename(p.replace(/\\/g, '/'), '.md');
@@ -549,10 +599,16 @@ async function writeHubs(db: pg.Pool) {
     writeNote(`hubs/${hubName(project || 'global')}.md`, { memhub: 'hub', project, tags: ['memhub/hub'] }, body);
   }
   const pending = rows.filter((r) => r.status === 'pending');
+  // forget cascade left these alone: ลุงจืด edited/pinned/wrote them, yet every chat they cite is gone (retireForgotten)
+  const orphans = (await db.query(`SELECT s.path FROM facts f JOIN sources s ON s.id = f.source_id
+    WHERE (f.edited OR f.pinned OR f.run IS NULL OR f.user_owned) AND coalesce(s.status, 'active') IN ('active', 'pending') AND ${ORPHAN} ORDER BY s.path`)).rows;
   writeNote('hubs/_review.md', { memhub: 'hub', tags: ['memhub/review'] },
     `# Review queue\n\nDream proposals that touch your own notes or assistant-only claims. Open one and set **status**:\n` +
     `- \`active\` = accept (the target gets superseded tonight)\n- \`rejected\` = reject (never proposed again)\n\n` +
-    (pending.length ? pending.map((r) => `- [[${rel(r.path)}]] vs [[${fidRel.get(r.review_target) ?? r.review_target}]]`).join('\n') : '- (empty)') + '\n');
+    (pending.length ? pending.map((r) => `- [[${rel(r.path)}]] vs [[${fidRel.get(r.review_target) ?? r.review_target}]]`).join('\n') : '- (empty)') + '\n' +
+    (orphans.length ? `\n## Forgotten chats, your notes\nEvery chat these notes came from was forgotten (\`forget\`), but they are yours (edited, pinned, saved, or a rule/feedback), so they were kept. ` +
+      `Delete the note = forget it too · status \`rejected\` = hide it from search · remove the \`source_uuids\` property = keep it as your own\n\n` +
+      orphans.map((r) => `- [[${rel(r.path)}]]`).join('\n') + '\n' : ''));
   await indexVault(db, MEMORY_VAULT);
   await resolveLinks(db);
 }

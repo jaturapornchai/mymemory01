@@ -97,7 +97,12 @@ async function look(name: string, env?: Record<string, string>) {
   const m = await mcp(name, env);
   try {
     const out: Record<string, string> = { search: await m.call('memory_search', { query: WORD, limit: 8 }),
-      brief: await m.call('memory_search', { query: WORD, detail: 'brief' }), related: await m.call('memory_related', { id: ids['zc-1'].chunk }) };
+      brief: await m.call('memory_search', { query: WORD, detail: 'brief' }), related: await m.call('memory_related', { id: ids['zc-1'].chunk }),
+      // a date range around the fake sources' day (2026-09-20) must not open the gate either, in either mode
+      dated: await m.call('memory_search', { query: WORD, since: '2026-09-20', until: '2026-09-20', limit: 8 }),
+      'dated brief': await m.call('memory_search', { query: WORD, until: '2026-09-21', detail: 'brief' }),
+      early: await m.call('memory_search', { query: WORD, until: '2026-09-19' }),
+      'bad until': await m.call('memory_search', { query: WORD, until: 'yesterday' }) };
     for (const sid of ['gmail:t1', 'google-timeline']) {
       const id = ids[sid].chunk;
       for (const k of [id, id.slice(0, 8)]) {
@@ -119,6 +124,7 @@ test('MCP: other apps, Claude on z.ai / a proxy, MEMHUB_PRIVATE_SOURCES=0 and un
   await Promise.all(hidden.map(async ([name, env]) => {
     const o = await look(name, env), who = `${name} ${JSON.stringify(env ?? {})}`;
     assert.match(o.search, /control chat/, who); // the gate hides private sources, not memory
+    assert.match(o.dated, /control chat/, who);
     for (const [k, v] of Object.entries(o)) {
       if (k.startsWith('get ') || k.startsWith('related ') || k.startsWith('timeline ')) assert.match(v, /^not found: /, `${who} ${k}`);
       assert.doesNotMatch(v, /marker|gmailthreadlink|Gmail|Google|gmail:t1/, `${who} ${k}`);
@@ -133,6 +139,10 @@ test('MCP: Claude Code / Claude Desktop on Anthropic see them, labelled, still r
     assert.match(o.search, /Gmail[^\n]*\n[^\n]*gmail marker/, name);
     assert.match(o.search, /Google Maps timeline[^\n]*\n[^\n]*timeline marker/, name);
     assert.match(o.brief, /Gmail/, name);
+    assert.match(o.dated, /gmail marker/, name);
+    assert.match(o['dated brief'], /Google Maps timeline/, name);
+    assert.match(o.early, /^no matches/, name);
+    assert.match(o['bad until'], /until must be an ISO date/, name);
     assert.match(o['get gmail:t1 16'], /gmail marker.*\[REDACTED:otp\]/s, name);
     assert.doesNotMatch(o['timeline google-timeline 8'], /^not found/, name);
     assert.match(o.related, /gmailthreadlink/, name);

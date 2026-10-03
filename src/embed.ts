@@ -53,8 +53,11 @@ export function warmUp() {
   embed(['warm-up'], 60_000).catch(() => {});
 }
 
-/** Embed every chunk that lacks a vector for the current model. */
-export async function backfill(db: pg.Pool, batch = 32, log = console.log) {
+/** Embed every chunk that lacks a vector for the current model.
+ *  batch 8, not 32: a hot-path query embed queues behind the whole in-flight batch (head-of-line blocking). Measured while a
+ *  backfill ran: busy query embed p95 594 ms at 32 (575 ms per batch) → 147 ms at 8, 0/20 over embedQuery's 300 ms wait;
+ *  throughput is the same (RATE caps it). */
+export async function backfill(db: pg.Pool, batch = 8, log = console.log) {
   let done = 0;
   const t0 = Date.now();
   for (;;) {
@@ -81,7 +84,8 @@ export async function backfill(db: pg.Pool, batch = 32, log = console.log) {
     done += rows.length;
     const ahead = (done * 1000) / RATE - (Date.now() - t0);
     if (ahead > 0) await new Promise((r) => setTimeout(r, ahead));
-    if (done % 1024 < batch) log(`embedded ${done} (${((done * 1000) / (Date.now() - t0)).toFixed(0)}/s)`);
+    // + the last partial batch, so a small hourly run still logs its rate (it did at batch 32 by accident: done < 32)
+    if (done % 1024 < batch || rows.length < batch) log(`embedded ${done} (${((done * 1000) / (Date.now() - t0)).toFixed(0)}/s)`);
   }
   return done;
 }

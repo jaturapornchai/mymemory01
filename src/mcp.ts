@@ -9,6 +9,7 @@ import { clean, normProject, projectName } from './importer.ts';
 import { saveNote } from './notes.ts';
 import { claimHandoff, DATA_NOTE, doneHandoff, handoffLines, saveHandoff } from './handoff.ts';
 import { day, hitLine, privateLabel, search, snippet, type Hit } from './search.ts';
+import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
 
 const db = connect('ro');
@@ -75,7 +76,7 @@ server.registerTool(
   {
     description:
       'Search ลุงจืด\'s past AI sessions (Claude Code, Codex, Gemini, Antigravity, ZCode, LM Studio), notes, GitHub (repos, commits, issues/PRs) and facts (Thai+English+code). Use when he refers to the past ("เคย", ' +
-      '"ครั้งก่อน", "last time"), before R0/R1 actions, or when unsure of a project fact. ≤8 snippets with ids, age, use count; ' +
+      '"ครั้งก่อน", "last time"), before R0/R1 actions, or when unsure of a project fact; since+until = a date range. ≤8 snippets with ids, age, use count; ' +
       'OLD = superseded. Priority order: curated rules/facts first, raw chats are evidence (↳ = the chat a fact came from); ' +
       'memory_get(id) only when a snippet is not enough (each get ≈1-3k tokens; full snippets usually answer). detail:"brief" = one line ' +
       'per hit (≈1/3 the tokens per hit at the same limit, ≈t = est. tokens of memory_get) to skim; then memory_timeline / memory_get only what matters.',
@@ -83,17 +84,18 @@ server.registerTool(
       query: z.string().min(1).max(300).describe('keywords or a short question, Thai or English'),
       project: z.string().max(200).optional().describe('filter: substring of project path, e.g. "proj-a"'),
       since: z.string().max(30).optional().describe('ISO date, e.g. 2026-09-01'),
+      until: z.string().max(30).optional().describe('ISO date, inclusive'),
       limit: z.number().int().min(1).max(15).optional().describe('default 6, at most 8 hits are returned'),
       detail: z.enum(['brief', 'full']).optional().describe('default full'),
     },
     annotations: { readOnlyHint: true },
   },
-  async ({ query, project, since, limit, detail }) => {
+  async ({ query, project, since, until, limit, detail }) => {
     const t0 = performance.now();
     const no = off(); if (no) return text(no);
     const brief = detail === 'brief';
     const n = limit && Math.min(limit, 8); // ≤ 8 hits in both modes; default = search()'s 6
-    const { hits, semantic } = await search(db, query, { project, since, limit: n, currentProject, before: startedAt, showPrivate: privateOk(client()) });
+    const { hits, semantic } = await search(db, query, { project, since, until, limit: n, currentProject, before: startedAt, now: new Date(), showPrivate: privateOk(client()) });
     const out = brief ? briefText(hits, query, semantic, await getTokens(db, hits.map((h) => h.id))) : searchText(hits, query, semantic);
     logAccess('search', hits, { tool: 'search', t0, query, semantic });
     return text(out);
@@ -109,21 +111,55 @@ const factBody = (t: string) => t.replace(/^D: # [FSI][0-9a-f]{8}[^\n]*\n?/, '')
 /** memory_search reply text — exported so scripts/eval.ts measures exactly what the calling model reads. */
 export function searchText(hits: Hit[], query: string, semantic: boolean): string {
   if (!hits.length) return semantic ? 'no matches' : 'no matches (keyword-only: embedder busy)';
-  return (semantic ? '' : '(keyword-only: embedder busy)\n') + hits.map((h) => hitText(h, query)).join('\n\n');
+  const max = budgets(hits.length);
+  return (semantic ? '' : '(keyword-only: embedder busy)\n') + hits.map((h, i) => hitText(h, query, max[i])).join('\n\n');
 }
 
-/** One result: line + snippet (a fact from its head), then its best source chat (↳) in the rest of the 400 chars.
+/** Chars per result: 400 each, but rank 1 +300 and rank 2 +100, paid evenly by ranks ≥ 3 (≥ 200 each); total unchanged.
+ *  eval tune, frozen ranking: buried-detail answer terms visible (fine.json ans@w) 68.0 → 76.0, raw 67.9 → 68.8, chars −1 %. */
+function budgets(n: number): number[] {
+  const max = Array<number>(n).fill(400);
+  if (n < 3) return max;
+  const pool = Math.min(400, (n - 2) * 200), first = Math.round((pool * 3) / 4);
+  max[0] += first; max[1] += pool - first;
+  for (let i = 2; i < n; i++) max[i] -= Math.ceil(pool / (n - 2));
+  return max;
+}
+
+/** snippet() for the caller: the same anchor (longest query word found) and window, but at the anchor's occurrence whose window
+ *  holds the most DISTINCT query terms (ties → the first = snippet() exactly), so a detail next to several query words beats a
+ *  passing first mention. eval tune with budgets(): fine ans@w 76.0 → 80.0 (Thai questions +1), raw 68.8 → 69.0; windows over
+ *  any term: fine 78.7 but Thai −10, length-weighted 80.3 but Thai −5 (IDF-weighted −0.9, two windows −1.9 earlier). */
+// ponytail: O(anchor hits × term hits) per text; fine for chunk-sized texts, cap the hit lists if huge chunks ever show in latency
+function passage(text: string, query: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (flat.length <= max || !query) return snippet(text, query, max);
+  const low = normalize(flat), occ: { i: number; k: string }[] = [];
+  for (const { key: k } of queryTerms(query)) for (let i = low.indexOf(k); i >= 0; i = low.indexOf(k, i + 1)) occ.push({ i, k });
+  const anchor = words(query).sort((a, b) => b.length - a.length).find((t) => low.includes(t));
+  let best = 0, most = -1;
+  for (let i = anchor ? low.indexOf(anchor) : -1; i >= 0; i = low.indexOf(anchor!, i + 1)) {
+    const s = Math.max(0, Math.min(i - Math.floor(max / 4), flat.length - max));
+    const n = new Set(occ.filter((p) => p.i >= s && p.i + p.k.length <= s + max).map((p) => p.k)).size;
+    if (n > most) { most = n; best = s; }
+  }
+  return (best > 0 ? '…' : '') + flat.slice(best, best + max) + (best + max < flat.length ? '…' : '');
+}
+
+/** One result: line + passage (a fact from its head), then its best source chat (↳) in the rest of its `max` chars.
  *  More source chats are only counted (+N): memory_get(fact id) lists its provenance. */
-export function hitText(h: Hit, query: string): string {
+export function hitText(h: Hit, query: string, max = 400): string {
   const [e, ...more] = h.evidence ?? [];
   const fact = h.fid && h.kind !== 'card';
-  const body = snippet(fact ? factBody(h.text) : h.text, fact ? '' : query, e ? FACT_EV_CHARS : 400);
-  if (!e) return `${hitLine(h)}\n${body}`;
+  const text = fact ? factBody(h.text) : h.text, q = fact ? '' : query;
+  if (!e) return `${hitLine(h)}\n${passage(text, q, max)}`;
   // a source chat whose decision a later fact replaced keeps the warning it has as a result of its own (not when that fact is h)
   const later = e.changed_to?.filter((f) => f !== h.fid) ?? [];
   const ev = `\n↳ source chat [${e.id}] ${day(e.ts)}${later.length ? ` (later changed -> [${later.join('] [')}])` : ''}` +
     `${more.length ? ` +${more.length} more` : ''}: `;
-  return `${hitLine(h)}\n${body}${ev}${snippet(e.text, query, 400 - body.length - ev.length)}`; // ≥ ~60 chars: body ≤ 252, ev ≤ ~90
+  // the ↳ header is sized first, so a long one (changed_to ids, +N) shortens the fact, not the total: body + ev + chat ≤ max
+  const body = passage(text, q, Math.max(60, Math.min(Math.round((FACT_EV_CHARS * max) / 400), max - ev.length - 60)));
+  return `${hitLine(h)}\n${body}${ev}${passage(e.text, query, Math.max(60, max - body.length - ev.length))}`;
 }
 
 // brief = progressive disclosure: same hits and order as full, one line each, gist last so the line cap only shortens the gist
@@ -139,13 +175,13 @@ export function briefText(hits: Hit[], query: string, semantic: boolean, cost: M
 /** `[id] 2026-09-12 proj-a codex subagent ≈850t ↳[source chat id]: gist` — OLD / PENDING / changed warnings kept from hitLine. */
 export function briefLine(h: Hit, query: string, cost: Map<string, number>): string {
   const fact = h.fid && h.kind !== 'card';
-  const what = h.kind ?? (PRIVATE_TOOLS.has(h.tool) ? privateLabel(h) : h.project?.startsWith('obsidian/') ? 'note' : h.tool === 'github' ? 'github'
+  const what = h.kind ?? (PRIVATE_TOOLS.has(h.tool) ? privateLabel(h) : h.project?.startsWith('obsidian/') ? (h.src_kind === 'daily' ? 'daily note' : 'note') : h.tool === 'github' ? 'github'
     : h.src_kind === 'main' ? h.tool : `${h.tool} ${h.src_kind}`);
   const flag = h.status === 'superseded' ? ` OLD -> [${h.superseded_by ?? '?'}]` : h.status === 'pending' ? ` PENDING vs [${h.review_target ?? '?'}]`
     : h.changed_to ? ` (later changed -> [${h.changed_to.join('] [')}])` : '';
   const ev = h.evidence?.length ? ` ↳[${h.evidence[0].id}]${h.evidence.length > 1 ? `+${h.evidence.length - 1}` : ''}` : '';
   const head = `[${fact ? h.fid : h.id}] ${day(h.ts)} ${projectName(h.fact_project ?? h.project ?? '') || 'global'} ${what}${flag} ≈${cost.get(h.id) ?? '?'}t${ev}: `;
-  return (head + snippet(fact ? factBody(h.text) : h.text, fact ? '' : query, 100)).slice(0, BRIEF_LINE);
+  return (head + passage(fact ? factBody(h.text) : h.text, fact ? '' : query, 100)).slice(0, BRIEF_LINE);
 }
 
 server.registerTool(

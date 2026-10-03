@@ -109,7 +109,52 @@ test('tokenizer splits Thai↔digit/Latin boundaries ICU leaves glued', () => {
   for (const x of ['ที่', '7', '53', 'ภายใน', 'claude']) assert.ok(w.includes(x), `${x} in ${w.join('|')}`);
 });
 
+import { bigramQuery as bq, bigramRuns, normalize, queryTerms as qt } from '../src/thai.ts';
+test('Thai digits fold to ASCII in the step index and query share: ภ.ง.ด.๕๓ = ภ.ง.ด.53', () => {
+  assert.deepEqual(words('ยื่นภ.ง.ด.๕๓ภายในวันที่๗'), words('ยื่นภ.ง.ด.53ภายในวันที่7')); // index side (words)
+  assert.deepEqual(bigramRuns('ภ.ง.ด.๕๓'), bigramRuns('ภ.ง.ด.53'));                       // index side (bigrams)
+  assert.equal(bq('ภ.ง.ด.๕๓'), bq('ภ.ง.ด.53'));                                         // query side
+  const k = (q: string) => qt(q).map((t) => t.key);
+  assert.deepEqual(k('ภาษี ๒๕๖๘ งวด 3 รอบ ๒๕68'), k('ภาษี 2568 งวด 3 รอบ 2568'));        // mixed digits
+  assert.equal(normalize('๐๑๒๓๔๕๖๗๘๙'), '0123456789');
+  const ascii = 'ยื่น ภ.ง.ด.53 ปี 2568 getUserById ๆ ฯ'; // no Thai digit (ๆ ฯ are not digits): unchanged, same length
+  assert.equal(normalize(ascii), ascii.toLowerCase());
+  assert.equal(normalize('ปี ๒๕๖๘').length, 'ปี ๒๕๖๘'.length, 'snippet offsets index the raw text');
+});
+
 test('code identifiers emit whole name + parts', () => {
   const w = words('call getUserById in src/search.ts and pg_advisory_xact_lock');
   for (const x of ['getuserbyid', 'user', 'search.ts', 'search', 'pg_advisory_xact_lock', 'advisory', 'lock']) assert.ok(w.includes(x), x);
+});
+
+import { bigramQuery, queryTerms } from '../src/thai.ts';
+const keys = (q: string) => queryTerms(q).map((t) => t.key);
+test('query terms: เลย stays when the rest only asks when/how often; question words stay (timeline headers ask them)', () => {
+  assert.ok(keys('ไปเลยเมื่อไหร่').includes('เลย'));
+  assert.ok(keys('ไปเลยเมื่อไหร่').includes('ไหร่'));
+  assert.notEqual(bigramQuery('ภงด'), null, 'a bare Thai abbreviation keeps its bigram leg');
+});
+
+test('loei: the province alias only where เลย cannot mean "go ahead"', () => {
+  for (const q of ['ไปเลยเมื่อไหร่', 'ไปจังหวัดเลยกี่ครั้ง', 'ไป จ.เลย ล่าสุด']) assert.ok(keys(q).includes('loei'), q);
+  for (const q of ['แก้ bug ไปเลย', 'ทำต่อเลยครับ', 'deploy เลย', 'ไปเที่ยวเลย']) assert.ok(!keys(q).includes('loei'), q);
+});
+
+import { timeWindow } from '../src/search.ts';
+test('relative time: a window from the anchor; relative words leave the terms, month names, years and case stay', () => {
+  const now = new Date('2026-10-03T12:00:00Z'), iso = (x?: Date) => x?.toISOString(); // 19:00 in Bangkok
+  let t = timeWindow('เมื่อวานแก้ bug อะไร', now);
+  assert.deepEqual([iso(t.from), iso(t.to)], ['2026-10-01T17:00:00.000Z', '2026-10-02T17:00:00.000Z']); // Bangkok days
+  assert.ok(!t.rest.includes('เมื่อวาน') && t.rest.includes('bug'));
+  t = timeWindow('เดือนสิงหาทำวิดีโอ', now);
+  assert.deepEqual([iso(t.from), iso(t.to)], ['2026-07-31T17:00:00.000Z', '2026-08-31T17:00:00.000Z']);
+  assert.ok(t.rest.includes('สิงหา'));
+  t = timeWindow('ปีที่แล้ว deploy getUserById', now);
+  assert.equal(iso(t.from), '2024-12-31T17:00:00.000Z');
+  assert.ok(t.rest.includes('getUserById') && !t.rest.includes('ปี'));
+  assert.ok(timeWindow('ภาษีปี 2568', now).rest.includes('2568'));
+  assert.equal(iso(timeWindow('มกราปีนี้', now).from), '2025-12-31T17:00:00.000Z');
+  assert.ok(timeWindow('last time we fixed it', now).recent);
+  t = timeWindow('ไปเลยเมื่อไหร่', now);
+  assert.deepEqual([t.from, t.recent, t.rest], [undefined, false, 'ไปเลยเมื่อไหร่']);
 });

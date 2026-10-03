@@ -116,12 +116,18 @@ export function commitBatch(vault: string, msg: string) {
   const open = batches.get(vault);
   if (!open) return; // the batch wrote nothing
   batches.delete(vault);
-  const paths = [...open].filter((p) => existsSync(join(vault, p))); // a write that failed before its rename: nothing to stage
-  quiet(() => locked(vault, () => { gitPaths(vault, paths, 'add'); return commitIndex(vault, msg); }));
+  const paths = [...open].filter((p) => existsSync(join(vault, p)));
+  // gone = a note the batch deleted (forget cascade) → stage the removal; a write that failed before its rename was never tracked
+  const gone = [...open].filter((p) => !paths.includes(p));
+  quiet(() => locked(vault, () => {
+    gitPaths(vault, paths, 'add');
+    gitPaths(vault, gone, 'rm', '-q', '--cached', '--ignore-unmatch');
+    return commitIndex(vault, msg);
+  }));
   quiet(() => rmSync(marker(vault), { force: true })); // only after the commit: until then no snapshot may take these notes
 }
 
-export const kindOf = (s: string) => (/^(dream|consolidate)\b/.test(s) ? 'dream' : s.startsWith('memory_save') ? 'save' : s === HUMAN ? 'human'
+export const kindOf = (s: string) => (/^(dream|consolidate)\b/.test(s) ? 'dream' : s.startsWith('memory_save') ? 'save' : /^daily \d/.test(s) ? 'daily' : s === HUMAN ? 'human'
   : s.startsWith('Revert') ? 'undo' : s === BASELINE ? 'baseline' : 'other');
 
 export function log(vault: string, n = 20) {
@@ -147,12 +153,12 @@ export function show(vault: string, rev?: string) {
 
 export const patch = (vault: string, rev: string) => git(vault, 'show', '--no-color', rev, '--');
 
-/** `git revert` a machine commit (dream / memory_save / undo); ลุงจืด's own snapshot or the baseline only with force. */
+/** `git revert` a machine commit (dream / memory_save / daily note / undo); ลุงจืด's own snapshot or the baseline only with force. */
 export function undo(vault: string, rev: string, force = false) {
   const hash = git(vault, 'rev-parse', '--verify', '-q', `${rev}^{commit}`).trim();
   const subject = git(vault, 'log', '-n1', '--format=%s', hash).trim();
   const kind = kindOf(subject);
-  if (!['dream', 'save', 'undo'].includes(kind) && !force) throw new Error(`${rev} is a ${kind} commit ("${subject}"), not a machine write: add --force to revert it anyway`);
+  if (!['dream', 'save', 'undo', 'daily'].includes(kind) && !force) throw new Error(`${rev} is a ${kind} commit ("${subject}"), not a machine write: add --force to revert it anyway`);
   snapshot(vault); // pending Obsidian edits → their own commit first (a dirty tree blocks the revert)
   locked(vault, () => {
     try { git(vault, 'revert', '--no-edit', hash); }

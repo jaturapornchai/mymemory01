@@ -323,22 +323,43 @@ async function parentProject(db: pg.Pool, sessionDir: string, sessionId: string)
 }
 
 const isForgotten = async (db: pg.Pool, sessionId: string, project: string) => !!(await db.query(
-  `SELECT 1 FROM forgotten WHERE key = 'session:' || $1 OR (key LIKE 'project:%' AND starts_with($2, substr(key, 9)))`,
+  `SELECT 1 FROM forgotten WHERE key = 'session:' || $1 OR (key LIKE 'project:%' AND ($2 = substr(key, 9) OR starts_with($2, substr(key, 9) || '/')))`,
   [sessionId, project])).rowCount;
 
-/** Drop a session or project (path prefix) from the index and tombstone it so imports skip it. Raw archive untouched. */
+/** Drop a session or project (path prefix) from the index and tombstone it so imports skip it. Raw archive untouched.
+ *  Facts/cards the dream distilled from it go too, unless another chat still backs them (dream.retireForgotten). */
 export async function forget(db: pg.Pool, what: 'session' | 'project', value: string) {
   const v = what === 'project' ? normProject(value) : value;
   if (!v) throw new Error('empty value');
   await db.query('INSERT INTO forgotten (key) VALUES ($1) ON CONFLICT DO NOTHING', [`${what}:${v}`]);
-  const r = await db.query(
-    `${what === 'session' ? 'DELETE FROM sources WHERE session_id = $1' : 'DELETE FROM sources WHERE starts_with(project, $1)'} RETURNING id, project`, [v]);
+  // a folder and what is under it, never a sibling that merely starts the same (d:/app ≠ d:/app2): the cascade deletes notes
+  const where = what === 'session' ? 'session_id = $1' : `(project = $1 OR starts_with(project, $1 || '/'))`;
+  const doomed = (await db.query(`SELECT id, session_id FROM sources WHERE ${where}`, [v])).rows;
+  // Before the delete (its turns name the cited uuids). For a session, session_ids also finds facts of one forgotten before
+  // this cascade existed (or a crashed run); a project rerun cannot (its sources are gone): lint lists those as orphans.
+  // keep = cited turns that stay indexed; obs: = a note citing itself, never a chat.
+  const facts = (await db.query(
+    `SELECT f.fid, s.path, array(SELECT u FROM unnest(f.source_uuids) u WHERE u LIKE 'obs:%'
+              OR EXISTS (SELECT 1 FROM turns t WHERE t.uuid = u AND t.source_id <> ALL($1::bigint[]))) keep
+     FROM facts f JOIN sources s ON s.id = f.source_id
+     WHERE f.session_ids && $2::text[] OR f.source_uuids && array(SELECT uuid FROM turns WHERE source_id = ANY($1::bigint[]))`,
+    [doomed.map((s) => s.id), what === 'session' ? [v] : [...new Set(doomed.map((s) => s.session_id).filter(Boolean))]])).rows;
+  const r = await db.query(`DELETE FROM sources WHERE ${where} RETURNING id, project`, [v]);
   // and their layout pins (src/layout.ts): forgotten raw keys must not linger in state, and the pin store stays bounded
   const pins = r.rows.flatMap((s) => [`source:${s.id}`, `source:${s.id}@github`]); // @github: a cloned repo's public spot (brain.ts)
   if (what === 'project') pins.push(...new Set(r.rows.map((s) => `project:${s.project ?? '?'}`))); // ponytail: a session forget keeps its hub's pin
   if (pins.length) await db.query(`UPDATE state SET v = v - $1::text[] WHERE k = 'layout'`, [pins]);
   await db.query('DELETE FROM access_log a WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.id = a.chunk_id)'); // queries may quote it
-  return r.rowCount ?? 0;
+  // the SessionStart log names the project and the chats it showed (session-start.ts); absent before migrate
+  await db.query(`DELETE FROM injections WHERE ${what === 'session' ? `session = $1 OR 'session:' || $1 = ANY(ids)` : `project = $1 OR starts_with(project, $1 || '/')`}`, [v])
+    .catch(() => {});
+  // after the delete: the review note lists edited notes whose chats are all gone. Dynamic: dream.ts imports this module
+  const notes = facts.length ? await (await import('./dream.ts')).retireForgotten(db, facts, `${what} ${v}`) : { retired: [], trimmed: [], review: [] };
+  // hubs/_lint.md keeps a week of sections naming notes; label = `${fid} ${note title}` (retireForgotten)
+  await (await import('./lint.ts')).pruneLint(db, notes.retired.map((l) => l.slice(l.indexOf(' ') + 1)), `forget ${what} ${v}: _lint.md`);
+  // daily notes quote prompts, card titles and fact names: rewritten without what is gone now (daily.ts)
+  const daily = await (await import('./daily.ts')).rewriteDailies(db, `forget ${what} ${v}: daily notes`); // a rerun redoes them too
+  return { sources: r.rowCount ?? 0, ...notes, daily };
 }
 
 export async function indexArchive(db: pg.Pool, force = false) {

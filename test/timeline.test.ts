@@ -18,9 +18,9 @@ const { connect, ROOT } = await import('../src/db.ts');
 const { store } = await import('../src/importer.ts');
 const { writeNote, md5, MEMORY_VAULT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
-const { search } = await import('../src/search.ts');
+const { hitLine, search, snippet } = await import('../src/search.ts');
 const { timeline, getTokens, tokens, TIMELINE_MAX } = await import('../src/timeline.ts');
-const { briefText, searchText, BRIEF_LINE } = await import('../src/mcp.ts');
+const { briefText, hitText, searchText, BRIEF_LINE } = await import('../src/mcp.ts');
 
 const db = connect('rw');
 const guard = async () => assert.equal((await db.query('SELECT current_schema() s')).rows[0].s, SCHEMA, 'scratch schema missing: refusing to write to public');
@@ -150,11 +150,12 @@ const HITS: any[] = [
   { ...base, id: '0000000000000008', ts: d('2026-09-25T00:00:00Z'), fid: 'F0000000e', kind: 'fact', status: 'pending', review_target: 'F0000000a', project: 'obsidian/memory-hub', fact_project: null, text: 'D: # F0000000e p\npending goldenport 7300' },
 ];
 
+// re-pinned 2026-10-03 for rank budgets + passage() (deliberate format change); any other change to it must stay byte-for-byte
 test('full mode is byte-for-byte what it was before brief mode (golden hash of searchText on the fixture)', () => {
   mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T00:00:00Z') }); // hitLine prints ages
   try {
     const outs = [searchText(HITS, 'goldenport 7100', true), searchText(HITS.slice(0, 2), 'goldenport', false), searchText([], 'x', true)];
-    assert.equal(createHash('sha256').update(outs.join('\0')).digest('hex'), '7d4a34379f6c3d0b3ebc368c1522727f10db973c826f124a915824cafff8b34f', outs[0]);
+    assert.equal(createHash('sha256').update(outs.join('\0')).digest('hex'), '86f0bdb487a4c4c615ce6c6455d10ce4d1d8964ff34ed932b334781092487366', outs[0]);
   } finally { mock.timers.reset(); }
 });
 
@@ -186,4 +187,16 @@ test('brief on real search results (MCP max 8 hits): all capped, each with an es
   assert.equal(lines.length, hits.length);
   for (const l of lines) assert.match(l, /^\[\S+\] \d{4}-\d{2}-\d{2} .* ≈\d+t/);
   assert.ok(out.length < searchText(hits, 'round tlterm', semantic).length, 'brief@8 costs less than full@8');
+});
+
+test('full mode: rank 1 gets +300 chars and rank 2 +100, paid by ranks ≥ 3, same total; the passage shows the detail next to the most query terms', () => {
+  const long = (i: number) => ({ ...base, id: `${i}`.repeat(16), ts: d('2026-09-20T10:00:00Z'), text: `U: budgetterm ${'filler words here '.repeat(60)}` });
+  const bodies = searchText([1, 2, 3, 4, 5, 6].map(long), 'budgetterm', true).split('\n\n').map((r) => r.split('\n')[1].length);
+  assert.deepEqual(bodies.map((n) => n - 1), [700, 500, 300, 300, 300, 300], 'bodies (minus the trailing cut mark)');
+  const detail = { ...base, id: 'abcdefabcdefabcd', ts: d('2026-09-20T10:00:00Z'),
+    text: `U: alphaterm first ${'unrelated chat '.repeat(60)} A: alphaterm betaterm gammaterm = port 4242 ${'more chat '.repeat(60)}` };
+  const q = 'alphaterm betaterm gammaterm';
+  assert.doesNotMatch(snippet(detail.text, q, 400), /4242/, 'sanity: snippet() anchors on the first alphaterm');
+  assert.match(hitText(detail, q), /alphaterm betaterm gammaterm = port 4242/);
+  assert.equal(hitText(detail, ''), `${hitLine(detail)}\n${snippet(detail.text, '', 400)}`, 'empty query = snippet()');
 });

@@ -24,6 +24,9 @@ const out = await call('memory_search', { query: q, limit: 5 });
 const brief = await call('memory_search', { query: q, detail: 'brief', limit: 15 });
 if (brief.split('\n').some((l) => l.length > 200)) fail('brief line > 200 chars');
 if (brief.split('\n').filter((l) => ID.test(l)).length > 8) fail('brief > 8 hits'); // invariant: ≤ 8 hits × ≤ 400 chars
+const day = (n: number) => new Date(Date.now() + 7 * 3600e3 - n * 864e5).toISOString().slice(0, 10); // Bangkok date n days ago
+const dated = await call('memory_search', { query: q, since: day(30), until: day(1), limit: 5 });
+if (/must be an ISO date|is after until/.test(dated)) fail('date range rejected');
 const id = out.match(ID)?.[1];
 if (!id) fail('no result id → get/timeline skipped');
 else {

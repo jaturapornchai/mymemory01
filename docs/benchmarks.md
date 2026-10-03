@@ -1,6 +1,6 @@
 > **สรุป (ไทย):** วัด memory-hub ด้วย benchmark สาธารณะ 2 ชุด ผ่าน pipeline จริงทั้งเส้น (redact → chunk → ตัดคำ → bge-m3 → `search()` RRF + prior) ใน schema แยก `memhub_bench` ไม่แตะ schema หลัก วัดเฉพาะการค้นคืน (retrieval) ไม่มี LLM อ่านหรือตอบ
 > - **LongMemEval_S** (สุ่มแบบแบ่งชั้น 54/500 ข้อ ครบ 6 ประเภท, seed 1): session R@5 = 100% (54/54) แต่พอตรวจซ้ำด้วยอีก 20 ข้อนอก subset (seed 2) ได้ R@5 **90%** / R@10 95% (พลาด 2 ข้อ เป็น temporal-reasoning ทั้งคู่) รวม 74 ข้อได้ R@5 **97.3%** (72/74, ช่วงเชื่อมั่น 95% คือ 90.7–99.3) / R@10 98.6% จึง**อยู่ระดับเดียวกับ** mempalace 96.6% และ agentmemory 95.2/98.6% (นิยามเดียวกัน วัดครบ 500 ข้อ) ไม่ใช่หลักฐานว่าเหนือกว่า ตัวเลขจริงต้องรอวัดครบ 500 ข้อ
-> - **LoCoMo** (ครบ 1,986 ข้อ): session R@10 = **93.9%** (mempalace hybrid v5 ได้ 88.9%) และ R@5 = 87.7% (mempalace ได้ 83.7%) ส่วนระดับ dialog ตามนิยามทางการ R@5/10/25 = 60.5/69.5/78.1% (paper ใช้ DRAGON ได้ 58.8/67.5/79.9%)
+> - **LoCoMo** (ครบ 1,986 ข้อ): session R@10 = **94.2%** (mempalace hybrid v5 ได้ 88.9%) และ R@5 = 88.1% (mempalace ได้ 83.7%) ส่วนระดับ dialog ตามนิยามทางการ R@5/10/25 = 60.4/70.0/78.3% (paper ใช้ DRAGON ได้ 58.8/67.5/79.9%)
 > - latency ของ `search()` อยู่ที่ p50 37.5 ms / p95 54.8 ms
 > - ข้อจำกัด: ข้อมูลเป็นภาษาอังกฤษล้วน จึงไม่ได้วัดภาษาไทย / LongMemEval เป็น subset / ตัวเลขของโปรเจ็กต์อื่นเป็นตัวเลขที่เขารายงานเอง (self-reported) เรายังไม่ได้รันซ้ำ / หน่วยที่ค้นคืนต่างกัน (ของเราคือ chunk ระดับ round)
 
@@ -72,7 +72,7 @@ The LongMemEval size was checked with a HEAD request before downloading (277 MB,
 
 All of the above is unit-tested against hand-computed cases in `test/bench-metrics.test.ts`.
 
-## 4. Results (run 2026-10-02, bge-m3 F16 on Ollama 0.33.2, `RANK` defaults)
+## 4. Results (run 2026-10-02, re-run 2026-10-03 after the relative-time boost; bge-m3 F16 on Ollama 0.33.2, `RANK` defaults)
 
 **LongMemEval_S, 54-question subset: mempalace definition** (session `recall_any`, all 54). A random ranking would score 18.9% at R@5 over the 500.
 
@@ -84,7 +84,7 @@ All of the above is unit-tested against hand-computed cases in `test/bench-metri
 
 Every question type scores 100 / 100 with hybrid.
 
-**Out-of-subset check: the 100 did not hold.** 20 more questions, `stratified(rest of the 500, 20, seed 2)`: disjoint from the 54, types 3/6/1/5/3/2 in the order of the §1 table. They were ingested into a scratch schema together with the 54 + LoCoMo (the same 35,434 chunk ids as the bench corpus, plus 12,102 new ones) and ranked the same way (scratch script `tmp/verify-benchmark/verify-subset.ts`).
+**Out-of-subset check: the 100 did not hold.** 20 more questions, `stratified(rest of the 500, 20, seed 2)`: disjoint from the 54, types 3/6/1/5/3/2 in the order of the §1 table. They were ingested into a scratch schema together with the 54 + LoCoMo (the same 35,434 chunk ids as the bench corpus, plus 12,102 new ones) and ranked the same way (scratch script `tmp/verify-benchmark/verify-subset.ts`). Measured on the 2026-10-02 code, not re-run since.
 
 | Questions | hybrid R@1 | hybrid R@5 | hybrid R@10 | keyword R@5 / R@10 |
 |---|---|---|---|---|
@@ -98,30 +98,30 @@ Both misses are temporal-reasoning: `gpt4_8279ba03` (missed at 5 and at 10) and 
 
 | Mode | any@1 | any@3 | any@5 | any@10 | all@5 | all@10 | nDCG@5 | nDCG@10 |
 |---|---|---|---|---|---|---|---|---|
-| session: hybrid | 93.6 | 100 | 100 | 100 | 93.6 | 95.7 | 95.8 | 96.4 |
-| session: keyword | 89.4 | 91.5 | 95.7 | 100 | 78.7 | 91.5 | 84.6 | 87.8 |
+| session: hybrid | 95.7 | 100 | 100 | 100 | 93.6 | 95.7 | 95.2 | 95.9 |
+| session: keyword | 87.2 | 91.5 | 95.7 | 100 | 78.7 | 91.5 | 83.7 | 87.2 |
 | session: semantic | 91.5 | 100 | 100 | 100 | 93.6 | 95.7 | 94.1 | 94.9 |
-| turn: hybrid | 66.0 | 95.7 | 95.7 | 95.7 | 66.0 | 72.3 | 73.0 | 74.6 |
-| turn: keyword | 57.4 | 83.0 | 87.2 | 97.9 | 57.4 | 63.8 | 66.6 | 69.2 |
+| turn: hybrid | 68.1 | 95.7 | 95.7 | 95.7 | 66.0 | 72.3 | 72.7 | 74.4 |
+| turn: keyword | 57.4 | 80.9 | 85.1 | 95.7 | 59.6 | 66.0 | 66.6 | 69.2 |
 | turn: semantic | 63.8 | 91.5 | 95.7 | 97.9 | 66.0 | 85.1 | 72.3 | 76.8 |
 
 **LoCoMo, all 1,986 questions** (`s@k` = mempalace session recall, `d@k` = official `recall_acc` over k dialogs):
 
 | Mode | s@5 | s@10 | d@5 | d@10 | d@25 |
 |---|---|---|---|---|---|
-| **hybrid `search()`** | **87.7** | **93.9** | **60.5** | **69.5** | **78.1** |
-| keyword-only | 83.7 | 90.6 | 54.7 | 62.4 | 71.5 |
+| **hybrid `search()`** | **88.1** | **94.2** | **60.4** | **70.0** | **78.3** |
+| keyword-only | 83.9 | 90.8 | 54.6 | 62.2 | 71.8 |
 | semantic-only (vector leg) | 86.4 | 93.6 | 58.9 | 69.1 | 80.2 |
 
 Hybrid by LoCoMo `category`. Names differ between papers, so the dataset's numbers are used:
 
 | Category | n | s@5 | s@10 | d@5 | d@10 | d@25 |
 |---|---|---|---|---|---|---|
-| 1 | 282 | 60.5 | 77.9 | 27.7 | 39.6 | 53.3 |
-| 2 | 321 | 88.0 | 95.8 | 65.8 | 73.3 | 81.5 |
-| 3 | 96 | 61.7 | 72.8 | 27.3 | 37.8 | 46.9 |
-| 4 | 841 | 95.8 | 98.8 | 68.1 | 77.4 | 84.2 |
-| 5 | 446 | 95.1 | 98.0 | 70.2 | 77.6 | 86.5 |
+| 1 | 282 | 60.7 | 78.8 | 27.9 | 39.9 | 53.5 |
+| 2 | 321 | 88.8 | 96.7 | 66.4 | 73.6 | 82.6 |
+| 3 | 96 | 61.7 | 73.8 | 27.3 | 37.8 | 47.4 |
+| 4 | 841 | 96.2 | 98.8 | 67.8 | 77.8 | 84.4 |
+| 5 | 446 | 95.3 | 97.8 | 69.7 | 78.7 | 86.3 |
 
 **Latency** of `search()`, measured on the default call (limit 20, project filter, query embedding included, sequential, 35,434-chunk bench corpus): hybrid p50 **37.5 ms** / p95 **54.8 ms**; keyword-only p50 15.3 ms / p95 20.0 ms.
 
@@ -134,9 +134,9 @@ Hybrid by LoCoMo `category`. Names differ between papers, so the dataset's numbe
 | [mempalace raw](https://github.com/MemPalace/mempalace/blob/develop/benchmarks/BENCHMARKS.md): ChromaDB + all-MiniLM-L6-v2, one doc per session (user turns), no LLM | LongMemEval_S cleaned, 500 q, session `recall_any@5` / `@10` over all questions (**same**) | 96.6 (R@5; no single R@10 stated) | 97.3 / 98.6 on **74 q** (54 subset + 20 out of it; R@5 CI 90.7–99.3): level, not ahead |
 | [agentmemory](https://github.com/rohitg00/agentmemory/blob/main/benchmark/LONGMEMEVAL.md) BM25 + vector (all-MiniLM-L6-v2) | same, 500 q (**same**) | 95.2 / 98.6 | 97.3 / 98.6 (74 q): level |
 | agentmemory BM25-only | same (**same**) | 86.2 / 94.6 | keyword-only 94.6 / 98.6 (74 q) |
-| [mempalace hybrid v5](https://github.com/MemPalace/mempalace/blob/develop/benchmarks/BENCHMARKS.md) (top-10, no rerank) | LoCoMo locomo10, 1,986 q, session recall @5 / @10 (**same**) | 83.7 / 88.9 | **87.7 / 93.9** |
-| mempalace bge-large hybrid (top-10, no LLM) | same, @10 (**same**) | 92.4 | 93.9 |
-| [LoCoMo paper](https://arxiv.org/abs/2402.17753), Table 3, DRAGON retriever, dialog units | LoCoMo `recall_acc` @5 / @10 / @25 dialogs (**same definition**; the paper's dataset version may differ, since v1 had 50 conversations) | 58.8 / 67.5 / 79.9 | 60.5 / 69.5 / 78.1 |
+| [mempalace hybrid v5](https://github.com/MemPalace/mempalace/blob/develop/benchmarks/BENCHMARKS.md) (top-10, no rerank) | LoCoMo locomo10, 1,986 q, session recall @5 / @10 (**same**) | 83.7 / 88.9 | **88.1 / 94.2** |
+| mempalace bge-large hybrid (top-10, no LLM) | same, @10 (**same**) | 92.4 | 94.2 |
+| [LoCoMo paper](https://arxiv.org/abs/2402.17753), Table 3, DRAGON retriever, dialog units | LoCoMo `recall_acc` @5 / @10 / @25 dialogs (**same definition**; the paper's dataset version may differ, since v1 had 50 conversations) | 58.8 / 67.5 / 79.9 | 60.4 / 70.0 / 78.3 |
 
 **Not comparable, and not compared:**
 - mempalace's 100% figures use an LLM rerank, and its LoCoMo top-50 exceeds the 19–32 sessions per conversation. Its own doc says so.
@@ -153,7 +153,7 @@ Hybrid by LoCoMo `category`. Names differ between papers, so the dataset's numbe
   - memory-hub retrieves round chunks: a user turn plus its replies, at most 1,200 chars, with *assistant text included*.
   - mempalace raw indexes whole sessions (user turns only); the LongMemEval turn index is single user turns; LoCoMo's is single dialogs. We map our ranking onto each unit (§1).
   - Including assistant text helps single-session-assistant questions in the mempalace definition. The official LongMemEval averages exclude those questions.
-- **Diversity cap.** The default 3-chunks-per-session cap in `search()` limits how many dialogs one session can contribute. That is why hybrid `d@25` (78.1) is below the uncapped vector leg (80.2).
+- **Diversity cap.** The default 3-chunks-per-session cap in `search()` limits how many dialogs one session can contribute. That is why hybrid `d@25` (78.3) is below the uncapped vector leg (80.2).
 - **Not tuned on these sets.** memory-hub's `RANK` parameters were tuned on ลุงจืด's own eval set, so they are zero-shot here. mempalace says its hybrid versions were built from failure patterns on these same benchmarks, apart from its held-out LongMemEval split.
 - **Dataset quirks.** The LongMemEval same-day timestamps (§1) and the 9 malformed LoCoMo evidence ids (§3) are handled as described, and both are scored literally.
 - **Revisions.** Other projects may have used an earlier revision of the cleaned LongMemEval file.

@@ -7,7 +7,8 @@ const SCRIPT_EDGE = /(?<=[฀-๿])(?=[0-9A-Za-z])|(?<=[0-9A-Za-z])(?=[฀-๿])
 // Code identifiers: snake_case, kebab, dotted, camelCase, HTTPServer → parts.
 const IDENT_EDGE = /[_.\-:]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/;
 
-const fold = (s: string) => s.normalize('NFC').replace(/ํา/g, 'ำ'); // ํา typed as two chars → ำ
+// ํา typed as two chars → ำ; Thai digits → ASCII (ภ.ง.ด.๕๓ = ภ.ง.ด.53), one char each so snippet offsets stay aligned
+const fold = (s: string) => s.normalize('NFC').replace(/ํา/g, 'ำ').replace(/[๐-๙]/g, (d) => String(d.charCodeAt(0) - 0x0e50));
 
 export function normalize(s: string): string {
   return fold(s).toLowerCase();
@@ -89,7 +90,10 @@ const ASK = new Set('เมื่อ ไหร่ ตอน ไหน ช่ว�
 export function queryTerms(q: string): Term[] {
   const ws = words(q), kept = ws.filter((w) => !STOP.has(w));
   const loei = kept.length > 0 && kept.every((w) => ASK.has(w));
-  return [...new Set(ws.filter((w) => !STOP.has(w) || (loei && w === 'เลย')))].map((w) => ({
+  const out = ws.filter((w) => !STOP.has(w) || (loei && w === 'เลย'));
+  // + the province's English name, only where เลย cannot mean "go ahead": the rule above, จ.เลย, จังหวัดเลย (not ไปเที่ยวเลย)
+  if (loei || ws.includes('จ.เลย') || ws.some((w, i) => w === 'เลย' && /^(จ\.?|จังหวัด)$/.test(ws[i - 1] ?? ''))) out.push('loei');
+  return [...new Set(out)].map((w) => ({
     key: w,
     lit: /^[a-z][a-z0-9_]{2,}$/.test(w) ? `${lit(w)}:*` : lit(w),
   }));

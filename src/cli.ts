@@ -1,4 +1,4 @@
-// node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search <query>|stats [--latency]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
+// node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -56,7 +56,12 @@ if (cmd === 'google') {
   const [sub] = args;
   try {
     if (sub === 'login') console.log(`logged in, scopes: ${(await g.login()).join(' + ')}`);
-    else if (sub === 'status') console.log((await g.status(join(ARCHIVE_ROOT, 'google'), args.includes('--dry'))).join('\n'));
+    else if (sub === 'status') {
+      console.log((await g.status(join(ARCHIVE_ROOT, 'google'), args.includes('--dry'))).join('\n'));
+      const t = await import('./tools/google-timeline.ts');
+      const age = t.dataAgeDays(join(ARCHIVE_ROOT, t.tool));
+      console.log(age === null ? 'timeline: no export yet' : t.staleWarning(age) ?? `timeline: newest data point ${age} days old`);
+    }
     else if (sub === 'revoke') console.log(await g.revoke());
     else console.log('usage: node src/cli.ts google <login|status [--dry]|revoke>');
   } catch (e) {
@@ -64,6 +69,16 @@ if (cmd === 'google') {
     process.exit(1);
   }
   process.exit(0);
+}
+
+if (cmd === 'lint') {
+  // lint [--dry]: nightly report-only checks → hubs/_lint.md (--dry prints instead). Reads the DB with the read-only role.
+  const { connect } = await import('./db.ts');
+  const db = connect('ro');
+  try { console.log(await (await import('./lint.ts')).runLint(db, { dry: args.includes('--dry') })); }
+  catch (e) { console.error(`lint: ${(e as Error).message}`); process.exitCode = 1; }
+  finally { await db.end(); }
+  process.exit();
 }
 
 const { connect } = await import('./db.ts');
@@ -81,7 +96,12 @@ try {
         const imp = await import('./importer.ts');
         const t0 = Date.now();
         if (args.includes('--google-full')) process.env.MEMHUB_GOOGLE_FULL = '1'; // every matching Gmail thread / Drive file, not just new ones
-        if (cmd === 'sync') console.log('archive', JSON.stringify(imp.syncArchive()));
+        if (cmd === 'sync') {
+          console.log('archive', JSON.stringify(imp.syncArchive()));
+          const t = await import('./tools/google-timeline.ts');
+          const stale = t.staleWarning(t.dataAgeDays(join(imp.ARCHIVE_ROOT, t.tool))); // hourly.log: the phone export is getting old
+          if (stale) console.log(stale);
+        }
         const file = args.find((a) => !a.startsWith('--'));
         const force = args.includes('--force');
         console.log('index', file ? await imp.indexFile(db, file, force) : await imp.indexArchive(db, force), `${Date.now() - t0} ms`);
@@ -103,35 +123,38 @@ try {
       .filter((f) => f.endsWith('.jsonl'));
     try {
       for (const f of files) { imp.syncOne(f); await imp.indexFile(db, imp.archivePath(f)); }
-      await (await import('./embed.ts')).backfill(db, 32, () => {}).catch(() => 0); // Ollama down → vectors filled by next import
+      await (await import('./embed.ts')).backfill(db, 8, () => {}).catch(() => 0); // Ollama down → vectors filled by next import
     } catch (e) {
       appendFileSync(join(ROOT, 'ingest.log'), `${new Date().toISOString()} ${live}: ${(e as Error).message}\n`);
     }
   } else if (cmd === 'retokenize') {
     // Tokenizer changed → rebuild words/bigrams in place (keeps embeddings; chunk ids don't depend on lexemes).
+    // Only rows whose tokens differ are written: every rewritten row is re-inserted into the GIN and HNSW indexes.
     const { bigramRuns, bigramTsvector, toTsvector, words } = await import('./thai.ts');
-    let n = 0;
+    let n = 0, changed = 0;
     for (let last = ''; ;) {
       const rows = (await db.query('SELECT id, ctx_header, text FROM chunks WHERE id > $1 ORDER BY id LIMIT 1000', [last])).rows;
       if (!rows.length) break;
-      await db.query(
-        `UPDATE chunks c SET words = v.w::tsvector, bigrams = v.b::tsvector FROM unnest($1::text[], $2::text[], $3::text[]) v(id, w, b) WHERE c.id = v.id`,
+      changed += (await db.query(
+        `UPDATE chunks c SET words = v.w::tsvector, bigrams = v.b::tsvector FROM unnest($1::text[], $2::text[], $3::text[]) v(id, w, b)
+         WHERE c.id = v.id AND (c.words, c.bigrams) IS DISTINCT FROM (v.w::tsvector, v.b::tsvector)`,
         [rows.map((r) => r.id), rows.map((r) => toTsvector(words(`${r.ctx_header}\n${r.text}`))), rows.map((r) => bigramTsvector(bigramRuns(r.text)))],
-      );
+      )).rowCount ?? 0;
       n += rows.length;
       last = rows.at(-1).id;
     }
     await (await import('./search.ts')).refreshTermDf(db);
-    console.log('retokenized', n);
+    console.log('retokenized', n, 'changed', changed);
   } else if (cmd === 'embed') {
     const { backfill } = await import('./embed.ts');
     const t0 = Date.now();
     console.log('embedded', await backfill(db), `${Date.now() - t0} ms`);
   } else if (cmd === 'search') {
     const { search, snippet } = await import('./search.ts');
-    const q = args.join(' ');
+    const take = (k: string) => { const i = args.indexOf(k); return i < 0 ? undefined : args.splice(i, 2)[1]; }; // flag + value leave the query
+    const since = take('--since'), until = take('--until'), q = args.join(' ');
     const t0 = performance.now();
-    const { hits, semantic } = await search(db, q);
+    const { hits, semantic } = await search(db, q, { since, until });
     const ms = (performance.now() - t0).toFixed(1);
     for (const h of hits) console.log(`[${h.id}] ${h.ts?.toISOString().slice(0, 10)} ${h.project} ${h.score.toFixed(4)}\n  ${snippet(h.text, q, 200)}`);
     console.log(`${hits.length} hits in ${ms} ms${semantic ? '' : ' (keyword-only)'}`);
@@ -141,7 +164,7 @@ try {
     try {
       console.log(args[0] ? await indexVault(db, args[0]) : await indexVaults(db)); // no arg = all vaults
       await resolveLinks(db);
-      await (await import('./embed.ts')).backfill(db, 32, () => {}).catch(() => 0);
+      await (await import('./embed.ts')).backfill(db, 8, () => {}).catch(() => 0);
     } catch (e) {
       (await import('node:fs')).appendFileSync(join(ROOT, 'ingest.log'), `${new Date().toISOString()} vault ${args[0]}: ${(e as Error).message}\n`);
     }
@@ -149,7 +172,11 @@ try {
     // forget --session <id> | --project <path prefix>: drop from the index for good (raw archive untouched)
     const what = args[0] === '--session' ? 'session' : args[0] === '--project' ? 'project' : null;
     if (!what || !args[1]) throw new Error('usage: forget --session <id> | --project <path>');
-    console.log('forgot sources:', await (await import('./importer.ts')).forget(db, what, args[1]));
+    const r = await (await import('./importer.ts')).forget(db, what, args[1]);
+    console.log('forgot sources:', r.sources);
+    // facts/cards dreamed from it: printed as fid + note file name (what was retired), not the note body
+    for (const [k, xs] of [['retired (note deleted)', r.retired], ['kept, provenance trimmed', r.trimmed], ['kept: edited by you, see hubs/_review.md', r.review], ['daily notes you edited (may still quote it)', r.daily]] as const)
+      if (xs.length) console.log(`${k}: ${xs.length}\n${xs.map((x) => `  ${x}`).join('\n')}`);
   } else if (cmd === 'dream') {
     // dream [--runner claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, co-access, hubs)
     const d = await import('./dream.ts');
@@ -169,6 +196,22 @@ try {
       console.log(JSON.stringify({ run, status: r.status, stats: r.stats }));
       if (r.pending) console.log(`pending requests (answer each <id>.request.json with <id>.result.json, then rerun):\n${r.pending.map((p) => join(dir, `${p}.request.json`)).join('\n')}`);
     }
+  } else if (cmd === 'daily') {
+    // daily [YYYY-MM-DD] [--out dir]: the day's activity note (default yesterday, Asia/Bangkok) → vault daily/ + index;
+    // --out = a preview file only (no vault, no git, no index)
+    const d = await import('./daily.ts');
+    const out = args.includes('--out') ? args[args.indexOf('--out') + 1] : undefined;
+    if (args.includes('--out') && !out) throw new Error('usage: daily [YYYY-MM-DD] [--out dir]');
+    const day = args.find((a) => !a.startsWith('--') && a !== out) ?? d.yesterday();
+    const r = await d.writeDaily(db, day, out);
+    if (r === 'written') {
+      const { MEMORY_VAULT } = await import('./notes.ts');
+      const { indexVault, resolveLinks } = await import('./obsidian.ts');
+      await indexVault(db, MEMORY_VAULT);
+      await resolveLinks(db);
+      await (await import('./embed.ts')).backfill(db, 8, () => {}).catch(() => 0); // Ollama down → the next sync embeds it
+    }
+    console.log(`daily ${day}: ${r}`); // kept-user-edit = ลุงจืด edited that note: left as is
   } else if (cmd === 'brain') {
     // brain [--public] [--out file.json] [--rebake] → graph for the web viewer (public = anonymized, safe to publish)
     const { buildBrain } = await import('./brain.ts');
@@ -277,12 +320,19 @@ try {
       console.log(`last ${days} day${days > 1 ? 's' : ''}:`);
       if (r.rows.length) console.table(r.rows); else console.log('  no timed calls yet');
     }
+  } else if (cmd === 'stats' && args[0] === '--injected') {
+    // stats --injected [n]: what the last n SessionStart hooks gave each new chat (ids only; memory_get <id> shows one)
+    const { projectName } = await import('./importer.ts');
+    const rows = (await db.query(`SELECT ts, client, project, ids, chars FROM injections ORDER BY id DESC LIMIT $1`, [Math.max(1, Number(args[1]) || 10)])).rows;
+    for (const r of rows) console.log(`${r.ts.toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }).slice(0, 16)}  ${r.client.padEnd(11)} ` +
+      `${(projectName(r.project ?? '') || '-').padEnd(14)} ${String(r.chars).padStart(4)} chars  ${r.ids.join(' ') || '(no ids)'}`);
+    console.log(rows.length ? `${rows.length} injections, newest first` : 'no injections recorded yet');
   } else if (cmd === 'stats') {
     const r = await db.query(`SELECT (SELECT count(*) FROM sources) sources, (SELECT count(*) FROM turns) turns,
       (SELECT count(*) FROM chunks) chunks, (SELECT pg_size_pretty(pg_database_size('memhub'))) db_size`);
     console.table(r.rows);
   } else {
-    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search <query>|stats [--latency]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|brain [--public] [--out file]|brain-serve [--port n]|publish [--build] [--force]>');
+    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|brain [--public] [--out file]|brain-serve [--port n]|publish [--build] [--force]>');
   }
 } finally {
   await db.end();

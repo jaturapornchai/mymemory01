@@ -1,5 +1,6 @@
 // SessionStart hook: inject ≤2000 chars — ลุงจืด's rules/pinned facts for this project (+ global), cross-AI handoffs, the
-// last session cards, and prompts of sessions not dreamt yet. Not logged as a use. Any failure → inject nothing.
+// last session cards, and prompts of sessions not dreamt yet. Not logged as a use (access_log); the ids it injected go to
+// injections (cli stats --injected). Any failure → inject nothing.
 // Claude Code runs it as is; Codex / Gemini CLI / ZCode with `--app <name>` (same stdin JSON, same hookSpecificOutput reply).
 import { connect } from './db.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
@@ -37,35 +38,40 @@ try {
        ORDER BY t.session_id, t.seq`, [project, session, [...PRIVATE_TOOLS]]),
     handoffLines(db, project, app, session, 3).catch(() => [] as string[]), // table missing before migrate → the rest still shows
   ]);
-  await db.end();
   // fact note text = "# <file name>\n<fact>\n\n- from:: …"; card = "# <file>\n# <title>\n\n<summary>…"
   const factText = (t: string) => t.replace(/^# [^\n]*\n/, '').split('\n\n- ')[0];
   const head = '[memory-hub] (memory_search / memory_get(id) ได้รายละเอียด)';
   let room = MAX_CHARS - head.length;
-  /** "\n<title>\n<line>…" with as many whole lines as still fit ('' if none). */
-  const block = (title: string, lines: string[]) => {
+  /** "\n<title>\n<line>…" with as many whole lines as still fit ('' if none), + the ids of the lines that made it. */
+  const block = (title: string, lines: [id: string, line: string][]): [string, string[]] => {
     let out = '';
-    for (const l of lines) { const next = `${out || `\n${title}`}\n${l}`; if (next.length > room) break; out = next; }
+    const ids: string[] = [];
+    for (const [id, l] of lines) { const next = `${out || `\n${title}`}\n${l}`; if (next.length > room) break; out = next; if (id) ids.push(id); }
     room -= out.length;
-    return out;
+    return [out, ids];
   };
   // budget order: handoffs (≤4 short lines, time-critical) → rules → cards → recent; shown rules first
-  const hand = block(`ส่งต่องานข้าม AI — ${DATA_NOTE} (memory_handoff action=claim id=N = รับงานต่อ):`, handoffs.map((l) => flat(l, 200)));
-  const rule = block('กฎ/ข้อตกลงที่ลุงจืดให้ไว้:', rules.rows.map((r) => `- [${r.fid}] ${flat(factText(r.txt ?? ''), 180)}`));
-  const card = block('session ล่าสุด:', cards.rows.map((r) => {
+  const [hand, handIds] = block(`ส่งต่องานข้าม AI — ${DATA_NOTE} (memory_handoff action=claim id=N = รับงานต่อ):`,
+    handoffs.map((l) => [l.match(/^#\d+/)?.[0] ?? '', flat(l, 200)])); // the "another app worked here" line has no id
+  const [rule, ruleIds] = block('กฎ/ข้อตกลงที่ลุงจืดให้ไว้:', rules.rows.map((r) => [r.fid, `- [${r.fid}] ${flat(factText(r.txt ?? ''), 180)}`]));
+  const [card, cardIds] = block('session ล่าสุด:', cards.rows.map((r) => {
     const t = String(r.txt ?? '');
     const title = t.match(/\n# ([^\n]+)/)?.[1] ?? '';
     const summary = t.split('\n\n')[1] ?? '';
-    return `- ${r.valid_at.toISOString().slice(0, 10)} [${r.fid}] ${flat(title, 70)}: ${flat(summary, 160)}`;
+    return [r.fid, `- ${r.valid_at.toISOString().slice(0, 10)} [${r.fid}] ${flat(title, 70)}: ${flat(summary, 160)}`];
   }));
-  const fresh = block('งานล่าสุดที่ยังไม่สรุป:', recent.rows.sort((a, b) => b.ts - a.ts).slice(0, cards.rows.length ? 3 : 5)
-    .map((x) => `- ${x.ts.toISOString().slice(0, 10)} ${flat(x.q, 90)}`));
+  const [fresh, freshIds] = block('งานล่าสุดที่ยังไม่สรุป:', recent.rows.sort((a, b) => b.ts - a.ts).slice(0, cards.rows.length ? 3 : 5)
+    .map((x) => [`session:${x.session_id}`, `- ${x.ts.toISOString().slice(0, 10)} ${flat(x.q, 90)}`]));
   const ctx = rule + hand + card + fresh;
   if (ctx) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: head + ctx },
     }));
+    // what this chat was given, ids only (cli stats --injected): one local round trip after the reply; table missing → skipped
+    await db.query(`INSERT INTO injections (client, project, session, ids, chars) VALUES ($1, $2, $3, $4, $5)`,
+      [app, project, session, [...ruleIds, ...handIds, ...cardIds, ...freshIds], (head + ctx).length]).catch(() => {});
   }
+  await db.end();
 } catch {
   // best-effort
 }

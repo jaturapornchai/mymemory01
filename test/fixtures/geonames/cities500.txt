@@ -1,0 +1,2 @@
+3001	Seoul	Seoul	โซล,Seoul	35.0	135.0	P	PPLA	KR		11				0		0	Asia/Bangkok	2026-01-01
+3002	Ranong	Ranong	ระนอง	10.0	100.0	P	PPLA	TH		01				0		0	Asia/Bangkok	2026-01-01

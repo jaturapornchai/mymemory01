@@ -1,0 +1,3 @@
+TH.01	Ranong	Ranong	1001
+TH.02	Surat Thani	Surat Thani	2001
+KR.11	Seoul	Seoul	3003

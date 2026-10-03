@@ -1,0 +1,23 @@
+# memory-hub Postgres — isolated: own container, own volume, loopback only.
+name: memory-hub
+services:
+  pg:
+    image: pgvector/pgvector:0.8.6-pg18
+    container_name: memhub-pg
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MEMHUB_PG_PORT:?run: node src/cli.ts init}:5432"
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: memhub
+      MEMHUB_RW_PASSWORD: ${MEMHUB_RW_PASSWORD:?}
+      MEMHUB_RO_PASSWORD: ${MEMHUB_RO_PASSWORD:?}
+    volumes:
+      - memhub-pgdata:/var/lib/postgresql # PG18 image: PGDATA=/var/lib/postgresql/18/docker
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    shm_size: 3g # parallel HNSW build uses maintenance_work_mem (2GB) of DSM
+    command: >
+      postgres -c shared_buffers=2GB -c effective_cache_size=8GB -c maintenance_work_mem=2GB
+      -c max_parallel_maintenance_workers=4 -c listen_addresses='*'
+volumes:
+  memhub-pgdata: {}

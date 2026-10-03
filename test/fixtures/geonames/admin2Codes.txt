@@ -1,0 +1,2 @@
+TH.01.0101	Amphoe Mueang Ranong	Amphoe Mueang Ranong	1002
+TH.02.0201	Amphoe Mueang Surat Thani	Amphoe Mueang Surat Thani	2002

@@ -1,0 +1,28 @@
+{
+  "name": "memory-hub-web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 5443",
+    "build": "next build",
+    "data": "node ../src/cli.ts brain --public --out public/graph.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test app/components/brain/brain.test.ts app/lib/insight.test.ts app/lib/numbers.test.ts",
+    "check": "node scripts/scene-check.mjs"
+  },
+  "dependencies": {
+    "next": "^16.3.8",
+    "postprocessing": "6.39.5",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "0.186.0",
+    "playwright-core": "1.63.0",
+    "typescript": "^5.9.3"
+  }
+}

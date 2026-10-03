@@ -1,0 +1,680 @@
+[
+ {
+  "sources": [
+   {
+    "title": "Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory (arXiv 2504.19413)",
+    "url": "https://arxiv.org/html/2504.19413"
+   },
+   {
+    "title": "mem0 prompts.py (ADDITIVE_EXTRACTION_PROMPT, DEFAULT_UPDATE_MEMORY_PROMPT, PAST_MESSAGE_TRUNCATION_LIMIT)",
+    "url": "https://raw.githubusercontent.com/mem0ai/mem0/main/mem0/configs/prompts.py"
+   },
+   {
+    "title": "mem0 memory/main.py (top_k=10 existing, last 10 messages, uuid_mapping, md5 dedup, entity boost)",
+    "url": "https://raw.githubusercontent.com/mem0ai/mem0/main/mem0/memory/main.py"
+   },
+   {
+    "title": "mem0 utils/scoring.py (combined score, ENTITY_BOOST_WEIGHT=0.5)",
+    "url": "https://raw.githubusercontent.com/mem0ai/mem0/main/mem0/utils/scoring.py"
+   },
+   {
+    "title": "Mem0 SDK changelog v2.0.0 (2026-04-14): V3 pipeline, ADD-only extraction",
+    "url": "https://docs.mem0.ai/changelog/sdk"
+   },
+   {
+    "title": "mem0 PR #4805: port v3 pipeline (ADD-only, graph stores removed)",
+    "url": "https://github.com/mem0ai/mem0/pull/4805"
+   },
+   {
+    "title": "mem0 Discussion #4787: dedup and contradiction handling (community answers)",
+    "url": "https://github.com/mem0ai/mem0/discussions/4787"
+   },
+   {
+    "title": "Sleep-time Compute: Beyond Inference Scaling at Test-time (arXiv 2504.13171)",
+    "url": "https://arxiv.org/html/2504.13171"
+   },
+   {
+    "title": "Letta blog: Sleep-time Compute",
+    "url": "https://www.letta.com/blog/sleep-time-compute/"
+   },
+   {
+    "title": "Letta docs: Memory & dreaming (current, MemFS)",
+    "url": "https://docs.letta.com/configuration/memory"
+   },
+   {
+    "title": "Letta source 0.16.8: groups/sleeptime_multi_agent_v4.py (watermark + transcript prompt)",
+    "url": "https://github.com/letta-ai/letta/blob/0.16.8/letta/groups/sleeptime_multi_agent_v4.py"
+   },
+   {
+    "title": "Letta source 0.16.8: prompts/system_prompts/sleeptime_v2.py",
+    "url": "https://github.com/letta-ai/letta/blob/0.16.8/letta/prompts/system_prompts/sleeptime_v2.py"
+   },
+   {
+    "title": "Letta source 0.16.8: constants.py (BASE_SLEEPTIME_TOOLS)",
+    "url": "https://github.com/letta-ai/letta/blob/0.16.8/letta/constants.py"
+   },
+   {
+    "title": "Letta community forum: Sleeptime agents best practices (community, not staff)",
+    "url": "https://forum.letta.com/t/sleeptime-agents-for-memory-consolidation-best-practices-guide/154"
+   },
+   {
+    "title": "Claude Platform Docs: Managed Agents Dreams (official)",
+    "url": "https://platform.claude.com/docs/en/managed-agents/dreams"
+   },
+   {
+    "title": "Claude blog: New in Claude Managed Agents (dreaming)",
+    "url": "https://claude.com/blog/new-in-claude-managed-agents"
+   },
+   {
+    "title": "Claude Code docs: How Claude remembers your project (auto memory; no Auto Dream mention)",
+    "url": "https://code.claude.com/docs/en/memory"
+   },
+   {
+    "title": "Claude Code docs: CLI reference (-p flags)",
+    "url": "https://code.claude.com/docs/en/cli-reference"
+   },
+   {
+    "title": "Claude Code docs: headless / bare mode",
+    "url": "https://code.claude.com/docs/en/headless"
+   },
+   {
+    "title": "Claude Code docs: env vars (CLAUDE_CODE_PROMPT_CACHE_TTL)",
+    "url": "https://code.claude.com/docs/en/env-vars"
+   },
+   {
+    "title": "Third-party: Claude Code Auto Dream write-up (claudefa.st, unofficial)",
+    "url": "https://claudefa.st/blog/guide/mechanics/auto-dream"
+   },
+   {
+    "title": "Third-party: Milvus blog on Claude Code memory (based on leaked source, unofficial)",
+    "url": "https://milvus.io/blog/claude-code-memory-memsearch.md"
+   }
+  ],
+  "mechanisms": [
+   {
+    "name": "Mem0 extraction phase (paper)",
+    "from": "arXiv 2504.19413 §2.1",
+    "exact_spec": "Prompt P = (S, {m_{t-m}, ..., m_{t-2}}, m_{t-1}, m_t). S is a conversation summary pulled from the DB. An 'asynchronous summary generation module ... periodically refreshes the conversation summary' outside the main pipeline. Recent window m = 10 messages. The new pair (m_{t-1}, m_t) is user msg + assistant reply. Extraction function phi (an LLM) returns salient memories Omega = {w1..wn}. Model GPT-4o-mini, embeddings text-embedding-3-small. It runs online, once per message pair. Paper-reported on LOCOMO: Mem0 ~7k tokens/conversation, p95 total latency 1.440 s vs full-context 17.117 s. J scores: single-hop 67.13, multi-hop 51.15, open-domain 72.93, temporal 55.51.",
+    "adopt_for_memory_hub": "Keep the input shape and drop the per-turn timing, since the hot path is forbidden. Nightly, build one 'S' per project: a project_brief row regenerated from promoted facts, not from raw turns. Feed it plus the session digest. Replace 'last m=10 messages' with the digest described in the batching mechanism below.",
+    "cost": "Online per-pair extraction = 1-2 LLM calls per turn. Ruled out by the constraint, and pointless given the measured volume (188 user turns in 8 days)."
+   },
+   {
+    "name": "Mem0 update phase ADD/UPDATE/DELETE/NOOP (paper) and DEFAULT_UPDATE_MEMORY_PROMPT (code)",
+    "from": "arXiv 2504.19413 §2.1; mem0/configs/prompts.py",
+    "exact_spec": "For each extracted fact, retrieve the top s = 10 semantically similar memories (dense vectors). The LLM picks one op via a tool call: 'ADD for creation of new memories when no semantically equivalent memory exists'; 'UPDATE for augmentation of existing memories with complementary information'; 'DELETE for removal of memories contradicted by new information'; 'NOOP when the candidate fact requires no modification'. Code output format: {\"memory\":[{\"id\":\"0\",\"text\":...,\"event\":\"ADD|UPDATE|DELETE|NONE\",\"old_memory\":...}]}. Rules quoted: keep the same ID on update and 'Do not generate any new ID' except for ADD. The code DELETE is a hard vector-store delete plus a history row (old_memory, new_memory, event, is_deleted).",
+    "adopt_for_memory_hub": "Retrieve s=10 neighbours per session with the existing hybrid search (RRF), with no LLM involved. Do NOT expose UPDATE/DELETE. Map them to: ADD (new fact), SUPERSEDES (new fact plus a link to the old one), NOOP, CONTRADICTS (goes to review_queue when the target kind is rule/feedback or comes from Obsidian notes). Old rows are never rewritten. A superseded fact gets an edge, not an in-place edit.",
+    "cost": "Paper version = 2 LLM calls per fact batch. The hub version is folded into the single nightly call."
+   },
+   {
+    "name": "Mem0 V3 ADD-only additive extraction (current code, v2.0.0, 2026-04-14)",
+    "from": "docs.mem0.ai/changelog/sdk; PR #4805; prompts.py generate_additive_extraction_prompt; main.py _add_to_vector_store",
+    "exact_spec": "Changelog: 'Replaced 2-LLM-call pipeline with additive extraction using ADDITIVE_EXTRACTION_PROMPT. Memories accumulate via linked_memory_ids: no more UPDATE/DELETE events.' User-prompt sections, in order: '## Summary', '## Last k Messages' (last 10 messages from db, each truncated to PAST_MESSAGE_TRUNCATION_LIMIT = 300 chars, formatted 'role: content'), '## Recently Extracted Memories' (up to 20, the 'primary deduplication reference'), '## Existing Memories' (vector top_k=10, JSON [{id,text}]), '## New Messages', '## Observation Date', '## Current Date', optional '## Custom Instructions', optional '## Language Requirement' ('Respond in the SAME LANGUAGE and SCRIPT as the input messages ... Do NOT translate or transliterate ... Technical terms, proper nouns, and brand names should be preserved in their original form ... If the input mixes languages ... preserve both'), then '# Output:'. Existing Memories are 'ONLY for deduplication and linking — do NOT extract new memories from Existing Memories'. Output: {\"memory\":[{\"id\":\"0\",\"text\":...,\"attributed_to\":\"user|assistant\",\"linked_memory_ids\":[uuid...]}]}. Further rules: 'Never generalize specific qualifiers'; 'No Detail Contamination from Context'; link only same specific entity/event/topic ('Do NOT link memories that merely share a vague theme'). After the LLM call, exact md5(text) dedup. The graph store was removed (~4,000 lines) in favour of built-in entity linking. latest_only and delete_linked handle superseded chains.",
+    "adopt_for_memory_hub": "Use this as the nightly prompt template almost verbatim. It already matches the no-delete rule and the Thai/English/code mix. Add a facts table (id, text, kind, lang, project, observed_at, source_uuids text[], md5 unique, dream_run_id) and fact_links(src, dst, rel, weight, created_by_run). Store linked ids as fact_links rows. These are the 'synapses' for the brain graph, and they render as Obsidian-style edges next to the existing links table. Always include the Language Requirement section so Thai stays Thai, because the bigram index cannot match translated text.",
+    "cost": "One LLM call per batch instead of two per fact. Mem0 gives the reason as reduced overhead (no paper number)."
+   },
+   {
+    "name": "Integer ID remapping before the LLM sees IDs",
+    "from": "mem0/memory/main.py (uuid_mapping); DEFAULT_UPDATE_MEMORY_PROMPT",
+    "exact_spec": "for idx, mem in enumerate(existing_results): uuid_mapping[str(idx)] = mem.id; existing_memories.append({\"id\": str(idx), \"text\": ...}). The LLM only ever sees '0','1',..., and the code maps back. New ADD ids are 'Sequential integers as strings starting at \"0\"'.",
+    "adopt_for_memory_hub": "In Node, map turns to T1..Tn and existing facts to F1..Fn per batch, and keep Map<short, uuid>. The JSON schema requires source_turns: string[] matching ^T\\d+$. Reject (do not 'repair') any id not in the map. That keeps the 'every fact keeps source_uuids' guarantee, and short ids save tokens over 36-char UUIDs.",
+    "cost": "Zero LLM cost. Cuts ID tokens and makes provenance hallucination detectable."
+   },
+   {
+    "name": "Mem0 retrieval scoring with hub-dampened entity boost (for the brain graph)",
+    "from": "mem0/utils/scoring.py; main.py _compute_entity_boosts",
+    "exact_spec": "combined = min((semantic + bm25 + entity_boost) / max_possible, 1.0). max_possible = 1.0 (+1.0 if BM25, +ENTITY_BOOST_WEIGHT if entities), ENTITY_BOOST_WEIGHT = 0.5. BM25 is normalized as 1/(1+exp(-steepness*(raw-midpoint))). Entity matches with similarity < 0.5 are skipped. memory_count_weight = 1/(1 + 0.001*(num_linked-1)^2). boost = similarity * 0.5 * memory_count_weight, max over entities. Semantic over-fetch = max(limit*4, 60). Default threshold 0.1.",
+    "adopt_for_memory_hub": "Keep the existing RRF; it is measured (R@10 86%). Borrow only the hub dampening: when spreading activation over fact_links/links, scale a neighbour's contribution by 1/(1+0.001*(deg-1)^2) so hub notes such as a daily note or 'README' don't dominate. Evaluate it on the existing 86-question set before shipping.",
+    "cost": "SQL only, no LLM."
+   },
+   {
+    "name": "Mem0g graph variant (paper) and its later removal",
+    "from": "arXiv 2504.19413 §2.2; changelog v2.0.0",
+    "exact_spec": "Entity extractor gives typed nodes. Relationship triplets (v_s, r, v_d), G = (V, E, L). Conflict detection on new info. Obsolete relations are marked 'invalid rather than physically removing them to enable temporal reasoning'. Neo4j. Paper-reported: ~14k tokens/conversation vs ~7k for Mem0. p95 latency 2.590 s vs 1.440 s. J: open-domain 75.71, temporal 58.13 (better), multi-hop 47.19 (worse than Mem0 51.15). Mem0 removed external graph stores in v2.0.0.",
+    "adopt_for_memory_hub": "Do not build an LLM triplet graph. Take two ideas only. (1) Invalidate, don't delete: fact_links rel='supersedes' plus valid_to on the link. (2) Build the 'brain' from cheap edges: wikilinks (already present), fact to source turn, fact to fact links from the nightly call, and vector kNN edges computed in SQL. LLM edge extraction doubles tokens (paper-reported) for mixed gains.",
+    "cost": "Paper-reported 2x tokens vs Mem0. Avoided."
+   },
+   {
+    "name": "Sleep-time compute (paper)",
+    "from": "arXiv 2504.13171",
+    "exact_spec": "Offline S(c) -> c', then test time T_b(q, c') -> a with b << B (baseline T_B(q, c) -> a). Implementation: function calls rethink_memory (replace context with a new string that integrates inferences) and finish_rethinking_memory (stop). 'The model is allowed to call the function rethink_memory for up to 10 times.' Paper-reported: ~5x less test-time compute for equal accuracy (Stateful GSM-Symbolic, Stateful AIME); +13% (GSM-Symbolic) and +18% (AIME) accuracy from scaling sleep-time compute; 2.5x lower average cost per query when amortized over 10 related queries per context (Multi-Query GSM-Symbolic). Most effective 'where the query is more predictable from the context'. The gap widens with predictability.",
+    "adopt_for_memory_hub": "This is the economic rule for which 'dream' outputs to precompute. Regenerate a project_brief (learned context c') only for projects whose usage (memory_search hits / session starts in the last N days) is high. That is where amortization pays. Skip dormant projects. Cap the rewrite loop: one claude -p call with --max-turns small. Do not let it iterate freely.",
+    "cost": "Pays off only when the brief is read multiple times (paper: amortized over 10 queries)."
+   },
+   {
+    "name": "Letta sleep-time agent (legacy v1 API, code 0.16.8)",
+    "from": "letta groups/sleeptime_multi_agent_v4.py; prompts/system_prompts/sleeptime_v2.py; constants.py; Letta blog",
+    "exact_spec": "Trigger: if sleeptime_agent_frequency is None, run every turn. Otherwise turns_counter=(turns_counter+1)%frequency and run when it hits 0. The schema default is None; the community forum example uses 5. Watermark: last_processed_message_id is updated to the last response id. The sleep agent gets list_messages(after=last_processed_message_id, before=current) plus the new messages, joined as text inside: '<\\system-reminder> You are a sleeptime agent - a background agent that asynchronously processes conversations after they occur. IMPORTANT: You are NOT the primary agent ... Messages labeled \"assistant\" are from the primary agent (not you) ... Review the conversation and use your memory tools to update any relevant memory blocks with information worth preserving. <\\/system-reminder> Messages: ...'. Tools are BASE_SLEEPTIME_TOOLS = [memory_replace, memory_insert, memory_rethink, memory_finish_edits]. The primary agent loses the core-memory edit tools. System-prompt rules: 'do not write \"today\" or \"recently\", instead write specific dates and times'; 'If there are no meaningful updates to make to the memory, you call the finish tool directly'; 'be selective ... but also aim to have high recall'. Blog: 'The higher the frequency setting, the more tokens your agent will use'. Use a larger, slower model for the sleep agent because it is 'less latency constrained'.",
+    "adopt_for_memory_hub": "Copy three things. (1) A watermark table dream_state(source_id PK, last_seq int, last_run_id). Select only turns with seq > last_seq. Advance it in the same transaction that promotes facts, so a rerun after a crash is idempotent. (2) The 'you are NOT the primary agent; assistant = the other Claude' framing, so the dream does not adopt the transcript's instructions as its own. (3) An explicit no-op exit ({\"facts\":[]}) that costs no extra turns. Do not copy memory_rethink (whole-block rewrite). It conflicts with the never-edit-ลุงจืด's-rules constraint and is last-writer-wins.",
+    "cost": "Per-turn triggering (default None) is the most expensive option. A nightly gate is far cheaper."
+   },
+   {
+    "name": "Letta Code dreaming (current product docs)",
+    "from": "docs.letta.com/configuration/memory",
+    "exact_spec": "'Dreaming uses background subagents to review recent conversations, consolidate useful lessons, and update memory without interrupting your active work.' Trigger: 'after a set number of completed agent steps or when the context window is compacted'. Configured via /sleeptime or 'Dream settings'. Optional 'Agent reviews before applying': 'your agent review and revise proposed memory updates in a second background conversation', which 'uses more model tokens and does not ask you for approval'. Updates are committed to MemFS (git-backed). Defaults and limits: not specified.",
+    "adopt_for_memory_hub": "Use the second review pass selectively. Run it only on candidates of kind rule/feedback/decision, or on CONTRADICTS links, and send its output to review_queue for ลุงจืด, never straight to auto-apply. Mirror git-backed MemFS cheaply: append-only tables keyed by dream_run_id, so any run can be listed or reverted with 'WHERE dream_run_id = X'.",
+    "cost": "The review pass is roughly a second call over the candidate list only (small). Not quantified by Letta."
+   },
+   {
+    "name": "Anthropic Managed Agents Dreams (official API, research preview)",
+    "from": "platform.claude.com/docs/en/managed-agents/dreams; claude.com blog",
+    "exact_spec": "Asynchronous job. Inputs: one existing memory_store plus '1 to 100 sessions'. Output: a NEW memory store. 'The input store is never modified, so you can review the output and discard it'. Result: 'duplicates merged, stale or contradicted entries replaced with the latest value, and new insights surfaced'. Optional instructions (max 4,096 chars) for 'focus areas ..., content to preserve unchanged, or output conventions'. It is 'a synthesis pass over the inputs, not an editor', so line-targeted directives 'generally produce no change'. Runs 'minutes to a few hours'. Statuses: pending/running/completed/failed/canceled. Billing: 'Cost scales roughly linearly with the number and length of input sessions. Start with a small batch'. Models: claude-opus-5, claude-fable-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-5, claude-sonnet-4-6. Blog: dreaming 'can update memory automatically, or you can review changes before they land'. Vendor-reported customer claim: Harvey completion rates '~6x'.",
+    "adopt_for_memory_hub": "Use the shadow-output pattern. The dream writes candidates into fact_candidates(dream_run_id, ...) and never touches facts. A deterministic Node promoter checks schema, ids, md5 dedup and protected kinds, then inserts into facts. Protected or contradicting items go to review_queue. Keep a hard cap of <=100 sessions per run. Put 'preserve unchanged' items in the instructions: ลุงจืด's rules, feedback, and mydocs/Obsidian notes are read-only inputs. Do targeted fixes in code, not via the prompt. This is the local equivalent without the API, run via claude -p.",
+    "cost": "Linear in session count and length (official). The hub cuts it by feeding digests, not full transcripts."
+   },
+   {
+    "name": "Claude Code Auto Dream",
+    "from": "code.claude.com/docs/en/memory (checked 2026-10-01); third-party write-ups",
+    "exact_spec": "OFFICIAL DOCS: not mentioned. The memory page, llms.txt index, commands, settings-reference, claude-directory and headless pages contain no 'dream'. Officially documented: auto memory in ~/.claude/projects/<project>/memory/ with a MEMORY.md index; 'The first 200 lines of MEMORY.md, or the first 25KB, whichever comes first, are loaded'; topic files load on demand; a 'modified' ISO-8601 frontmatter field is added on writes (v2.1.214+). UNOFFICIAL (community/leaked-source claims, unverified): phases Orient -> Gather signal -> Consolidate -> Prune & index; auto-runs after >=24 h AND >=5 sessions since the last run; /dream manual trigger; converts relative dates to absolute; keeps MEMORY.md under 200 lines.",
+    "adopt_for_memory_hub": "Borrow the gate only as a heuristic: skip the night unless there are >=5 new sessions OR >24 h of backlog with any new user turns. Also borrow the 4-phase order. Orient = load project_brief + top facts (SQL). Gather = build digests (SQL/Node). Consolidate = the single claude -p call. Prune & index = SQL: rebuild briefs and edges, never delete rows. Label it 'unofficial' in docs.",
+    "cost": "The gate turns quiet nights into zero tokens."
+   },
+   {
+    "name": "Nightly claude -p batching recipe for memory-hub (synthesized; volumes measured from the local DB)",
+    "from": "Synthesis of the above plus the Claude Code CLI/headless/env-vars docs; measured on memhub turns table 2026-09-23..10-01",
+    "exact_spec": "MEASURED (8 days, non-subagent): 188 user turns = 16k chars total; 7,076 assistant messages = 1.97M chars; only 186 are the final assistant reply before the next user turn (199k chars when each is capped at 1,500); role='note' (Obsidian) = 1.79M chars, and the 2026-09-28 spike of 210 'sessions' was vault notes, not chats. So a digest of user turns in full + final reply capped at 1,500 + compact tool lines is about 27k chars/day, roughly 10% of raw. Thai tokens/char is not verified: measure usage.input_tokens. STEPS: (1) Lock: pg_try_advisory_lock(<const>) so only one dream runs. (2) Select sessions with seq > dream_state.last_seq whose last turn ts < now()-1h (finished). Exclude role in (note, notice, summary), subagent sources and internal runs. (3) Gate: run if >=5 new sessions or oldest pending >24h. (4) Digest per session: header 'session S3 | project | 2026-09-30 (Asia/Bangkok)'. User turns verbatim (corrections live here). For each user turn, keep only the final assistant reply, capped at 1,500 chars (Mem0 uses 300 for context messages; ลุงจืด's answers carry decisions, so keep more). Keep Write/Edit file paths deduped, drop Bash output. Ids T1..Tn. (5) Pack by project, then time, into batches of <= ~40k input tokens and <= 100 sessions. At today's volume that is 1 call/night, or 1 per active project. (6) Per batch, run existing hybrid search with each session's user text as the query. Union the top s=10 per session, dedupe, cap ~40, id F1..Fn, mark protected kinds. (7) Prompt order for cache reuse. --system-prompt-file dream.md is static: the Mem0 additive rules + Letta 'you are NOT the primary agent' + absolute dates + Language Requirement + protected-kind policy. Then the user message: Current Date, project brief, Existing Facts, sessions. No dates in the system prompt. (8) Invocation: MEMORY_HUB_INTERNAL=1 CLAUDE_CODE_PROMPT_CACHE_TTL=1h claude -p --output-format json --json-schema '<schema>' --tools \"\" --strict-mcp-config --no-session-persistence --system-prompt-file dream.md --model sonnet --max-turns 3 < batch.txt. Use --bare only if ANTHROPIC_API_KEY is set; per the docs, bare mode 'doesn't use your subscription login'. Check whether ~/.claude/CLAUDE.md (+@AGENTS.md) still loads: compare usage.input_tokens on an empty prompt, and try --setting-sources project from an empty cwd. (9) Schema: {facts:[{text, kind: rule|feedback|decision|fact|preference|howto, lang: th|en|mixed, source_turns:[\"T..\"], links:[{to:\"F..\", rel: supports|supersedes|contradicts|related}], confidence: 0..1}]}. An empty facts array is a valid no-op. (10) Promote in one transaction: validate ids, map to uuids (source_uuids), md5 dedup, insert facts and fact_links. Send contradicts/supersedes targeting protected kinds to review_queue. Advance the watermark. Release the lock. (11) Weekly 'REM' pass, inputs = facts only (not raw turns). Use SQL kNN clustering to find clusters touched this week with >= 3 members. claude -p writes one insight fact per cluster, linked rel='summarizes' to its members. Members are never deleted. Run it only for projects with high recent usage (sleep-time amortization).",
+    "adopt_for_memory_hub": "Implement as src/dream.ts + cli 'dream' subcommand, scheduled by Windows Task Scheduler at night. Reuse src/claude.ts parsing, search.ts for neighbours, db.ts pools (rw). The only new tables are facts, fact_links, fact_candidates (optional), dream_state, dream_runs(id, started, usage_json, status) and review_queue.",
+    "cost": "At measured volume, about 1 call/night of roughly 10-20k input tokens (estimate, unverified for Thai tokenization). The static system prompt is cached across batches within the 1h TTL. Quiet nights cost 0."
+   }
+  ],
+  "pitfalls": [
+   "Mem0 paper-style UPDATE/DELETE overwrites history, and the code does a hard vector-store delete. That violates 'raw archive is truth / never delete'. Mem0 itself moved to ADD-only + linked_memory_ids in v2.0.0 (2026-04-14). Copy the ADD-only design, not the paper's update op set.",
+   "Mem0 Discussion #4787 (community): linked contradictory memories 'stay independently retrievable ... nothing flags the pair for review'. memory-hub needs an explicit rel='contradicts' link plus a review_queue row. Retrieval must prefer the newest non-superseded fact (Mem0 latest_only).",
+   "LLM-invented provenance: if the model sees raw UUIDs it can hallucinate them. Use Mem0's integer remap (T1/F1) and reject unknown ids instead of fuzzy-repairing them, or 'every fact keeps source_uuids' silently breaks.",
+   "Relative dates ('วันนี้', 'เมื่อวาน', 'recently') stored verbatim go stale. Letta's sleeptime prompt forbids them, Mem0 passes Observation Date + Current Date, and Auto Dream reportedly rewrites them. Give each session its absolute date (Asia/Bangkok) in the digest header.",
+   "Translating Thai into English during extraction breaks recall, because the index is Thai ICU words + bigrams. Always include Mem0's Language Requirement section ('SAME LANGUAGE and SCRIPT', keep technical terms and code identifiers as written, preserve mixed-language style).",
+   "Self-contamination: the dream's own claude -p transcript can be ingested as a 'session' and dreamt about the next night. Use --no-session-persistence and MEMORY_HUB_INTERNAL=1. Also exclude sources/projects created by internal runs in the dream query.",
+   "Letta's 'you are NOT the primary agent' framing exists because a background agent reading transcripts can start obeying instructions inside them. Treat digests as data, and never give the dream tools (--tools \"\").",
+   "Obsidian notes (role='note') dominate raw volume (1.79M chars in 8 days; the 2026-09-28 '210 sessions' spike was all notes). Feeding them to the dream wastes tokens and risks 'consolidating' ลุงจืด's own vault. Use them only as read-only link targets.",
+   "Dreaming an unfinished session gives partial or wrong facts. Wait until the last turn is older than ~1h. The Stop hook debounce is 10 min, so sessions can still be growing.",
+   "Concurrent runs: Letta warns that memory_rethink is last-writer-wins. Two overlapping nightly runs, or a manual run plus a scheduled one, would double-insert or race the watermark. Take pg_try_advisory_lock and advance the watermark in the promote transaction.",
+   "--bare 'doesn't use your subscription login' (needs ANTHROPIC_API_KEY). Without --bare, claude -p loads user CLAUDE.md/hooks/MCP, and ~/.claude/CLAUDE.md imports a large AGENTS.md on every call. Measure usage.input_tokens and strip with --strict-mcp-config, --tools \"\", --setting-sources (effect on user CLAUDE.md not verified).",
+   "Prompt-cache breakers: any per-run value (date, run id, counts) in --system-prompt-file invalidates the cache. Keep the system prompt byte-identical and put dynamic data in the user message. Set CLAUDE_CODE_PROMPT_CACHE_TTL=1h for multi-batch nights.",
+   "Anthropic Dreams doc: the dream is 'a synthesis pass ..., not an editor'. Line-targeted instructions 'generally produce no change'. Don't rely on prompt instructions for precise edits; do them in deterministic SQL/Node.",
+   "Sleep-time compute only pays when queries are predictable and amortized (paper: 2.5x cost/query over 10 queries/context). Regenerating briefs for dormant projects is pure cost. Gate on usage counts.",
+   "Letta's default sleeptime_agent_frequency=None means it runs every turn, and Letta's blog says higher frequency = more tokens. Per-turn consolidation is both forbidden in the hot path and the most expensive option.",
+   "Mem0g (LLM triplet graph) used ~2x tokens and ~1.8x p95 latency vs Mem0 (paper-reported, LOCOMO, GPT-4o-mini), and Mem0 later removed graph stores. Don't build the 'brain' with LLM edge extraction. Derive edges from wikilinks, provenance, nightly linked ids and SQL kNN.",
+   "Hub nodes in a neuron-style graph (daily notes, index notes) dominate spreading activation. Dampen by degree, e.g. Mem0's 1/(1+0.001*(n-1)^2), and re-check R@10 on the 86-question eval before shipping.",
+   "All benchmark numbers here are paper-reported or vendor-reported (Mem0 LOCOMO J scores and latency; sleep-time 5x/13%/18%/2.5x; Harvey ~6x) on other models and data. They do not predict memory-hub results. Use the local 86-question eval.",
+   "Claude Code 'Auto Dream' is NOT in official Claude Code docs as of 2026-10-01. The 24h/5-session gate and 4 phases come from third-party write-ups (some citing leaked source). Treat them as heuristics, not spec.",
+   "The dream must never auto-apply anything touching ลุงจืด's rules/feedback or mydocs/Obsidian content. That covers SUPERSEDES/CONTRADICTS targeting protected kinds. Route these to review_queue, like Letta's optional review pass and Anthropic's 'review changes before they land'."
+  ]
+ },
+ {
+  "sources": [
+   {
+    "title": "Zep: A Temporal Knowledge Graph Architecture for Agent Memory (arXiv 2501.13956, HTML)",
+    "url": "https://arxiv.org/html/2501.13956"
+   },
+   {
+    "title": "Zep paper abstract page",
+    "url": "https://arxiv.org/abs/2501.13956"
+   },
+   {
+    "title": "getzep/graphiti README (temporal fact management: 'old facts are invalidated — not deleted')",
+    "url": "https://github.com/getzep/graphiti"
+   },
+   {
+    "title": "graphiti_core/prompts/dedupe_edges.py (resolve_edge: duplicate + contradiction prompt)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/prompts/dedupe_edges.py"
+   },
+   {
+    "title": "graphiti_core/utils/maintenance/edge_operations.py (resolve_edge_contradictions, self-expiry, fast path)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/utils/maintenance/edge_operations.py"
+   },
+   {
+    "title": "graphiti_core/prompts/extract_edges.py (extract_timestamps prompt)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/prompts/extract_edges.py"
+   },
+   {
+    "title": "graphiti_core/edges.py (EntityEdge fields valid_at/invalid_at/expired_at/episodes)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/edges.py"
+   },
+   {
+    "title": "graphiti_core/search/search_filters.py (bi-temporal DateFilter DNF)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search_filters.py"
+   },
+   {
+    "title": "graphiti_core/search/search_helpers.py (context string with valid/invalid dates)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search_helpers.py"
+   },
+   {
+    "title": "graphiti_core/search/search_utils.py (rrf rank_const=1, episode_mentions_reranker, MMR lambda 0.5)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/search/search_utils.py"
+   },
+   {
+    "title": "graphiti_core/utils/maintenance/dedup_helpers.py (exact -> MinHash/LSH -> LLM entity resolution)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/utils/maintenance/dedup_helpers.py"
+   },
+   {
+    "title": "graphiti_core/prompts/dedupe_nodes.py (entity resolution prompt)",
+    "url": "https://github.com/getzep/graphiti/blob/main/graphiti_core/prompts/dedupe_nodes.py"
+   },
+   {
+    "title": "MemoryBank: Enhancing Large Language Models with Long-Term Memory (arXiv 2305.10250)",
+    "url": "https://arxiv.org/abs/2305.10250"
+   },
+   {
+    "title": "MemoryBank paper HTML v3 (Section on Ebbinghaus memory updating)",
+    "url": "https://arxiv.org/html/2305.10250v3"
+   },
+   {
+    "title": "MemoryBank-SiliconFriend forget_memory.py (actual forgetting implementation)",
+    "url": "https://github.com/zhongwanjun/MemoryBank-SiliconFriend/blob/main/memory_bank/memory_retrieval/forget_memory.py"
+   },
+   {
+    "title": "MemoryBank-SiliconFriend local_doc_qa.py (FAISS retrieval, top_k=3)",
+    "url": "https://github.com/zhongwanjun/MemoryBank-SiliconFriend/blob/main/memory_bank/memory_retrieval/local_doc_qa.py"
+   },
+   {
+    "title": "PostgreSQL 18 release notes (temporal PK/UNIQUE WITHOUT OVERLAPS, FK PERIOD)",
+    "url": "https://www.postgresql.org/docs/current/release-18.html"
+   },
+   {
+    "title": "PostgreSQL 18 CREATE TABLE docs",
+    "url": "https://www.postgresql.org/docs/current/sql-createtable.html"
+   }
+  ],
+  "mechanisms": [
+   {
+    "name": "Bi-temporal fact edges (never delete, only close the interval)",
+    "from": "Zep paper arXiv 2501.13956 §2 + graphiti_core/edges.py + README",
+    "exact_spec": "Paper: two timelines. T = (t_valid, t_invalid): \"the temporal range during which facts held true\" (chronological order of events). T' = (t'_created, t'_expired): \"when facts are created or invalidated in the system\" (transactional order of ingestion). Code EntityEdge fields: fact (text), fact_embedding, episodes: list[str] (\"list of episode ids that reference these entity edges\"), valid_at (\"when the fact became true\"), invalid_at (\"when the fact stopped being true\"), created_at, expired_at (docstring: \"when the node was invalidated\"), reference_time (\"reference timestamp from the episode that produced this edge\"). README: \"When information changes, old facts are invalidated — not deleted. Query what's true now, or what was true at any point in time.\" Paper-reported benchmarks: DMR 94.8% (Zep, gpt-4-turbo) vs 93.4% MemGPT; LongMemEval 71.2% vs 60.2% full-context (gpt-4o), latency 2.58 s vs 28.9 s, ~1.6k vs 115k context tokens.",
+    "adopt_for_memory_hub": "New derived table (NOT under sources ON DELETE CASCADE, so a re-import does not wipe it): facts(id bigserial PK, kind text CHECK (kind IN ('fact','rule','feedback','preference')), subject text, predicate text, object text, fact text NOT NULL, valid_at timestamptz, invalid_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(), expired_at timestamptz, superseded_by bigint REFERENCES facts, source_uuids text[] NOT NULL CHECK (cardinality(source_uuids) > 0), words tsvector, bigrams tsvector, embedding halfvec(1024)). Indexes: GIN(source_uuids) for turn->fact backlinks; partial index WHERE expired_at IS NULL for 'current' search. Rule: the code never issues DELETE on facts; superseding = UPDATE invalid_at/expired_at/superseded_by only. Reuse the existing words/bigrams builders + bge-m3 embedder so facts plug into the existing RRF search unchanged.",
+    "cost": "Schema + ~1 migration; zero LLM in hot path; storage small (facts << chunks)."
+   },
+   {
+    "name": "Duplicate + contradiction judge (resolve_edge prompt)",
+    "from": "graphiti_core/prompts/dedupe_edges.py + edge_operations.resolve_extracted_edge",
+    "exact_spec": "System: \"You are a fact deduplication assistant. NEVER mark facts with key differences as duplicates.\" User prompt sections: <EXISTING FACTS> (hybrid-search candidates restricted to edges between the SAME entity pair), <FACT INVALIDATION CANDIDATES> (broader hybrid RRF search over all edges, minus those already in EXISTING), <NEW FACT>. idx numbering is continuous across both lists. Output schema EdgeDuplicate {duplicate_facts: list[int] 'only from EXISTING FACTS range', contradicted_facts: list[int] 'from full idx range'}. Rules: \"NEVER mark facts as duplicates if they have key differences, particularly around numeric values, dates, or key qualifiers\"; \"A fact from EXISTING FACTS can be both a duplicate AND contradicted (e.g., semantically the same but the new fact updates/supersedes it)\". Few-shot: 'Alice works at Acme as a software engineer' -> 'senior engineer' = contradicted not duplicate; 'Bob ran 5 miles on Tuesday' vs '3 miles on Wednesday' = neither. Fast path before LLM: same endpoints + identical normalized fact text -> reuse existing edge and append the episode uuid (no LLM). Out-of-range idx returned by the LLM are logged and dropped.",
+    "adopt_for_memory_hub": "Nightly job: batch N new facts per `claude -p --output-format json` call (MEMORY_HUB_INTERNAL=1) with this exact two-list structure; candidates come from memory-hub's own hybrid search over facts WHERE expired_at IS NULL (top ~10 same-subject + top ~10 global). Validate idx ranges in Node before acting. Duplicate -> append new turn uuid to source_uuids (no new row). Contradiction -> if old.kind IN ('rule','feedback') or new fact comes from an assistant/subagent turn: INSERT INTO review_queue(old_fact_id, new_fact_id, reason, llm_json) and touch nothing; else apply the temporal rule below. Keep the exact-text fast path to save Claude calls.",
+    "cost": "1 Claude call per batch of new facts nightly (dominant cost); 2 extra hybrid searches per fact (~110 ms p95 each, offline)."
+   },
+   {
+    "name": "Temporal invalidation rule (interval overlap + late-arrival self-expiry)",
+    "from": "Zep paper §2.2.3 + edge_operations.resolve_edge_contradictions / resolve_extracted_edge",
+    "exact_spec": "Paper: \"When the system identifies temporally overlapping contradictions, it invalidates the affected edges by setting their t_invalid to the t_valid of the invalidating edge\"; \"Following the transactional timeline T', Graphiti consistently prioritizes new information\". Code, for each contradicted candidate e vs new edge n: SKIP if (e.invalid_at <= n.valid_at) OR (n.invalid_at <= e.valid_at) [no overlap]; ELSE IF e.valid_at < n.valid_at: e.invalid_at = n.valid_at; e.expired_at = e.expired_at ?? now(). Before that, on n itself: if n.invalid_at set and n.expired_at null -> n.expired_at = now(); candidates sorted by valid_at (nulls last); first candidate with candidate.valid_at > n.valid_at -> n.invalid_at = candidate.valid_at; n.expired_at = now() (\"Expire new edge since we have information about more recent events\"). All comparisons are on UTC (ensure_utc). If either valid_at is NULL, nothing is invalidated.",
+    "adopt_for_memory_hub": "Port as one pure JS function resolveContradictions(newFact, candidates, now) -> {updates[]} plus an assert-based self-check (overlap, non-overlap, late-arriving older fact, null valid_at). Apply in a single transaction: UPDATE facts SET invalid_at=$1, expired_at=COALESCE(expired_at, now()), superseded_by=$2 WHERE id=$3 AND kind NOT IN ('rule','feedback'). Default valid_at to the earliest source turn's turns.ts when the LLM returns null, otherwise null-dated facts can never be superseded.",
+    "cost": "Pure code, microseconds; no LLM."
+   },
+   {
+    "name": "Temporal extraction prompt (valid_at / invalid_at from text)",
+    "from": "graphiti_core/prompts/extract_edges.py extract_timestamps(_batch) + Zep paper appendix",
+    "exact_spec": "\"Given a FACT and its REFERENCE TIME, determine when the fact became true (valid_at) and when it stopped being true (invalid_at).\" Rules: \"Resolve relative expressions (\\\"last week\\\", \\\"2 years ago\\\", \\\"yesterday\\\") using REFERENCE TIME.\" \"If the fact is ongoing (present tense), set valid_at to REFERENCE TIME.\" \"If a change or end is expressed, set invalid_at to the relevant time.\" \"Leave both null if no time is stated or resolvable.\" \"Use ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z).\" Batch variant takes a list of FACTS each with its own REFERENCE TIME. Paper: extraction context = current message + last n=4 messages (\"two complete conversation turns\"). Called only if the extraction step did not already set valid_at/invalid_at.",
+    "adopt_for_memory_hub": "Fold into the same nightly claude -p fact-extraction call (one prompt returns facts + valid_at/invalid_at) to avoid a second call. REFERENCE TIME = turns.ts; give it with +07:00 offset and add Thai rules to the prompt: เมื่อวาน/อาทิตย์ที่แล้ว/เดือนก่อน/ปีที่แล้ว, Buddhist-era years (พ.ศ. − 543 = ค.ศ.). Context = the 4 previous turns of the same session by seq. Store as timestamptz.",
+    "cost": "Marginal tokens inside the existing nightly extraction call."
+   },
+   {
+    "name": "Episode provenance with bidirectional index (mention count for free)",
+    "from": "Zep paper §2.1 + edges.py episodes field + edge dedup fast path",
+    "exact_spec": "Episodes (message/text/JSON, each with t_ref) \"serve as a non-lossy data store from which semantic entities and relations are extracted\"; \"Episodes and their derived semantic edges maintain bidirectional indices ... semantic artifacts can be traced to their sources for citation or quotation\". On duplicate, the episode uuid is appended to the existing edge's episodes list instead of creating a new edge.",
+    "adopt_for_memory_hub": "source_uuids text[] on facts == Graphiti episodes. GIN index gives turn->facts (backlink) and the array gives fact->turns. cardinality(source_uuids) and count(DISTINCT turns.session_id) = how many times / sessions ลุงจืด stated it: a 'said often' signal that needs no extra tracking. memory_get(fact) returns the raw turns for citation.",
+    "cost": "One GIN index; no LLM."
+   },
+   {
+    "name": "Old-vs-new presentation + point-in-time queries",
+    "from": "graphiti_core/search/search_helpers.py, search_filters.py; Zep paper context template",
+    "exact_spec": "format_edge_date_range: '<valid_at or \"date unknown\"> - <invalid_at or \"present\">'. Context string: \"These are the most relevant facts and their valid and invalid dates. Facts are considered valid between their valid_at and invalid_at dates. Facts with an invalid_at date of \\\"Present\\\" are considered valid.\" Paper template: \"FACT (Date range: from - to)\". SearchFilters has valid_at / invalid_at / created_at / expired_at, each list[list[DateFilter]] = OR of AND-groups, operators incl. =, <, >, <=, >=, IS NULL, IS NOT NULL. Default search does NOT drop invalidated edges; the date range is shown to the LLM instead.",
+    "adopt_for_memory_hub": "memory_search per hit: status ('current' | 'superseded' | 'date unknown'), 'valid: 2026-03-01 → present', superseded_by {id, fact} and age label from chunks.ts / facts.valid_at (e.g. 'วันนี้', '3 เดือนก่อน'). Params: default current only (expired_at IS NULL); as_of=$t -> valid_at <= $t AND (invalid_at IS NULL OR invalid_at > $t); known_at=$t -> created_at <= $t AND (expired_at IS NULL OR expired_at > $t); include_history=true -> no filter, superseded hits ranked after current ones. Obsidian export: superseded notes get a 'superseded_by: [[...]]' frontmatter link so history is visible in the graph.",
+    "cost": "SQL WHERE clauses only."
+   },
+   {
+    "name": "Entity resolution cascade (exact -> fuzzy -> LLM)",
+    "from": "Zep paper §2.2.1 + dedup_helpers.py + prompts/dedupe_nodes.py",
+    "exact_spec": "Paper: entity name embedded (1024-d) for cosine search + separate full-text search on names -> candidates + episode context -> LLM entity-resolution prompt; on duplicate, \"generates an updated name and summary\". Code order: (1) exact normalized name (lowercase, collapse whitespace); exactly 1 hit -> merge, >1 hits -> LLM. (2) entropy gate: skip fuzzy if len < 6 AND tokens < 2, or char Shannon entropy < 1.5. (3) MinHash: 3-gram shingles, 32 permutations (blake2b seeds), LSH band size 4, accept Jaccard >= 0.9. (4) LLM: \"Entities should only be considered duplicates if they refer to the *same real-world object or concept*\"; \"Return duplicate_candidate_id = -1 when there is no match or you are unsure.\"; name = \"most complete and descriptive name\". Edge dedup searches only edges between the same entity pair.",
+    "adopt_for_memory_hub": "entities(id, name, aliases text[]) nightly. Exact = lower(trim). Fuzzy = Jaccard over memory-hub's existing Thai char bigrams + Latin words (do NOT copy Graphiti's normalizer: it strips everything outside [a-z0-9'], so Thai names become empty and always fall to the LLM). Only ambiguous names go to the nightly claude -p batch. Merges append aliases; never rewrite the source text.",
+    "cost": "Mostly SQL/JS; LLM only for the ambiguous tail."
+   },
+   {
+    "name": "Ebbinghaus retention score (as a ranking feature, not deletion)",
+    "from": "MemoryBank arXiv 2305.10250 §2.3 + repo forget_memory.py",
+    "exact_spec": "Paper: R = e^{-t/S}; R = \"memory retention, or what fraction of the information can be retained\"; t = \"time elapsed since learning the information\"; S = \"memory strength\", initialised to 1 \"upon its first mention in a conversation\"; when recalled, \"increase S by 1 and reset t to 0\". Caveat (paper): \"this is an exploratory and highly simplified memory updating model.\" Repo: forgetting_curve(t, S) with t in days, implemented as `math.exp(-t / 5*S)` (Python precedence = exp(-(t/5)*S)); on every load each memory gets retention from last_recall_date, and `if random.random() > retention_probability` it is popped from memory.json and the file is rewritten. update_memory_when_searched: memory_strength += 1 and last_recall_date = cur_date for recalled memories. Retrieval: FAISS dense, top_k = 3 (local_doc_qa). Units of S beyond 'integer count' not specified.",
+    "adopt_for_memory_hub": "Append-only usage_events(turn_uuid or fact_id, kind 'get'|'cite', at timestamptz) written by memory_get (SQL insert, no LLM, OK in hot path); nightly aggregate into memory_strength(key PK, strength int DEFAULT 1, last_used_at, uses int). Query time: retention = exp(-(extract(epoch FROM now() - coalesce(last_used_at, ts))/86400.0) / strength) — paper formula, days, S counted per real use. Feed it as one extra ranked list into the existing RRF (k=60) over the top ~100 hybrid candidates, or as a tie-breaker, so relevance still dominates. Never delete or hide on low R; R only re-orders. Key usage by turn uuid / fact id, not chunks.id.",
+    "cost": "One small table + one expression in the ranking SQL; negligible latency."
+   },
+   {
+    "name": "Frequency-of-mention reranker + RRF/MMR constants",
+    "from": "graphiti_core/search/search_utils.py; Zep paper §3",
+    "exact_spec": "episode_mentions_reranker: run rrf first, then score = count of (Episodic)-[:MENTIONS]->(Entity) per node, sort descending, drop below min_score; nodes with no MENTIONS get 0 and rank last. Paper: \"Prioritizes results based on the frequency of entity or fact mentions within a conversation\". Graphiti rrf: score += 1/(i + rank_const), rank_const default 1 (not 60). MMR: DEFAULT_MMR_LAMBDA = 0.5, mmr = λ·dot(q,c) + (λ−1)·max_sim. Other rerankers: node distance from a centroid node, cross-encoder.",
+    "adopt_for_memory_hub": "Expose two separate signals instead of one blended 'popularity': mentioned_often = count(DISTINCT session_id) over source_uuids (from the corpus), used_often = uses from usage_events (from retrieval). Keep memory-hub's measured RRF k=60 and don't switch to Graphiti's 1. MMR (λ=0.5 on existing embeddings) is optional and only worth adding if near-duplicate chunks crowd the top 10.",
+    "cost": "SQL aggregates; no LLM."
+   },
+   {
+    "name": "Nightly hierarchical consolidation ('dream')",
+    "from": "MemoryBank §2.2 hierarchical summarization; Zep community map-reduce summaries",
+    "exact_spec": "MemoryBank prompts: daily \"Summarize the events and key information in the content [dialog/events]\" -> daily event summary -> global summary; personality: \"Based on the following dialogue, please summarize the user's personality traits\" then \"provide a highly concise and general summary of the user's personality\". Zep: community nodes hold \"summaries derived through an iterative map-reduce-style summarization of member nodes\".",
+    "adopt_for_memory_hub": "Dream = one nightly script, ordered: (1) extract facts + timestamps from yesterday's turns, (2) dedupe/contradiction judge, (3) apply temporal rule or review_queue, (4) aggregate usage_events into strength, (5) refresh clusters, (6) daily digest per project (MemoryBank prompt, Thai output) stored as a fact-like row with source_uuids. Each step idempotent, keyed by date, so a crashed night can rerun. claude -p only, MEMORY_HUB_INTERNAL=1.",
+    "cost": "Bounded by new-turn volume per day; all Claude cost is offline."
+   },
+   {
+    "name": "Community detection by label propagation (the 'brain' clusters)",
+    "from": "Zep paper §2.3",
+    "exact_spec": "Uses \"label propagation algorithm rather than the Leiden algorithm\". Dynamic update: when adding node n_i, \"surveys the communities of neighboring nodes\" and assigns it to the community \"held by the plurality of its neighbors\", then updates the community summary. Caveat: communities \"gradually diverge from those that would be generated by a complete label propagation run. Therefore, periodic community refreshes remain necessary.\" Iteration count / convergence parameters: not specified.",
+    "adopt_for_memory_hub": "Graph = existing links (wikilinks) + entity co-mention edges from facts. Full label propagation in Node nightly (a few dozen lines, no dependency) and drop the incremental variant (YAGNI at this size). Write cluster_id per entity/source; Claude summary per changed cluster; export to Obsidian as hub notes so ลุงจืด sees neuron-like clusters.",
+    "cost": "Seconds of CPU nightly + 1 Claude call per changed cluster."
+   },
+   {
+    "name": "PG18 temporal UNIQUE (optional DB-level guard)",
+    "from": "PostgreSQL 18 release notes + CREATE TABLE docs",
+    "exact_spec": "PG18 adds `PRIMARY KEY/UNIQUE (cols..., range_col WITHOUT OVERLAPS)` and `FOREIGN KEY (..., PERIOD col)`. The WITHOUT OVERLAPS column must be a range/multirange, must be last, and empty ranges are rejected. It behaves like EXCLUDE USING GIST (id WITH =, valid WITH &&) and needs btree_gist for scalar key columns.",
+    "adopt_for_memory_hub": "Use only for single-valued slots (e.g. subject+predicate like 'default port of X'): UNIQUE (slot_key, validity WITHOUT OVERLAPS) where validity = tstzrange(valid_at, invalid_at). Then two 'current' contradictory facts fail loudly instead of coexisting. Skip it until double-current facts actually show up, because multi-valued predicates (uses Postgres AND Redis) must not get this constraint.",
+    "cost": "One GiST index + btree_gist extension."
+   }
+  ],
+  "pitfalls": [
+   "MemoryBank repo bug: forgetting_curve returns math.exp(-t / 5*S), which Python evaluates as exp(-(t/5)*S). Higher strength then makes a memory decay faster, the opposite of the paper's R = e^{-t/S}. Implement the paper formula and add an assert that R grows with S.",
+   "MemoryBank forgetting is destructive and random. It checks `random.random() > retention` and pops the memory from memory.json, then rewrites the file. That breaks memory-hub's rules that the raw archive stays the truth and nothing is deleted, and it makes ranking nondeterministic. Use R only to re-order results.",
+   "MemoryBank's reinforcement path appears unwired. GitHub code search finds update_memory_when_searched only where it is defined, in forget_memory.py, so the 'recall raises S' part of the paper may never run in the reference code. Verify this before citing the repo as proof that it works.",
+   "If every search result counts as a 'use', ranking feeds itself: whatever is in the top 10 gets stronger and stays there. Count only memory_get / cite events and keep the usage signal weak inside RRF.",
+   "chunks.id is sha256(chunker_ver, source, text), so it changes whenever chunker_ver changes, and chunks are deleted via ON DELETE CASCADE on reimport. Key usage counts and facts by turns.uuid or fact id. Never key them by chunks.id or attach them to sources with a cascade, or a reindex silently wipes 'used often' history that cannot be rebuilt from the raw archive.",
+   "Graphiti silently skips invalidation when either valid_at is NULL. The LLM can say 'contradicted' and nothing changes, leaving two 'current' facts. Default valid_at to the source turn's ts.",
+   "Graphiti 'consistently prioritizes new information'. In ลุงจืด's chats, newer is not always truer: assistant guesses, subagent output, quoted old text, hypotheticals ('ถ้า...'), and pasted logs. Allow auto-invalidation only when the new fact comes from a role=user turn about the same subject. Anything touching rules/feedback, or any assistant-sourced contradiction, goes to review_queue.",
+   "The LLM contradiction judge is an inference, not proof. The prompt itself counts 'software engineer -> senior engineer' as a contradiction. Store the raw LLM JSON in review_queue or an audit column so a wrong supersede can be reversed by clearing invalid_at/expired_at.",
+   "Graphiti's fuzzy entity normalizer strips everything outside [a-z0-9' ], so Thai names become empty strings, and its token-count gate assumes space-separated words. Use memory-hub's own Thai bigram tokenization for fuzzy matching.",
+   "Graphiti's rrf default is rank_const=1, while the Zep paper just says 'RRF' and memory-hub uses k=60. Don't copy the constant; keep the measured k=60 (R@10 86%).",
+   "Time zones: Graphiti converts everything to UTC. Thai relative dates ('เมื่อวาน', 'คืนนี้') resolved against a UTC reference near midnight land on the wrong day. Pass the REFERENCE TIME with +07:00 and handle พ.ศ. years in the prompt.",
+   "Graphiti's code sets expired_at = now() even on a newly ingested edge that is already invalid (or older than a known candidate). So expired_at means 'when the system learned it was no longer current', not 'when it was superseded by edge X'. Store superseded_by explicitly for the old-vs-new UI.",
+   "All benchmark numbers are paper-reported, not reproduced. DMR conversations are only ~60 messages (the paper says so), and LongMemEval gains (71.2% vs 60.2%) used gpt-4o, not Claude. Measure on memory-hub's own 86-question set before and after adding fact/temporal layers.",
+   "Not specified in the sources: the exact edge-invalidation prompt in the paper (the current code merged it into resolve_edge), label-propagation iteration/convergence parameters, and the time unit of S in the MemoryBank paper (the code uses days)."
+  ]
+ },
+ {
+  "sources": [
+   {
+    "title": "Generative Agents: Interactive Simulacra of Human Behavior (Park et al., arXiv 2304.03442), ar5iv HTML",
+    "url": "https://ar5iv.labs.arxiv.org/html/2304.03442"
+   },
+   {
+    "title": "generative_agents official repo: retrieve.py (new_retrieve, extract_recency, gw weights)",
+    "url": "https://github.com/joonspk-research/generative_agents/blob/main/reverie/backend_server/persona/cognitive_modules/retrieve.py"
+   },
+   {
+    "title": "generative_agents official repo: scratch.py (recency_decay, importance_trigger_max defaults)",
+    "url": "https://github.com/joonspk-research/generative_agents/blob/main/reverie/backend_server/persona/memory_structures/scratch.py"
+   },
+   {
+    "title": "generative_agents official repo: reflect.py (reflection trigger, focal points, insights with evidence)",
+    "url": "https://github.com/joonspk-research/generative_agents/blob/main/reverie/backend_server/persona/cognitive_modules/reflect.py"
+   },
+   {
+    "title": "generative_agents official repo: poignancy_event_v1.txt (importance prompt template)",
+    "url": "https://github.com/joonspk-research/generative_agents/blob/main/reverie/backend_server/persona/prompt_template/v3_ChatGPT/poignancy_event_v1.txt"
+   },
+   {
+    "title": "Petrov (2006) Computationally Efficient Approximation of the Base-Level Learning Equation in ACT-R (ICCM, CMU-hosted)",
+    "url": "http://act-r.psy.cmu.edu/wordpress/wp-content/uploads/2012/12/652petrovAbstract.pdf"
+   },
+   {
+    "title": "ACT-R 4.0 User's Manual (Lebiere 1998): BLL default 0.5, OL approximation",
+    "url": "https://act-r.psy.cmu.edu/wordpress/wp-content/themes/ACT-R/older/ACT-R_4/manual.pdf"
+   },
+   {
+    "title": "Cormack, Clarke, Buettcher (SIGIR 2009) Reciprocal Rank Fusion",
+    "url": "http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf"
+   },
+   {
+    "title": "Craswell, Robertson, Zaragoza, Taylor (SIGIR 2005) Relevance Weighting for Query Independent Evidence",
+    "url": "https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/craswell_sigir05.pdf"
+   },
+   {
+    "title": "Elasticsearch docs: rank_feature query (saturation/log/sigmoid, default pivot)",
+    "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-rank-feature-query.html"
+   },
+   {
+    "title": "Elasticsearch docs: Incorporating static relevance signals into the score",
+    "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/static-scoring-signals.html"
+   },
+   {
+    "title": "Memory OS of AI Agent (MemoryOS, Kang et al., arXiv 2506.06326)",
+    "url": "https://arxiv.org/html/2506.06326"
+   },
+   {
+    "title": "MemoryBank: Enhancing LLMs with Long-Term Memory (Zhong et al., arXiv 2305.10250)",
+    "url": "https://arxiv.org/html/2305.10250"
+   },
+   {
+    "title": "Hou, Tamoto, Miyashita: 'My agent understands me better' dynamic recall & consolidation (CHI'24 LBW, arXiv 2404.00573)",
+    "url": "https://arxiv.org/html/2404.00573"
+   },
+   {
+    "title": "Zep: A Temporal Knowledge Graph Architecture for Agent Memory (arXiv 2501.13956)",
+    "url": "https://arxiv.org/html/2501.13956"
+   },
+   {
+    "title": "Joachims et al. (SIGIR 2005) Accurately Interpreting Clickthrough Data as Implicit Feedback",
+    "url": "https://www.cs.cornell.edu/people/tj/publications/joachims_etal_05a.pdf"
+   }
+  ],
+  "mechanisms": [
+   {
+    "name": "Generative Agents retrieval score (recency + importance + relevance)",
+    "from": "Park et al. 2023, arXiv 2304.03442 Sec 4.1 + official repo retrieve.py/scratch.py",
+    "exact_spec": "PAPER: score = a_recency*recency + a_importance*importance + a_relevance*relevance. Recency = exponential decay over sandbox game hours since the memory was LAST RETRIEVED, decay factor 0.995 (half-life ~138 h = 5.8 days). Importance = integer 1-10 assigned by LLM at memory creation (prompt paraphrased: rate poignancy on a 1-10 scale; anchors 1 = purely mundane e.g. brushing teeth/making bed, 10 = extremely poignant e.g. a break-up/college acceptance; code template asks to return a number 1-10). Relevance = cosine(query embedding, memory embedding). Each of the three is min-max normalized to [0,1] over the candidate set; all alphas = 1. Memory object stores creation timestamp and most-recent-access timestamp. RELEASED CODE (main branch, read 2026-10-01): candidates = events+thoughts (non-idle), sorted ascending by last_accessed; recency_vals = recency_decay**i for i=1..N assigned in that order (rank-based, not hours); scratch.py recency_decay=0.99, recency_w=relevance_w=importance_w=1; new_retrieve multiplies by hard-coded gw=[0.5,3,2] for recency, relevance, importance; top n_count=30; every retrieved node gets last_accessed=curr_time (retrieval itself refreshes recency). Paper-reported ablation (TrueSkill mu): full 29.89, no reflection 26.88, no reflection+planning 25.64, no observation+reflection+planning 21.21, crowdworker-authored 22.95.",
+    "adopt_for_memory_hub": "Do NOT port the additive min-max formula onto the RRF hybrid: per-query min-max makes the prior's effective weight depend on candidate spread, and adding normalized relevance discards the rank-fusion property that gives R@10 86%. Adopt only (a) the three-signal decomposition as separate columns, (b) 'last used' for recency, but refreshed ONLY by explicit use events (memory_get/cite), never by being shown in memory_search, (c) importance as a bounded prior (see importance mechanism).",
+    "cost": "Paper: 1 LLM call per memory at write time for importance + embedding per memory. For memory-hub: importance must be batched nightly via claude -p; recency/relevance free."
+   },
+   {
+    "name": "ACT-R base-level activation (frequency x recency in one number) + Petrov O(1) approximation",
+    "from": "ACT-R (Anderson & Lebiere 1998; Anderson & Schooler 1991), ACT-R 4.0 manual, Petrov ICCM 2006",
+    "exact_spec": "Exact: B_i = ln( sum_{j=1..n} t_j^(-d) ), t_j = time since j-th use (creation counts as a reference), d = decay; 0.5 is the standard/default value (ACT-R 4.0 manual: BLL 'with 0.5 the standard value'). Interpreted as log odds an item will be needed (rational analysis, Anderson & Schooler 1991): sum gives power law of practice, each term's power decay gives power law of forgetting. Anderson-Lebiere optimized learning (assumes evenly spaced uses): B ~= ln(n/(1-d)) - d*ln(L), L = lifetime since creation; Petrov: it underestimates decay after bursts and misses the recency spike. Petrov hybrid (keep k most recent lags exactly): B ~= ln( sum_{i=1..k} t_i^(-d) + (n-k)(t_n^(1-d) - t_k^(1-d)) / ((1-d)(t_n - t_k)) ), t_n = lifetime. For d=0.5: B ~= ln( sum_{i=1..k} t_i^(-1/2) + 2(n-k)/(sqrt(t_n)+sqrt(t_k)) ). Petrov: approximation is nearly perfect even for k=1; k=0 reduces to the old approximation. Time unit arbitrary: changing units adds a constant -d*ln(c) to every B, so ranking among chunks is unchanged (only the pivot of any downstream transform shifts).",
+    "adopt_for_memory_hub": "Store per chunk: n_uses (int, includes creation as 1), last_use timestamptz (defaults to chunk ts), first_ref = chunk ts. Compute at query time for the <=180 RRF candidates only (O(1) per row, no nightly job needed, stays correct as time passes): t1 = greatest(extract(epoch from (asof - last_use))/86400, 1.0/24); tn = greatest(days since first_ref, t1); S = power(t1,-0.5) + CASE WHEN n_uses>1 AND tn>t1 THEN 2*(n_uses-1)/(sqrt(tn)+sqrt(t1)) ELSE 0 END. Note S = exp(B) is already the non-negative 'static feature' the Craswell transform expects. asof = now() normally, = $before when the existing SearchOpts.before is set. Power law keeps old-but-used memories alive: t^-0.5 at 180 days = 0.075 vs exponential 0.995/h at 180 days ~4e-10.",
+    "cost": "2 extra columns (or a chunk_stats table) + one cheap expression per candidate; event table for uses (see use-signal mechanism)."
+   },
+   {
+    "name": "Saturating transform of a query-independent prior before combining (log / satu / sigm)",
+    "from": "Craswell, Robertson, Zaragoza, Taylor SIGIR 2005; Elasticsearch rank_feature docs",
+    "exact_spec": "finalscore = BM25score + w*f(S), reranking only the top 1000 of the BM25 baseline. log: w*log(S). satu: w*S/(k+S) (w = maximum approached, k = value of S where score is w/2). sigm: w*S^a/(k^a+S^a). Justification: log-odds decomposition BM25 + log P(S|M,R)/P(S|M,notR), i.e. additive in log-odds space. Paper-reported (TREC-2004 Web .GOV, 225 queries, MAP): baseline 0.430; raw linear S best w=0.005 -> 0.439; log w=0.20 -> 0.508; satu w=1.34,k=1.36 -> 0.515; sigm w=1.8,k=1,a=0.6 -> 0.523. Elasticsearch rank_feature: saturation S/(S+pivot), default pivot = approximate geometric mean of all feature values in the index; sigmoid S^exp/(S^exp+pivot^exp) in [0,1); log log(scaling_factor+S) unbounded; normally placed in bool should so it is ADDED to the text score. Elastic static-signals example: bm25_score + pagerank/(10+pagerank).",
+    "adopt_for_memory_hub": "p_use = S/(S+kappa) in [0,1), kappa = geometric mean (or median) of S over chunks with n_uses>1, recomputed nightly and stored in a 1-row settings table. Fixed pivot (not per-query min-max) keeps the prior's strength stable across queries. Like Craswell, apply it ONLY to the candidate set already selected by the three legs (never let the prior pull in non-candidates).",
+    "cost": "One nightly aggregate query; zero LLM."
+   },
+   {
+    "name": "Bounded multiplicative prior on RRF (rank-displacement budget)",
+    "from": "Cormack, Clarke, Buettcher SIGIR 2009 (RRF) + derivation for memory-hub's src/search.ts",
+    "exact_spec": "RRF: RRFscore(d) = sum_{r in R} 1/(k + r(d)), k = 60 'fixed during a pilot investigation'; intuition: mitigates the impact of high rankings by outlier systems. Derived consequence: RRF scores are highly compressed (one leg: rank 1 vs rank 10 = 70/61 = 1.148). With final = rrf*(1+beta*p), a max-prior item at rank r ties an unboosted item at r' = (k+r)/(1+beta) - k, i.e. displacement ~= (k+r)*beta/(1+beta) ranks (assuming similar leg coverage). beta=0.02: rank 10 -> 8.6; beta=0.05: rank 10 -> 6.7, rank 20 -> 16.2; beta=0.1: rank 10 -> 3.6; existing project boost x1.3: rank 30 -> ~9.2. Additive alternative final = rrf + lambda*p: lambda must be in RRF units (one-leg gap rank1..rank10 = 1/61-1/70 = 0.0021), and additive can lift an item with weak relevance as much as a strong one.",
+    "adopt_for_memory_hub": "In search.ts final SELECT: score = f.s * projectBoost * (1 + $beta * p) where p = noisy-or of p_use and p_importance (1-(1-p_use)(1-p_imp)), bounded <1. Multiplicative is preferred over additive because the bump scales with relevance (cannot manufacture relevance). Choose beta from grid {0, 0.02, 0.05, 0.1} on eval: largest beta with R@10 >= current 86% on the 86 questions AND improvement on a new small 'freshness/most-used' question set. Keep 'c.ts DESC' tie-break. Do NOT add the prior as a 4th RRF leg: RRF treats it as a full voter and boosts items found by only one weak leg.",
+    "cost": "One multiply in SQL; eval reruns (~86 queries x 4 betas)."
+   },
+   {
+    "name": "Use-signal taxonomy for an MCP memory tool (impression vs get vs citation)",
+    "from": "Joachims et al. SIGIR 2005 (implicit feedback); behavior of Generative Agents code (retrieval refreshes last_accessed) and MemoryOS (retrieval increments N_visit)",
+    "exact_spec": "Joachims 2005: clicks are informative but biased (trust bias toward higher positions, quality bias); interpreting clicks as absolute relevance is unreliable, but relative preferences such as 'Click > Skip Above' are reasonably accurate on average. GA code: every retrieved node gets last_accessed = now (impression = use). MemoryOS: the segment's visit counter and recency are updated on retrieval.",
+    "adopt_for_memory_hub": "Event table memory_event(id bigserial, chunk_id, kind text CHECK (kind IN ('impression','get','related_from','cite')), rank int, query_id, session_id, at timestamptz). Weights (design choice, not from literature): impression 0 (logged only, for CTR/position analysis), memory_get 1, memory_related(id) 0.5 on the source id, cite 2. Citation detected nightly from the raw archive: the assistant turn after a memory_get contains the id or a long n-gram overlap with the fetched text. Count at most one use per (chunk, session) to stop bursts inflating frequency. Never log when MEMORY_HUB_INTERNAL=1 (dream jobs), during eval runs, or for SessionStart auto-injection. Insert fire-and-forget after the tool response (not awaited) to keep p95 ~110 ms. Nightly: roll up n_uses/last_use; derive Click>Skip-Above pairs (get on rank 4 while 1-3 skipped) for offline beta tuning; co-gets in the same session become Hebbian edge weights for the 'brain' graph.",
+    "cost": "One small INSERT per tool call; nightly SQL rollup; citation scan over new turns only."
+   },
+   {
+    "name": "Importance prior (LLM 1-10) restricted and structural-first",
+    "from": "Generative Agents (poignancy 1-10 at creation); Craswell 2005 (indegree as static feature)",
+    "exact_spec": "GA: importance rated once at memory creation by LLM on 1-10 poignancy scale (prompt paraphrased in first mechanism), never updated; min-max normalized into the sum. Craswell: link indegree was a useful static feature after log/sigmoid transform (paper-reported on .GOV).",
+    "adopt_for_memory_hub": "p_imp from structure first: source kind (ลุงจืด's rules/feedback/decision files -> fixed floor p_imp=1, never lowered by an LLM), Obsidian backlink indegree via satu (indeg/(indeg+median)). LLM importance only for dream-produced facts and decision-like chunks: nightly claude -p, batch ~50 chunks per call, strict JSON {id: 1-10}, cached by chunk hash, mapped (score-1)/9. Combine with p_use via noisy-or so neither dominates.",
+    "cost": "Nightly claude -p batches proportional to new facts only, not every turn."
+   },
+   {
+    "name": "Reflection trigger and insight-with-citation prompt (basis for 'dream')",
+    "from": "Generative Agents Sec 4.2 + reflect.py/scratch.py",
+    "exact_spec": "Trigger: reflect when sum of importance of the latest perceived events exceeds a threshold of 150 (code: importance_trigger_curr starts at importance_trigger_max=150, reflection fires when it is <=0 and memories exist, then reset). Paper: agents reflected roughly 2-3 times per day. Step 1: feed the 100 most recent records; ask for the 3 most salient high-level questions answerable about the subjects in those statements (code: n=3 focal points). Step 2: per question, retrieve relevant memories (including prior reflections), number them, ask for 5 high-level insights each citing supporting record numbers in the format 'insight (because of 1, 5, 3)' (code: n=5). Step 3: store each insight as a new 'thought' with evidence node ids; reflections can be reflected on again (trees).",
+    "adopt_for_memory_hub": "Nightly cron (claude -p, MEMORY_HUB_INTERNAL=1). Gate: skip the night if sum of p_imp of new chunks since last dream is below a tuned threshold (or simply < N new turns). Map citation numbers -> chunk ids -> source_uuids; reject any insight with zero valid citations (enforces provenance constraint). Store insights as kind='reflection' memories with derived_from links = synapses in the graph. Contradictions with ลุงจืด's rules -> review_queue, never edit.",
+    "cost": "Per dream: 1 question-gen call + 3 insight calls (+ retrieval); batched in one claude -p session."
+   },
+   {
+    "name": "Heat score (visits + length + recency) for consolidation selection",
+    "from": "MemoryOS, Kang et al. arXiv 2506.06326",
+    "exact_spec": "Heat = alpha*N_visit + beta*L_interaction + gamma*R_recency; R_recency = exp(-dt/mu), dt = seconds since last access, mu = 1e7 s (~116 days); alpha=beta=gamma=1. N_visit and R_recency updated on mid-term retrieval. Segments with heat > tau = 5 promoted to long-term persona memory; on overflow, lowest-heat segments evicted. Segment matching F_score = cos(e_s,e_p) + Jaccard(K_s,K_p), threshold theta=0.6.",
+    "adopt_for_memory_hub": "Use only as a 'what should dream consolidate tonight' selector (cluster heat), with log1p(N_visit) instead of linear. Do not use for eviction (raw archive is source of truth) and not for ranking (linear unbounded N_visit dominates).",
+    "cost": "Nightly SQL only."
+   },
+   {
+    "name": "Ebbinghaus strength update",
+    "from": "MemoryBank, Zhong et al. arXiv 2305.10250",
+    "exact_spec": "Retention R = e^(-t/S); S (memory strength) initialized to 1 at first mention; on each recall S += 1 and t reset to 0. No retain/forget threshold specified; authors call it exploratory and highly simplified. Retrieval itself is DPR-style dense + FAISS. Time unit: not specified in the passage read.",
+    "adopt_for_memory_hub": "Skip: exponential retention with integer strength still collapses month-old memories; ACT-R power law gives frequency+recency with the same state (n, last_use, first_ref).",
+    "cost": "n/a"
+   },
+   {
+    "name": "Recall probability with consolidation (spacing effect)",
+    "from": "Hou, Tamoto, Miyashita, CHI 2024 LBW, arXiv 2404.00573",
+    "exact_spec": "p_n(t) = (1 - exp(-r * e^(-t/g_n))) / (1 - e^(-1)); r = cosine relevance, t = elapsed time, g_n = consolidation constant after n recalls; g_n = g_(n-1) + S(t), S(t) = (1-e^(-t))/(1+e^(-t)) (= tanh(t/2)), g_0 = 1; recall when p > 0.86. Paper-reported: lower loss than Generative Agents baseline, t = -5.687, p = 0.000299, 95% CI [-0.27,-0.12], 6 participants x 10 tasks. Time unit not specified in what I read.",
+    "adopt_for_memory_hub": "Borrow only the principle: a use after a long gap should count more than repeated uses in one burst -> per-session dedupe of use events (ACT-R already gives diminishing returns). Do not adopt the relevance x time gate (it multiplies relevance down for old items and would hide old-but-valid rules).",
+    "cost": "n/a"
+   },
+   {
+    "name": "Old vs new = validity (bi-temporal supersession), not decay",
+    "from": "Zep / Graphiti, arXiv 2501.13956",
+    "exact_spec": "Edges carry t_valid/t_invalid (when the fact held true) and t'_created/t'_expired (when the system learned/invalidated it). On a temporally overlapping contradiction, the old edge's t_invalid is set to the new edge's t_valid; old edges are invalidated, not deleted. Rerankers offered: RRF, MMR, episode-mentions (frequency of entity/fact mentions in the conversation), node-distance from a centroid, cross-encoder.",
+    "adopt_for_memory_hub": "facts get valid_from, invalid_at, superseded_by, created_at. Nightly claude -p proposes supersessions; anything touching ลุงจืด's rules/feedback goes to review_queue (no auto-edit). Search demotes invalid facts by a fixed factor and annotates 'superseded by <id>' instead of hiding. Also return an age label per hit (e.g. created 3 days / 8 months ago) so Claude can judge staleness without any ranking risk.",
+    "cost": "Schema columns + nightly contradiction pass (claude -p) + review UI/queue."
+   }
+  ],
+  "pitfalls": [
+   "Generative Agents released code does not match the paper: recency is rank-based (decay**i over sorted list), decay 0.99 not 0.995, weights gw=[0.5,3,2] not all 1, and as written the list is sorted ascending by last_accessed so decay**1 goes to the OLDEST-accessed node (inverted vs paper). Verified by reading main branch 2026-10-01; no issue thread found. Do not port the code literally.",
+   "Exponential recency at 0.995/hour has a ~5.8-day half-life; a 6-month-old memory scores ~4e-10, which would bury ลุงจืด's long-standing rules. Use ACT-R power law (t^-0.5: 180 days -> 0.075) and a fixed importance floor for rules/feedback.",
+   "RRF scores are compressed (one leg rank1/rank10 = 1.148). Any multiplicative prior above ~1.1 reshuffles the top 10; displacement ~= (60+r)*beta/(1+beta). The existing x1.3 current-project boost already moves a rank-30 item to ~9, so priors stack on top of it.",
+   "Per-query min-max normalization (Generative Agents) makes the prior's weight depend on the candidate set's spread and is unstable with few candidates; use a fixed-pivot saturating transform (S/(S+kappa)) instead.",
+   "Counting memory_search impressions as 'use' creates a rich-get-richer loop (GA refreshes last_accessed on every retrieval; MemoryOS increments visits on retrieval). Count only memory_get/related/cite, deduped per session.",
+   "Trust/position bias (Joachims 2005): Claude will memory_get rank-1 hits partly because they are rank 1, so raw get counts overstate top-ranked items; use Click>Skip-Above pairs for tuning, not raw counts as ground truth.",
+   "Internal traffic contamination: dream jobs (MEMORY_HUB_INTERNAL=1), the 86-question eval and SessionStart auto-injection must not write use events, otherwise priors drift and R@10 is inflated.",
+   "Time-travel leakage: search.ts supports SearchOpts.before; the prior must be computed as of `before` and ignore use events after it, or evals using `before` see the future.",
+   "t -> 0 singularity: t^-0.5 is infinite right after a use; floor t (e.g. 1 hour). The floor value is not specified by the sources; it is a design choice.",
+   "Unbounded linear frequency (MemoryOS N_visit, raw-count additive like Craswell's raw PageRank, w=0.005, MAP only 0.439 paper-reported) performs badly; always log/saturate.",
+   "Recency-of-use, age-of-content and validity are different things: 'which decision is newest' needs supersession (valid_from/invalid_at), not decay. Decay alone can rank a frequently used superseded rule above its replacement.",
+   "Importance at creation never changes (GA). LLM importance can drift between nightly runs and could under-rate ลุงจืด's rules; cache by chunk hash and use a fixed floor for rules/feedback/decisions.",
+   "Adding the prior as a 4th RRF leg lets an item from a single weak leg jump; and the prior must never introduce items that are not already candidates (Craswell reranks only the top-1000 baseline).",
+   "All benchmark numbers here are paper-reported in unrelated domains (TREC web search, sandbox simulation, 6-person user study). None transfer; beta must be tuned on memory-hub's own 86 questions plus a new freshness/most-used question set, with R@10 not regressing."
+  ]
+ },
+ {
+  "sources": [
+   {
+    "title": "A-MEM: Agentic Memory for LLM Agents (arXiv 2502.12110, HTML)",
+    "url": "https://arxiv.org/html/2502.12110"
+   },
+   {
+    "title": "agiresearch/A-mem - agentic_memory/memory_system.py (official code: prompts, evolution, search_agentic)",
+    "url": "https://github.com/agiresearch/A-mem/blob/main/agentic_memory/memory_system.py"
+   },
+   {
+    "title": "HippoRAG: Neurobiologically Inspired Long-Term Memory for LLMs (arXiv 2405.14831)",
+    "url": "https://arxiv.org/html/2405.14831"
+   },
+   {
+    "title": "From RAG to Memory: Non-Parametric Continual Learning for LLMs - HippoRAG 2 (arXiv 2502.14802)",
+    "url": "https://arxiv.org/html/2502.14802"
+   },
+   {
+    "title": "OSU-NLP-Group/HippoRAG - src/hipporag/HippoRAG.py (run_ppr, graph_search_with_fact_entities, edge builders)",
+    "url": "https://github.com/OSU-NLP-Group/HippoRAG/blob/main/src/hipporag/HippoRAG.py"
+   },
+   {
+    "title": "OSU-NLP-Group/HippoRAG - src/hipporag/utils/config_utils.py (defaults: damping, linking_top_k, passage_node_weight, synonymy thresholds)",
+    "url": "https://github.com/OSU-NLP-Group/HippoRAG/blob/main/src/hipporag/utils/config_utils.py"
+   },
+   {
+    "title": "HeLa-Mem: Hebbian Learning and Associative Memory for LLM Agents (arXiv 2604.16839, ACL 2026)",
+    "url": "https://arxiv.org/html/2604.16839v1"
+   },
+   {
+    "title": "ReinerBRO/HeLa-Mem - hela_mem/hebbian_memory.py (official code defaults)",
+    "url": "https://github.com/ReinerBRO/HeLa-Mem/blob/main/hela_mem/hebbian_memory.py"
+   },
+   {
+    "title": "SYNAPSE: Episodic-Semantic Memory via Spreading Activation (arXiv 2601.02744v3)",
+    "url": "https://arxiv.org/html/2601.02744v3"
+   },
+   {
+    "title": "EngramRAG: Dynamic Usage-Weighted Topology and Synaptic Consolidation (arXiv 2609.32049)",
+    "url": "https://arxiv.org/html/2609.32049"
+   },
+   {
+    "title": "Taatgen, Lebiere, Anderson - Modeling paradigms in ACT-R (activation, S_ji = S - ln(fan_j))",
+    "url": "https://www.ai.rug.nl/~niels/publications/taatgenLebiereAnderson.pdf"
+   },
+   {
+    "title": "Petrov 2006 - Computationally efficient approximation of the ACT-R base-level learning equation",
+    "url": "http://alexpetrov.com/pub/iccm06/PetrovICCM06.pdf"
+   },
+   {
+    "title": "Local measurement: D:\\memoryhub Postgres 18.6 (memhub-pg), 12,628 chunks, TEMP tables only, nothing persisted",
+    "url": "file:///D:/memoryhub/sql/schema.sql"
+   }
+  ],
+  "mechanisms": [
+   {
+    "name": "A-MEM note construction + LLM link generation (Zettelkasten)",
+    "from": "A-MEM arXiv 2502.12110 Eq.1-6; agiresearch/A-mem memory_system.py",
+    "exact_spec": "Note m_i = {c_i, t_i, K_i, G_i, X_i, e_i, L_i} (content, timestamp, keywords, tags, context, embedding, links). K_i,G_i,X_i <- LLM(c_i || t_i || Ps1). e_i = f_enc[concat(c_i, K_i, G_i, X_i)] (all-MiniLM-L6-v2). Link candidates: cosine s_n,j, M_near = top-k (paper default k=10; Table 8 uses 10-50 per task/model). L_i <- LLM(m_n || M_near || Ps2). Code analyze_content prompt asks for JSON {keywords (most->least important), context, tags}. Query time: plain cosine top-k; code search_agentic then appends linked notes flagged is_neighbor=True but returns memories[:k]. Paper-reported: ~1,200 tokens per memory op, 5.4 s latency (GPT-4o-mini); LoCoMo GPT-4o-mini F1 multi-hop 27.02, temporal 45.85, single-hop 44.65.",
+    "adopt_for_memory_hub": "ADOPT as nightly 'dream linker' (claude -p, MEMORY_HUB_INTERNAL=1). For each chunk/fact created since last run: candidates = top-10 by existing halfvec HNSW, excluding same session_id. Prompt: new memory (id, ts, project, ctx_header, text) + 10 candidates (id, ts, project, 300-char snippet) -> JSON only {links:[{to, relation: same_topic|continues|example_of|contradicts|supersedes, confidence 0..1, why <=20 words}], keywords[], tags[]}. Validate with zod, DROP any 'to' id not in the candidate list (hallucinated ids). Insert synapses kind=dream, w=confidence*0.8, why, source_uuids. keywords/tags go to a derived node_meta table, never into chunks/turns. relation contradicts/supersedes touching a rule/feedback chunk -> review_queue, not an edge.",
+    "cost": "Paper-reported ~1.2k tokens/op; for memory-hub estimate ~3-4k input tokens per new chunk (11 snippets), batchable 5 chunks/call. Not measured."
+   },
+   {
+    "name": "A-MEM memory evolution (strengthen / update_neighbor)",
+    "from": "A-MEM arXiv 2502.12110 Eq.7; agiresearch/A-mem _evolution_system_prompt",
+    "exact_spec": "For each neighbor m_j in M_near: m_j* <- LLM(m_n || M_near \\ m_j || m_j || Ps3); m_j* REPLACES m_j. Code prompt (verbatim excerpt): 'Should this memory be evolved?... What specific actions should be taken (strengthen, update_neighbor)?' JSON {should_evolve, actions, suggested_connections, tags_to_update, new_context_neighborhood, new_tags_neighborhood}. strengthen -> note.links.extend(suggested_connections), note.tags = new tags; update_neighbor -> overwrite neighbors' context+tags in place. consolidate_memories() every evo_threshold=100 adds.",
+    "adopt_for_memory_hub": "PARTIAL. 'strengthen' = add dream synapse (above). 'update_neighbor' only on derived node_meta rows with a version column (old row kept), never on raw chunks, Obsidian notes, or ลุงจืด's rules/feedback; anything that would change a rule's meaning -> review_queue. Skip consolidate every-100 (nightly batch already covers it).",
+    "cost": "One extra LLM call per new memory if run separately; fold into the dream-linker call (same prompt returns links + neighbor tag updates) to avoid doubling."
+   },
+   {
+    "name": "HippoRAG v1 Personalized PageRank with node specificity",
+    "from": "HippoRAG arXiv 2405.14831 Sec.2-3",
+    "exact_spec": "Offline: 1-shot NER then OpenIE triples -> KG nodes (noun phrases); synonymy edges when retriever cosine > tau = 0.8; P = |N|x|P| count matrix of phrase-in-passage. Online: query NER -> each entity mapped to argmax-cosine KG node; personalization = equal probability on query nodes, 0 elsewhere, each multiplied by node specificity s_i = |P_i|^-1 (P_i = passages containing node i). PPR damping 0.5. Passage score pi_p = pi'_n * P. Paper-reported R@2/R@5: MuSiQue 40.9/51.9, 2Wiki 70.7/89.1, HotpotQA 60.5/77.7; ablation w/o node specificity MuSiQue 37.6/50.2; query nodes only without PPR 37.1/41.0; online retrieval 10-30x cheaper and 6-13x faster than IRCoT.",
+    "adopt_for_memory_hub": "ADOPT node specificity idea = fan normalization (it is IDF on graph nodes; memory-hub already has term_df). Use row-normalized weights wn = w/sum(w out of src) so hub chunks (CLAUDE.md boilerplate, 'ok' turns) cannot flood activation. Full-graph PPR NOT adopted for the hot path (see latency pitfall); truncated PPR over a 2-hop ball is an optional reranker measured at 11.9 ms p95 locally.",
+    "cost": "Offline OpenIE per passage is the expensive part (LLM); memory-hub can skip OpenIE because chunks are the nodes and edges come from kNN/temporal/wikilink/usage/dream."
+   },
+   {
+    "name": "HippoRAG 2 dense-sparse graph + seeding (official code defaults)",
+    "from": "HippoRAG 2 arXiv 2502.14802; OSU-NLP-Group/HippoRAG HippoRAG.py + config_utils.py",
+    "exact_spec": "Graph: phrase nodes + passage nodes; passage->phrase 'contains' edges weight 1.0 (code: node_to_node_stats[passage_edge] = 1.0); fact edges weight = co-occurrence count (+1 per triple); synonymy edges weight = cosine score, threshold synonymy_edge_sim_threshold=0.8, max 100 per node, KNN synonymy_edge_topk=2047. Query-to-triple matching via embeddings, then LLM triple filter (DSPy MIPROv2-tuned prompt, Appendix A; not quoted here). Seeds: phrase weight = fact_score / len(ent_node_to_chunk_ids[phrase]) averaged over occurrences, keep linking_top_k=5 phrases; ALL passages seeded with min_max_normalize(dense score) * passage_node_weight (0.05). run_ppr: graph.personalized_pagerank(damping=0.5, directed=False, weights='weight', reset=reset_prob, implementation='prpack'); rank passages by PPR score. Defaults: retrieval_top_k=200, qa_top_k=5, embedder NV-Embed-v2. Paper-reported: Recall@5 avg 87.1 full; w/o filter 86.4; w/o passage node 81.0; NER-to-node 74.6; QA 1.2 s/query; MuSiQue indexing 99.5 min for 11,656 passages.",
+    "adopt_for_memory_hub": "ADOPT the shape: chunks = passage nodes, future dream-extracted facts = phrase-like nodes (kind 'f') with abstraction edges to source chunks (keeps source_uuids). Seed rule: hybrid-search top-20 chunks with normalized RRF score as reset vector. Optional cheap phrase nodes without LLM: regex entities (file paths like src/search.ts, function/table names, URLs) + high-IDF Thai terms from term_df, weight 1/df (= HippoRAG specificity). Add only if the 86-question eval shows multi-hop gain.",
+    "cost": "Graph-side zero LLM if facts come from the dream job; regex entities ~free. PPR itself measured locally (below)."
+   },
+   {
+    "name": "Hebbian co-activation strengthening + global decay + dual-pathway recall",
+    "from": "HeLa-Mem arXiv 2604.16839 (ACL 2026) Eq.1-4; ReinerBRO/HeLa-Mem hebbian_memory.py",
+    "exact_spec": "Paper Eq.1: w_ij(t+1) = (1-lambda)*w_ij(t) + eta*I(v_i,v_j in K_t), lambda=0.995, eta=0.02. CODE semantics differ: add_edge: w = min(1.0, w + eta) both directions (eta default 0.01), applied to all pairs of the retrieved set (reinforce_memory_cluster, O(K^2)); global_decay: w *= 0.995, delete if w < 0.01. Consecutive turns init edge 0.5 (code). Base score: S_base = [sim(q,e_i) + alpha*keyword_match]*exp(-dt/tau) (paper tau=60 days; code HEBBIAN_TAU=1e7 s ~116 days; keyword weight 0.5 in code). Spreading Eq.4: S(v_j) = S_base(v_j) + beta*sum_{i in N(j)} S_base(v_i)*w_ij, beta=0.1, 1 hop, only sources with score > threshold (paper 0.6, code 0.4). Dual pathway: fixed base top-k + up to max_flipped=5 extra nodes from the spreading ranking. Hub: D(v)=sum_j w_vj > delta_hub (value not specified) -> Reflective Agent distills to semantic memory. Forgetting: total edge weight < delta_prune AND inactive > delta_age AND no recent access (code defaults min_edge_weight=0.1, min_age_days=30, dry_run=True). Paper-reported LoCoMo GPT-4o-mini avg F1 34.74; w/o spreading 32.19; w/o reflective agent 29.87; w/o forgetting 34.28.",
+    "adopt_for_memory_hub": "ADOPT with two changes. (1) Strengthen on USE, not on co-retrieval: memory_get / cited ids in the same session within 30 min appended to recall_log (one INSERT in hot path); nightly job upserts pairs: w = least(1, w_eff + 0.02), touched=now(), kind=co_use. (2) Lazy decay instead of nightly UPDATE: w_eff = w * 0.995^(days since touched) computed in the query; nightly only DELETE where w_eff < 0.01. Half-life = ln0.5/ln0.995 = 138 days, so a single co-use (0.02) disappears after ~138 days; repeated co-use accumulates. Dual pathway: keep hybrid top-k untouched, append <=5 'associated' memories with the path (via seed id + edge kind). Forgetting = prune edges only, never nodes/raw archive. Distillation of hubs = part of dream job, output fact nodes with source_uuids.",
+    "cost": "Measured locally: 90-pair upsert 1.6 ms; full-table decay UPDATE on 160k edges 766 ms (avoided by lazy decay)."
+   },
+   {
+    "name": "Spreading activation with fan effect, lateral inhibition, sigmoid (SYNAPSE)",
+    "from": "SYNAPSE arXiv 2601.02744v3 Eq.1-5",
+    "exact_spec": "Init a_i(0) = alpha*sim(h_i,h_q) for seed set T else 0. Propagate: u_i(t+1) = (1-delta)*a_i(t) + sum_{j in N(i)} S*w_ji*a_j(t)/fan(j), S=0.8, delta=0.5, fan(j)=deg_out(j); temporal edge w = exp(-rho*|tau_i - tau_j|), rho=0.01; semantic edge w = sim. Lateral inhibition: u^_i = max(0, u_i - beta*sum_{k in top-M} (u_k - u_i)*I[u_k > u_i]), beta=0.15, M=7. Sigmoid a = 1/(1+exp(-gamma*(u^ - theta))), gamma=5, theta=0.5. T=3 steps. Final S = 0.5*sim + 0.3*a(T) + 0.2*PageRank, top-k=30. Edges: temporal 1.0, abstraction 0.8, concept-concept if sim > 0.92 and in top-15; consolidation every N=5 turns; max 10,000 active nodes; dormancy eps=0.01 over 10 windows. Rejection gate tau_gate=0.12. Paper-reported LoCoMo GPT-4o-mini avg F1 40.5; w/o activation dynamics 30.5; w/o inhibition 39.4; vectors only 25.2; 1.9 s/query; code 'will be made publicly available upon acceptance'.",
+    "adopt_for_memory_hub": "ADOPT only the fan(j) division (same as row-normalized wn) and abstraction edge weight 0.8 for fact<->chunk. SKIP lateral inhibition (ablation: only -1.1 F1, paper-reported) and sigmoid (extra knobs, no code to verify against). Temporal decay on edges exp(-0.01*dt) is not needed: memory-hub temporal edges are consecutive-chunk only.",
+    "cost": "Iterative T=3 over the whole graph is the expensive variant; local truncated 3-iteration version = 11.9 ms p95."
+   },
+   {
+    "name": "Usage-modulated PPR + usage-weighted edge formula (EngramRAG)",
+    "from": "EngramRAG arXiv 2609.32049 Eq.1-3,5-6 (preprint, Sept 2026, no code)",
+    "exact_spec": "Edge: W_ij(t) = 0.4*cos(x_i,x_j) + 0.4*sum_{k=1..M_ij} exp(-lambda_access*(t - t_k)) + 0.2*R_type(r) (lambda_access not specified; R_SUPERSEDES=2.5); co-activation = both retrieved in the same episode. Personalization: p_i = 0.6*max(0,cos(q,i))/sum + 0.4*[log(1+n_i)*exp(-0.05*(t - t_i))]/sum, n_i = access count. pi* = (1-d)(I - d P^T)^-1 p, d=0.85, <=20 power iterations. Decay: lambda_eff(v) = lambda_base(type)*exp(-2.0*Score_topology(v)), lambda_base identity 0.0001 / preference 0.0008 / episodic 0.08. Paper-reported: LoCoMo Recall@5 53.21 vs dense 38.29 vs BM25 48.66; full retrieval 26.21 ms; U-PPR 4-6 ms at |V|=1,000 and ~50 ms at |V|=10,000.",
+    "adopt_for_memory_hub": "ADOPT the personalization idea only if the separate usage-ranking work adds n_use/last_use per chunk: seed reset = 0.6*normalized RRF + 0.4*normalized log(1+n_use)*exp(-0.05*days_since_use). Do NOT adopt d=0.85 full-graph PPR in the hot path (their own 50 ms at 10k nodes > our 30 ms budget). CATD idea (central nodes decay slower) maps to: never decay structural edges, only co_use/dream.",
+    "cost": "No code; numbers unverified beyond paper."
+   },
+   {
+    "name": "ACT-R activation: base-level + spreading with fan",
+    "from": "ACT-R (Anderson & Lebiere 1998; Taatgen, Lebiere & Anderson chapter; Petrov 2006)",
+    "exact_spec": "A_i = B_i + sum_j W_j*S_ji. Base level B_i = ln(sum_{j=1..n} t_j^-d), d=0.5 default (:bll .5), n = number of past uses, t_j = time since j-th use. S_ji = S - ln(fan_j), S = max associative strength (:mas, often ~2; fan model fit 1.6), W_j usually 1/n over n sources. Petrov 2006 gives a cheaper approximation keeping only the most recent use(s) exactly.",
+    "adopt_for_memory_hub": "Use as the principled form for both asks: B_i (frequency+recency of USE) for the 'used often / old vs new' rank, and S - ln(fan) as the fan normalization in recall. Cheap SQL: store last 8 use timestamps per chunk (int[] epoch) and compute ln(sum(power(age_sec, -0.5))); Petrov approximation if arrays grow.",
+    "cost": "Negligible; computed in SQL over at most the 20 seeds + 5 associated nodes."
+   },
+   {
+    "name": "memory-hub brain design (Postgres, measured locally)",
+    "from": "Synthesis of the above; latency measured on D:\\memoryhub PG 18.6 with TEMP tables (12,628 chunks, 160,104 directed edges = kNN k=8 cosine + consecutive-chunk edges, both directions)",
+    "exact_spec": "DDL: nodes(nid serial PK, kind char(1) CHECK kind IN ('c','f','n') -- chunk|fact|obsidian note(source), ref text NOT NULL, deg int, UNIQUE(kind,ref)). synapses(src int REFERENCES nodes ON DELETE CASCADE, dst int REFERENCES nodes ON DELETE CASCADE, kind smallint -- 1 sim kNN, 2 next (same session consecutive), 3 wikilink, 4 co_use (Hebbian), 5 dream (LLM), 6 abstraction (fact<->chunk), w real CHECK (w>0 AND w<=1), wn real -- w/sum(w) per src, nightly, touched timestamptz DEFAULT now(), why text, source_uuids text[], PRIMARY KEY(src,dst,kind)); CREATE INDEX ON synapses(src) INCLUDE (dst,kind,w,wn,touched); store both directions. recall_log(ts timestamptz DEFAULT now(), session_id text, used_ids text[]). Initial weights: sim = cosine (k=8, also require cosine >= calibrated floor; HippoRAG uses 0.8 for its encoder, bge-m3 needs its own), next = 0.5 (HeLa-Mem code), wikilink = 1.0 (HippoRAG passage edge), abstraction = 0.8 (SYNAPSE), dream = 0.8*confidence, co_use += 0.02 capped 1. Kind multipliers (calibration knob, not from papers): sim 0.5, next 0.7, wikilink 1.0, co_use 1.0, dream 0.8, abstraction 0.8. Effective weight w_eff = w * CASE WHEN kind IN (4,5) THEN power(0.995, extract(epoch FROM now()-touched)/86400) ELSE 1 END. Query-time associative recall (after existing hybrid search, seeds = top-20 nids, b = RRF score): WITH s AS (SELECT unnest($1::int[]) nid, unnest($2::real[]) b) SELECT y.dst, sum(s.b*y.wn*mult*decay) a, (array_agg(s.nid ORDER BY s.b*y.wn DESC))[1] via FROM s JOIN synapses y ON y.src=s.nid WHERE y.dst <> ALL($1) GROUP BY 1 ORDER BY 2 DESC LIMIT 5 -> appended as 'associated' with via+kind; base top-k order untouched. Optional 2-hop: prune hop-1 frontier to top-50, hop-2 weight 0.01. Optional reranker: truncated PPR damping 0.5, 3 power iterations, frontier top-300 per iteration. MEASURED (60 random queries, parallel workers off): 1-hop p50 0.39 ms / p95 0.53 ms; 2-hop p50 0.82 / p95 1.06 ms; truncated PPR-3 p50 11.2 / p95 11.9 ms. Offline: kNN k=8 edges for all 12,628 chunks 3.2 s; row-normalize 61 ms; Hebbian 90-pair upsert 1.6 ms; full decay UPDATE 766 ms (replace with lazy decay). Nightly order: (1) kNN + next edges for new chunks, (2) wikilink edges from links (chunks of src source <-> chunks of dst source, cap 3 chunks each), (3) apply recall_log -> co_use upserts, (4) dream linker claude -p, (5) DELETE w_eff < 0.01 for kinds 4,5, (6) recompute wn and deg, ANALYZE. Obsidian view: nightly write generated md files (separate folder, not ลุงจืด's vault notes) only for fact nodes/hubs with [[links]] to neighbors with w_eff >= 0.3, so the graph view shows hundreds, not 12k, nodes.",
+    "adopt_for_memory_hub": "ADOPT 1-hop + dual pathway first (0.5 ms, well under the 30 ms budget, adds to the 110 ms p95 search). Add truncated PPR only if the 86-question eval improves vs a plain k+5 baseline. New MCP output field 'associated' (or extend memory_related to use synapses instead of on-the-fly vector similarity).",
+    "cost": "Storage ~160k rows per 12.6k chunks for k=8 undirected (~10-15 MB with index). Hot path: one extra indexed query (<1 ms) + one recall_log INSERT on memory_get. Nightly: seconds for graph, LLM cost only in dream step."
+   }
+  ],
+  "pitfalls": [
+   "MEASURED locally: spreading activation and truncated PPR seeded by hybrid top-20 put 0.00 new memories into the top-10 (40 random queries). The seeds' own scores always win, and PPR with damping 0.5 keeps half its mass on the seeds. So graph expansion re-ranks; it does not discover. Associated memories must get their own slots (HeLa-Mem dual pathway, max_flipped=5) and must not be merged into the main ranking.",
+   "kNN-similarity edges only re-find what vector search already found, because neighbors are near-duplicates (avg edge cosine 0.78 at k=8). Associative value has to come from non-similarity synapses: consecutive-chunk temporal edges, Obsidian wikilinks (only 138 resolved links today, so sparse), co-use (Hebbian) and dream edges.",
+   "Rich-get-richer loop: HeLa-Mem strengthens every co-retrieved pair. That reinforces wrong retrievals, and retrieved items get retrieved again. Strengthen only on actual use (memory_get or a cited id), cap w at 1, and decay. HeLa-Mem's own ablation shows forgetting matters little (-0.46 F1), but that was measured on short LoCoMo dialogs, not months of usage.",
+   "Hub flooding: generic chunks (CLAUDE.md boilerplate, rules text, 'ok/continue' turns) gather many edges. Without fan normalization (HippoRAG s_i=1/|P_i|, SYNAPSE /fan(j), ACT-R S-ln(fan)) they show up as 'associated' for every query. Use the row-normalized wn and consider excluding rule/system chunks as spreading sources.",
+   "A-MEM evolution OVERWRITES neighbor notes' context/tags in place (update_neighbor). That breaks the never-auto-edit and raw-archive-is-truth constraints. Apply it only to versioned derived metadata and route rule/feedback changes to review_queue. The LLM can also return ids that are not among the candidates: drop any link whose target is outside the candidate list.",
+   "A-MEM official code gaps (verified by reading agiresearch/A-mem memory_system.py): (1) search_agentic appends linked neighbors and then returns memories[:k], so links only appear when vector search returned fewer than k hits; (2) retrieval_count and last_accessed are stored but never incremented. Do not assume A-MEM implements usage counting.",
+   "Paper vs code mismatches in HeLa-Mem. The paper writes (1-lambda)*w with lambda=0.995, which would wipe weights every step; the code does w *= 0.995. Paper eta=0.02 vs code 0.01. Paper spreading threshold 0.6 vs code 0.4. Paper tau=60 days vs code 1e7 s (about 116 days). Follow the code semantics (retention 0.995) and tune on the local eval.",
+   "igraph damping semantics: HippoRAG's damping=0.5 is the probability of following an edge, so the restart probability is also 0.5. EngramRAG uses d=0.85 in (1-d)(I-dP^T)^-1 p. Mixing up the two conventions silently changes how far activation travels.",
+   "Latency scaling: EngramRAG itself reports full U-PPR at about 50 ms for 10k nodes (paper-reported), which breaks a 30 ms budget. Keep PPR truncated to a small subgraph (measured 11.9 ms p95 for 3 iterations x top-300 frontier), or use 1-hop (0.53 ms p95).",
+   "Nightly full-table decay UPDATE (766 ms for 160k rows) creates dead tuples and bloat every night. Lazy decay (store touched, compute w*0.995^days at read time, nightly DELETE below 0.01) avoids rewriting the table.",
+   "Eval trap: 'top-10 + 5 associated' must be compared against a plain hybrid top-15. Otherwise any recall gain is just the larger k. Report R@10 unchanged plus R@15 vs baseline R@15 on the 86 questions.",
+   "Every benchmark number above is paper-reported on English, mostly synthetic dialog sets (LoCoMo, MuSiQue, 2Wiki, HotpotQA) with other LLMs and embedders. None of them transfers to Thai, English and source-code chat logs. Only the local latency numbers were measured here, on 12,628 chunks.",
+   "HippoRAG-style OpenIE/NER is English-centric and LLM-heavy at indexing time. For Thai, node keys must not depend on word segmentation variants: use chunk ids as nodes, and use regex entities for code (file paths, identifiers, table names) instead of LLM extraction. Any LLM entity extraction belongs in the nightly claude -p job, never at query time.",
+   "Never let forgetting delete nodes or raw chunks. HeLa-Mem's adaptive forgetting removes nodes, which conflicts with 'raw archive stays the source of truth'. Prune edges only; low-activation memories should rank lower, not disappear."
+  ]
+ }
+]

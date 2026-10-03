@@ -1,0 +1,1320 @@
+/* memory-hub web — quiet glass HUD over the 3D brain. Dark (default) and light themes on html[data-theme], set before
+   first paint by the inline script in layout.tsx. Fonts are self-hosted by next/font: 0 third-party requests. */
+:root,
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #07090f; /* = brain/style.ts THEME.dark.bg */
+  --surface: rgba(16, 18, 24, 0.8); /* .58 / .72 let a close-up cluster behind the glass pull text-3 to 3.4 / 4.2:1 */
+  --surface-solid: rgba(14, 16, 22, 0.9);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --hilite: rgba(255, 255, 255, 0.05);
+  --fill: rgba(255, 255, 255, 0.06); /* hover rows, segmented tracks */
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --glass: blur(20px) saturate(160%);
+  /* WCAG ratios on the composited panel #0c0e14: 17.4 / 7.8 / 6.1 / 7.6 (text-3 on a hovered row: 5.4). text-3 was
+     #828893 (5.4): a zoomed-in cluster behind the glass pulled it to 4.2 */
+  --text: #f2f3f5;
+  --text-2: #a1a5ae;
+  --text-3: #8b919c;
+  --accent: #a594ff; /* only: live dot, playhead, active segment, focus ring, pressed toggles */
+  --on-accent: #0c0a1f;
+}
+html[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f5f5f7; /* = brain/style.ts THEME.light.bg */
+  --surface: rgba(255, 255, 255, 0.86); /* .66 / .80: same, 3.5 / 4.3:1 */
+  --surface-solid: rgba(255, 255, 255, 0.92);
+  --border: rgba(0, 0, 0, 0.07);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --hilite: rgba(255, 255, 255, 0.8);
+  --fill: rgba(0, 0, 0, 0.045);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.08);
+  --glass: blur(20px) saturate(120%); /* 160% turns close-up nodes behind the glass into peach and blue blotches */
+  /* WCAG ratios on the composited panel #fcfcfc: 16.4 / 6.1 / 5.2 / 5.8 (text-3 on a hovered row: 4.75) */
+  --text: #1d1d1f;
+  --text-2: #5f6068;
+  --text-3: #6a6a72;
+  --accent: #5b4ce0;
+  --on-accent: #fff;
+}
+:root {
+  /* Inter for Latin, Anuphan for Thai (next/font variables on <html>); weights 400 / 500 / 600 only */
+  --font: var(--font-latin), var(--font-thai), system-ui, sans-serif;
+  --gap: 12px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 13px/1.55 var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+button {
+  font: inherit;
+  color: inherit;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.num,
+.stat__value,
+.strip__foot,
+.tl__readout,
+.tl__xlabel,
+.hubs,
+.facts dd,
+.feed__time,
+.syslog__time,
+.pill,
+.seg__btn,
+.caption__date {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* ───────── stage: 3D canvas + overlays ───────── */
+.stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+.scene {
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+}
+.scene canvas {
+  display: block;
+  outline: none;
+  animation: fade-in 300ms ease-out backwards; /* a theme switch remounts the engine: the new canvas fades in from --bg */
+}
+/* engine.ts sets data-drawn once a frame is really on screen: the first one composited black (a grey flash in light) */
+.scene canvas:not([data-drawn]) {
+  opacity: 0;
+  animation: none;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* ───────── HUD layout ───────── */
+.hud {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  gap: var(--gap);
+  padding: max(var(--gap), env(safe-area-inset-top)) max(var(--gap), env(safe-area-inset-right)) max(var(--gap), env(safe-area-inset-bottom)) max(var(--gap), env(safe-area-inset-left));
+  pointer-events: none; /* only panels and controls take the pointer; the empty centre drags the camera */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    'head head'
+    'strip side'
+    'bl side'
+    'time time';
+}
+.hud-header {
+  grid-area: head;
+}
+.strip {
+  grid-area: strip;
+}
+.side {
+  grid-area: side;
+}
+.hud__bl {
+  grid-area: bl;
+}
+.timeline {
+  grid-area: time;
+}
+.panel,
+.btn,
+.pill,
+.brand {
+  pointer-events: auto;
+}
+
+/* ───────── glass ───────── */
+.panel {
+  position: relative;
+  background: var(--surface);
+  -webkit-backdrop-filter: var(--glass);
+  backdrop-filter: var(--glass);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: inset 0 1px 0 var(--hilite), var(--shadow);
+  animation: rise 240ms var(--ease) backwards;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+.panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 8px 8px 16px;
+  font: 600 13px/1.55 var(--font);
+  border-bottom: 1px solid var(--border);
+}
+
+/* ───────── controls ───────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 36px;
+  padding: 0 13px;
+  font: 500 13px/1 var(--font);
+  color: var(--text-2);
+  background: var(--fill);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 120ms, background-color 120ms, border-color 120ms, transform 120ms;
+}
+.btn:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.btn:active,
+.seg__btn:active,
+.tab:active,
+.feed__row:active {
+  transform: scale(0.97);
+}
+.btn[aria-pressed='true'] {
+  color: var(--text);
+}
+/* ตาราง / ข้อมูล have no dot: text colour alone is < 3:1 between states and equals :hover */
+.btn[aria-pressed='true']:not(:has(.btn__dot)) {
+  border-color: var(--accent);
+}
+.btn__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--text-3);
+}
+.btn[aria-pressed='true'] .btn__dot {
+  background: var(--accent);
+  box-shadow: none;
+}
+/* the user took the camera: follow resumes in 20 s. A half-filled accent dot: a shape of its own between off (hollow
+   ring) and on (full), not a colour alone (a hollow accent ring was 1.1-1.25:1 to the off ring) */
+.btn[aria-pressed='true'][data-paused='true'] .btn__dot {
+  background: linear-gradient(90deg, var(--accent) 50%, transparent 0);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.btn--icon {
+  width: 36px;
+  padding: 0;
+}
+.btn--play svg {
+  fill: currentColor;
+}
+/* header controls float over the scene: glass like the panels */
+.hud-header .btn,
+.pill {
+  background: var(--surface);
+  -webkit-backdrop-filter: var(--glass);
+  backdrop-filter: var(--glass);
+  box-shadow: inset 0 1px 0 var(--hilite), var(--shadow);
+}
+.btn--theme {
+  display: inline-grid;
+  place-items: center;
+}
+.btn--theme svg {
+  grid-area: 1 / 1;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: opacity 240ms var(--ease), transform 240ms var(--ease);
+}
+/* the icon shows where the toggle goes: sun on dark, moon on light */
+.btn--theme .i-moon,
+html[data-theme='light'] .btn--theme .i-sun {
+  opacity: 0;
+  transform: rotate(-90deg);
+}
+html[data-theme='light'] .btn--theme .i-moon {
+  opacity: 1;
+  transform: none;
+}
+.btn--hud {
+  display: none;
+}
+.pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 14px;
+  font: 500 13px/1 var(--font);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.pill__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.pill[data-state='live'] .pill__dot {
+  animation: breathe 2.4s ease-in-out infinite;
+}
+.pill[data-state='loading'] .pill__dot {
+  background: var(--text-3);
+}
+.pill[data-state='snapshot'],
+.pill[data-state='error'] {
+  color: var(--text-2);
+}
+.pill[data-state='snapshot'] .pill__dot,
+.pill[data-state='error'] .pill__dot {
+  display: none;
+}
+@keyframes breathe {
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
+}
+.seg {
+  position: relative;
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  height: 36px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--fill);
+  border: 1px solid var(--border);
+}
+.seg__thumb {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / 3); /* 3 = SPEEDS.length */
+  border-radius: 999px;
+  background: var(--accent);
+  transform: translateX(calc(var(--i, 0) * 100%));
+  transition: transform 180ms var(--ease);
+}
+.seg__btn {
+  position: relative;
+  min-width: 42px;
+  padding: 0 8px;
+  font: 500 13px/1 var(--font);
+  color: var(--text-2);
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 180ms, transform 120ms;
+}
+.seg__btn:hover {
+  color: var(--text);
+}
+.seg__btn[aria-pressed='true'] {
+  color: var(--on-accent);
+}
+/* theme switch (lib/theme.ts): controls flip with the panels instead of fading as dark blocks on a white HUD */
+html.theme-flip :is(.btn, .tab, .seg__btn, .seg__thumb) {
+  transition: none;
+}
+
+/* ───────── header (bare: no panel) ───────── */
+.hud-header {
+  position: relative;
+  isolation: isolate; /* the scrim below stays behind the header, above the scene */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  min-width: 0;
+}
+/* scrim in the page colour (invisible over the empty scene, which is --bg too): edges and nodes behind the bare
+   header fade to 20 % instead of crossing the subtitle, then ease out over 56 px (the panels below paint on top) */
+.hud-header::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: -40px -40px -56px;
+  background: linear-gradient(var(--bg) calc(100% - 56px), transparent);
+  opacity: 0.8;
+  pointer-events: none;
+}
+.brand {
+  min-width: 0;
+  /* bare header over the scene: a halo in the page colour keeps it legible over bright edges and clusters */
+  text-shadow: 0 0 1px var(--bg), 0 0 3px var(--bg), 0 0 6px var(--bg), 0 0 12px var(--bg); /* tight layers mask 1px edges */
+}
+.brand__title {
+  margin: 0;
+  white-space: nowrap;
+  font: 600 16px/1.2 var(--font);
+  letter-spacing: -0.01em; /* Latin wordmark only: Thai is never letter-spaced */
+}
+.brand__sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.hud-header__tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hud-header__wide {
+  display: contents;
+}
+
+/* ───────── stat strip (also the legend) ───────── */
+.strip {
+  align-self: start;
+  justify-self: start;
+  width: min(100%, 540px);
+  overflow: hidden;
+}
+.strip__cells {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin: 0;
+}
+.stat {
+  min-width: 0;
+  padding: 11px 14px 9px;
+}
+.stat + .stat {
+  border-left: 1px solid var(--border);
+}
+/* wraps instead of an ellipsis: the strip is the only legend of the glyphs (WCAG 1.4.12 text spacing cut its labels) */
+.stat__label {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.stat__label .glyph {
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.stat__value {
+  margin: 2px 0 0;
+  font: 500 24px/1.2 var(--font);
+  letter-spacing: -0.01em; /* digits only */
+}
+.stat__value--flash {
+  animation: flash 600ms ease-out;
+}
+@keyframes flash {
+  from {
+    color: var(--accent);
+  }
+}
+.strip__foot {
+  margin: 0;
+  padding: 6px 14px 7px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.strip__foot > span {
+  white-space: nowrap;
+}
+.glyph {
+  flex: none;
+}
+
+/* ───────── right column: activity | system log ───────── */
+.side {
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  transition: opacity 240ms var(--ease) 60ms, transform 240ms var(--ease) 60ms;
+}
+.side__tools {
+  display: none;
+}
+.side__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px 8px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.side__hint {
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.tabs {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--fill);
+}
+.tab {
+  height: 30px;
+  padding: 0 12px;
+  font: 600 13px/1 var(--font);
+  color: var(--text-2);
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 120ms, background-color 120ms, transform 120ms;
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab[aria-pressed='true'] {
+  color: var(--on-accent);
+  background: var(--accent); /* the active segment, like the speed thumb (a surface-on-fill tab was 1.1:1 to its track) */
+}
+.feed__list,
+.syslog__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+.feed__row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  grid-template-areas: 'g what time' '. meta meta';
+  column-gap: 10px;
+  width: 100%;
+  padding: 6px 14px;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: left;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  transition: background-color 120ms, transform 120ms;
+}
+.feed__row:hover {
+  background: var(--fill);
+}
+.feed__row:focus-visible,
+.syslog__list:focus-visible {
+  outline-offset: -2px; /* full-width row / scroll box: an outside ring is clipped left and right */
+}
+.feed__row .glyph {
+  grid-area: g;
+  align-self: center;
+}
+.feed__what {
+  grid-area: what;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.feed__time,
+.syslog__time {
+  font-size: 12px;
+  color: var(--text-3);
+  text-align: right;
+  white-space: nowrap;
+}
+.feed__time {
+  grid-area: time;
+}
+.feed__meta {
+  grid-area: meta;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.feed__empty {
+  padding: 8px 14px;
+  color: var(--text-2);
+}
+.syslog__list {
+  max-height: 46vh;
+}
+.syslog__ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.syslog__row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 10px;
+  padding: 6px 14px;
+  line-height: 1.6;
+}
+.syslog__what,
+.syslog__where {
+  grid-column: 1 / -1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.syslog__what {
+  overflow-wrap: anywhere;
+}
+.syslog__where {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ───────── bottom-left: details / hover card ───────── */
+.hud__bl {
+  align-self: end;
+  justify-self: start;
+  width: min(100%, 320px);
+}
+.details,
+.tooltip {
+  padding: 12px 14px;
+}
+.card__head {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 8px;
+  align-items: center;
+}
+.card__type {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.card__title {
+  grid-column: 2;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 14px;
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+.facts dt {
+  color: var(--text-2);
+}
+.facts dd {
+  margin: 0;
+}
+.details__links {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.details__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 5;
+  width: 240px;
+  transform: translate(var(--x, 0px), var(--y, 0px));
+  pointer-events: none;
+  animation: none; /* the rise would fight the pointer-following transform */
+}
+.tooltip[hidden] {
+  display: none;
+}
+
+/* ───────── timeline ───────── */
+.timeline {
+  padding: 10px 14px 4px;
+  background: var(--surface-solid); /* spans the bottom where clusters sit: glass dropped its axis labels to 3.7:1 */
+}
+.tl__controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.btn--live[aria-pressed='true'] {
+  border-color: var(--border-strong);
+}
+.tl__readout {
+  margin-left: auto;
+  font: 600 15px/1 var(--font);
+}
+/* the caption already shows the date; on a 360 px phone it would wrap to its own row and jump back at LIVE */
+.stage[data-phase='intro'] .tl__readout {
+  display: none;
+}
+.tl__chart {
+  height: 74px; /* CHART_H 56 + AXIS_H 18 */
+  border-radius: 4px;
+  cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
+}
+.tl__chart svg {
+  display: block;
+  overflow: visible;
+}
+.tl__bar {
+  fill: var(--text-3);
+  fill-opacity: 0.72; /* ≥ 3:1 against the panel (.35 was 1.6:1): the unplayed bars are the activity being scrubbed into */
+}
+.tl__bar--played {
+  fill: var(--text);
+  fill-opacity: 0.85;
+}
+.tl__base,
+.tl__tick {
+  stroke: var(--border-strong);
+}
+.tl__xlabel {
+  font: 12px var(--font);
+  fill: var(--text-3);
+}
+.tl__head {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+.tl__handle,
+.tl__live {
+  fill: var(--accent);
+}
+.tl__live {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+/* ───────── page-load intro ───────── */
+/* the right column waits for LIVE, then rises in: the panel, then its rows 60 ms apart (an open ข้อมูล sheet stays) */
+.stage[data-phase='intro']:not([data-hud='on']) :is(.side, .feed__list > li) {
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  visibility: hidden; /* out of the tab order too; not transitioned, so it flips back at once and the rise still plays */
+}
+/* while graph.json loads only the boot screen and header show: no zero stats, no 1970 axis; panels rise in on reveal */
+.stage[data-phase='boot'] :is(.strip, .side, .timeline) {
+  display: none;
+}
+/* the camera keeps the hidden side panel's column free (no slide at the reveal): centre the caption over the brain */
+.stage[data-phase='intro'] .caption {
+  grid-column: 1;
+}
+/* a node picked mid-intro opens the details panel in that cell: the caption covered its buttons; the side column is empty */
+@media (min-width: 720px) {
+  .stage[data-phase='intro'][data-selected] .caption {
+    grid-column: 2;
+  }
+}
+.feed__list > li {
+  transition: opacity 240ms var(--ease), transform 240ms var(--ease);
+  transition-delay: calc(120ms + 60ms * var(--i, 0));
+}
+.caption {
+  grid-row: bl;
+  grid-column: 1 / -1;
+  justify-self: center;
+  align-self: end;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: 100%;
+  padding: 10px 10px 10px 24px;
+  border-radius: 999px;
+}
+.caption__text {
+  display: grid;
+}
+.caption__date {
+  min-width: 6.5em; /* the widest date ("30 เม.ย. 2569", 6.4em): Thai months differ in width, the pill must not resize daily */
+  font: 500 32px/1.2 var(--font);
+}
+.caption__sub {
+  color: var(--text-2);
+}
+.caption__skip {
+  min-width: 64px;
+  height: 44px;
+  border-color: transparent;
+  border-radius: 999px;
+  background: none;
+  animation: fade-in 240ms var(--ease) 600ms backwards;
+}
+/* in the tab order from the start: a keyboard user tabbing in early must not land on an invisible button (WCAG 2.4.7) */
+.caption__skip:focus-visible {
+  animation: none;
+}
+.caption__skip:hover {
+  background: var(--fill);
+}
+.caption--live {
+  padding: 12px 24px;
+  font: 600 15px/1.55 var(--font);
+  pointer-events: none;
+  animation: rise 240ms var(--ease) backwards, fade-out 400ms var(--ease) 1.8s forwards;
+}
+@keyframes fade-out {
+  to {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
+/* the LIVE beat: an accent ring expands from the status pill */
+.pill[data-ring]::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border: 2px solid var(--accent);
+  border-radius: inherit;
+  pointer-events: none;
+  animation: ring 700ms var(--ease) forwards;
+}
+@keyframes ring {
+  from {
+    opacity: 0.9;
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.25, 1.8);
+  }
+}
+
+/* ───────── hub table (a11y alternative to the 3D view) ───────── */
+.table-panel {
+  position: absolute;
+  z-index: 4;
+  grid-row: strip-start / time-start;
+  grid-column: 1 / -1;
+  inset: 0;
+  max-width: 900px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  /* a reading surface: opaque page colour (3D nodes behind the rows read as noise); the glass rules resolve to it too */
+  --surface: var(--bg);
+  --surface-solid: var(--bg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.table-panel__scroll {
+  overflow: auto;
+  min-height: 0;
+  scroll-padding-top: 48px; /* the sticky header (33 px, 44.5 px touch) must not cover a row focused by Shift+Tab */
+}
+.hubs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.hubs th,
+.hubs td {
+  padding: 7px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.hubs thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-solid);
+  color: var(--text-2);
+  font-weight: 600;
+}
+.hubs .num {
+  text-align: right;
+}
+.hubs button {
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.hubs tbody th {
+  font-weight: 400;
+}
+.hubs tbody tr:hover {
+  background: var(--fill);
+}
+/* no-break space: the arrow never wraps alone. Empty alt text: aria-sort says the direction, the glyph is not read (the
+   first declaration is the fallback of a browser without alt text, which drops the second) */
+.hubs th[aria-sort='ascending'] button::after {
+  content: '\00a0▲';
+  content: '\00a0▲' / '';
+}
+.hubs th[aria-sort='descending'] button::after {
+  content: '\00a0▼';
+  content: '\00a0▼' / '';
+}
+/* the table covers the centre: hide the HUD panels it would otherwise bleed over (and keep their buttons out of the tab
+   order under it) */
+.stage[data-table='on'] :is(.strip, .side, .hud__bl) {
+  visibility: hidden;
+}
+
+/* ───────── boot / notices ───────── */
+.boot {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  pointer-events: none;
+}
+.boot__mark {
+  font: 600 16px/1 var(--font);
+  letter-spacing: -0.01em;
+}
+.boot__line {
+  position: relative;
+  width: 120px;
+  height: 1px;
+  overflow: hidden;
+  background: var(--border-strong);
+}
+.boot__line::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, var(--text), transparent);
+  transform: translateX(-100%);
+  animation: shimmer 1.4s var(--ease) infinite;
+}
+@keyframes shimmer {
+  to {
+    transform: translateX(250%);
+  }
+}
+.boot__text {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.scene__loading {
+  position: absolute;
+  top: 58%;
+  left: 50%;
+  margin: 0;
+  padding: 8px 16px;
+  transform: translateX(-50%);
+  font-size: 13px;
+  color: var(--text-2);
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  pointer-events: none;
+}
+/* the no-WebGL notice: centred, wraps on a phone instead of running off the edges */
+p.scene__loading {
+  left: 16px;
+  right: 16px;
+  width: fit-content;
+  margin: 0 auto;
+  transform: none;
+  text-align: center;
+}
+.fatal {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  color: var(--text-2);
+  pointer-events: none;
+}
+.fatal a {
+  color: var(--text);
+  pointer-events: auto;
+}
+
+/* touch devices have no hover: the details sheet is the tap UX */
+@media (hover: none) {
+  .tooltip {
+    display: none;
+  }
+}
+/* 44 px touch targets */
+@media (pointer: coarse) {
+  .btn,
+  .pill,
+  .seg {
+    height: 44px;
+  }
+  .btn--icon {
+    width: 44px;
+  }
+  .btn {
+    min-width: 44px; /* a short label (ปิด) left 43.9 px */
+  }
+  .tab {
+    height: 38px; /* + the 3px track padding = 44 */
+  }
+}
+/* phones and LOW: no backdrop blur (a full-screen blur per panel per frame), near-opaque glass instead */
+@media (pointer: coarse) {
+  .panel,
+  .hud-header .btn,
+  .pill {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    background: var(--surface-solid);
+  }
+}
+html[data-tier='low'] .panel,
+html[data-tier='low'] .hud-header .btn,
+html[data-tier='low'] .pill {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: var(--surface-solid);
+}
+/* a selected node means a close-up: bright clusters fill the glass, so panels go near-opaque (text-3 stays ≥ 4.5:1) */
+.stage[data-selected] .panel {
+  background: var(--surface-solid);
+}
+
+/* ───────── phones are first-class ───────── */
+@media (max-width: 719px) {
+  :root {
+    --gap: 8px;
+  }
+  .hud {
+    grid-template-columns: minmax(0, 1fr);
+    /* the ข้อมูล sheet shrinks (its list scrolls) before the timeline is pushed off-screen */
+    grid-template-rows: auto auto minmax(0, auto) minmax(0, 1fr) auto auto;
+    grid-template-areas: 'head' 'strip' 'side' '.' 'bl' 'time';
+  }
+  /* one row: wordmark, status, theme, ข้อมูล (ติดตาม + ตาราง live in the sheet) */
+  .brand__sub,
+  .hud-header__wide {
+    display: none;
+  }
+  .hud-header__tools {
+    gap: 6px;
+    min-width: 0;
+  }
+  .pill {
+    padding: 0 12px;
+  }
+  .btn--hud {
+    display: inline-flex;
+    order: 1;
+  }
+  .strip {
+    width: 100%;
+  }
+  /* content-sized columns: equal fifths cut the longer Thai labels (เอเจนต์ย่อย) on a 390 px phone */
+  .strip__cells {
+    grid-template-columns: repeat(5, minmax(0, auto));
+  }
+  .stat {
+    padding: 8px 6px 7px;
+  }
+  .stat__label .glyph {
+    margin-right: 4px;
+  }
+  .stat__value {
+    font-size: 18px;
+  }
+  .strip__foot {
+    padding-inline: 8px;
+  }
+  .side {
+    display: none;
+  }
+  .stage[data-hud='on'] .side {
+    display: flex;
+  }
+  .side__tools {
+    display: flex;
+    gap: 8px;
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .side__tools .btn {
+    flex: 1;
+  }
+  .feed__list,
+  .syslog__list {
+    max-height: 34vh;
+  }
+  .hud__bl {
+    width: 100%;
+  }
+  /* details → bottom sheet, opaque: the timeline and the ข้อมูล sheet must not ghost through it */
+  .details {
+    --surface: var(--bg);
+    --surface-solid: var(--bg);
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    max-height: 52vh;
+    overflow-y: auto;
+    padding: 20px 16px max(14px, env(safe-area-inset-bottom));
+    border-width: 1px 0 0;
+    border-radius: 14px 14px 0 0;
+  }
+  .details::before {
+    content: '';
+    position: absolute;
+    top: 7px;
+    left: 50%;
+    width: 38px;
+    height: 4px;
+    margin-left: -19px;
+    border-radius: 2px;
+    background: var(--border-strong);
+  }
+  .details .btn {
+    flex: 1;
+  }
+  .timeline {
+    padding: 8px 10px 4px;
+  }
+  /* the opaque details sheet covers them: out of the tab order while open (focus must not land out of sight) */
+  .stage[data-selected] :is(.timeline, .caption) {
+    visibility: hidden;
+  }
+  /* ข้อมูล reopened over a selection: the sheet would cover its feed rows (back when ข้อมูล closes) */
+  .stage[data-hud='on'] .details {
+    visibility: hidden;
+  }
+  .seg__btn {
+    min-width: 38px;
+    padding: 0 6px;
+  }
+  .caption {
+    gap: 10px;
+    padding: 8px 8px 8px 18px;
+  }
+  .caption__date {
+    font-size: 24px;
+  }
+  /* six columns fit a phone: tighter cells, Thai headers break onto two lines */
+  /* 4 px: the 44 px touch-target buttons (ชื่อ, โน้ต) made 8 px cells overflow a 390 px phone */
+  .hubs th,
+  .hubs td {
+    padding: 7px 4px;
+  }
+  .hubs thead th {
+    white-space: normal;
+  }
+}
+/* tablet portrait: the strip (also the legend) gets the full width, the side panel sits under it */
+@media (min-width: 720px) and (max-width: 959px) {
+  .hud {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'head head'
+      'strip strip'
+      'bl side'
+      'time time';
+  }
+}
+/* 360 px phones: room for เอเจนต์ย่อย and a one-row header */
+@media (max-width: 374px) {
+  .stat {
+    padding-inline: 4px;
+  }
+  .stat__label .glyph {
+    margin-right: 3px;
+  }
+  .pill__verb {
+    display: none;
+  }
+  /* a user replay keeps its date on the control row (a wrap grew the timeline 23 px and shrank it back at สด):
+     the widest, 28 เม.ย. 2569, is 85 px at 13 px; ▶ 44 + speeds 110 + สด 58 + 3 gaps leave 92 of the 322 px row */
+  .tl__controls {
+    gap: 6px;
+  }
+  .seg__btn {
+    min-width: 34px;
+    padding: 0 4px;
+  }
+  .tl__readout {
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  /* six two-line headers are still too wide here and split เอเจนต์ mid-word: one line, the table scrolls sideways */
+  .hubs thead th {
+    white-space: nowrap;
+  }
+}
+/* 44 px touch targets, after the phone block (its cell padding would win): table buttons fill their cells; tabs and
+   speed buttons reach over the track's dead 3-4 px padding without changing the look */
+@media (pointer: coarse) {
+  .hubs th,
+  .hubs td {
+    padding-block: 0;
+  }
+  .hubs button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .tab {
+    position: relative;
+  }
+  .tab::after,
+  .seg__btn::after {
+    content: '';
+    position: absolute;
+    inset: -4px 0;
+  }
+  /* the ::after reach is vertical only. 360 px: the replay row then wraps, as LIVE's "ข้อมูล ณ …" already does there */
+  .seg__btn {
+    min-width: 44px;
+  }
+}
+
+/* short viewports (browser zoom: 200 % of a 1366×768 laptop is 683×328, WCAG's 400 % reflow case 320×256; landscape
+   phones): the grid squeezed the side panel to its tabs and the timeline over the strip. One scrolling column instead,
+   in reading order (header, strip, side, details, caption, timeline); the table still covers it. */
+@media (max-height: 480px) {
+  .hud {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    scroll-padding-block: var(--gap); /* a focused control scrolls fully into view, focus ring included */
+  }
+  .hud > * {
+    flex: none;
+  }
+  .side,
+  .feed__list,
+  .syslog__list {
+    max-height: none;
+  }
+  /* align-self is horizontal in a column. The side panel keeps its column on the right (the brain stays visible on
+     the left), a phone's ข้อมูล sheet spans the width; details stay bottom-left */
+  .side {
+    align-self: end;
+    width: min(100%, 340px);
+  }
+  @media (max-width: 719px) {
+    .side {
+      align-self: stretch;
+      width: auto;
+    }
+  }
+  .hud__bl {
+    align-self: start;
+  }
+  /* the intro's hidden side panel kept its ~490 px and pushed the caption (ข้าม) below the fold: a touch user has no
+     Esc. Sticky keeps it on screen whatever the column holds (an open ข้อมูล sheet). The timeline goes too, and the
+     caption sits at the bottom: in the middle of the one free band they covered the brain (BrainScene frames above it) */
+  .stage[data-phase='intro']:not([data-hud='on']) :is(.side, .timeline) {
+    display: none;
+  }
+  .stage[data-phase='intro']:not([data-hud='on']) .caption {
+    margin-top: auto;
+  }
+  /* the sticky caption (≤ 76 px) + gap + focus ring: Tab through an open ข้อมูล sheet must not stop under it */
+  .stage[data-phase='intro'] .hud {
+    scroll-padding-bottom: 92px;
+  }
+  .caption {
+    position: sticky;
+    bottom: var(--gap);
+    align-self: center;
+  }
+  /* the table covers this first screen: what is under it leaves the tab order too (focus never hidden, WCAG 2.4.11) */
+  .stage[data-table='on'] .hud > :not(.table-panel) {
+    visibility: hidden;
+  }
+}
+/* Windows High Contrast: forced colours flatten every pressed state (tab, speed, ติดตาม / สด dot) to Canvas */
+@media (forced-colors: active) {
+  .tab[aria-pressed='true'],
+  .seg__thumb,
+  .btn[aria-pressed='true'] .btn__dot {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+  .tab[aria-pressed='true'],
+  .seg__btn[aria-pressed='true'] {
+    forced-color-adjust: none;
+    color: HighlightText;
+  }
+  .btn__dot {
+    forced-color-adjust: none;
+    box-shadow: inset 0 0 0 1.5px CanvasText;
+  }
+  .btn[aria-pressed='true'] {
+    border-color: Highlight;
+  }
+  .btn[aria-pressed='true'][data-paused='true'] .btn__dot {
+    background: linear-gradient(90deg, Highlight 50%, transparent 0);
+    box-shadow: inset 0 0 0 1.5px Highlight;
+  }
+  /* Chrome does not force SVG fill / stroke: the timeline kept the site theme's colours on the forced Canvas */
+  .tl__bar {
+    fill: GrayText;
+    fill-opacity: 1;
+  }
+  .tl__bar--played,
+  .tl__xlabel {
+    fill: CanvasText;
+  }
+  .tl__base,
+  .tl__tick {
+    stroke: CanvasText;
+  }
+  .tl__head {
+    stroke: Highlight;
+  }
+  .tl__handle,
+  .tl__live {
+    fill: Highlight;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+  /* they only leave by animating */
+  .pill[data-ring]::after,
+  .caption--live {
+    display: none;
+  }
+}

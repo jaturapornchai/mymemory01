@@ -1,0 +1,7 @@
+1001	Changwat Ranong	Changwat Ranong	จังหวัดระนอง,Ranong	10.0	100.0	A	ADM1	TH		01				0		0	Asia/Bangkok	2026-01-01
+1002	Amphoe Mueang Ranong	Amphoe Mueang Ranong	อำเภอเมืองระนอง	10.0	100.0	A	ADM2	TH		01	0101			0		0	Asia/Bangkok	2026-01-01
+1003	Ban Nai	Ban Nai		10.001	100.001	P	PPL	TH		01	0101			0		0	Asia/Bangkok	2026-01-01
+1004	Ban Nok	Ban Nok		10.03	100.03	P	PPL	TH		01	0101			0		0	Asia/Bangkok	2026-01-01
+2001	Changwat Surat Thani	Changwat Surat Thani	จังหวัดสุราษฎร์ธานี	11.0	100.0	A	ADM1	TH		02				0		0	Asia/Bangkok	2026-01-01
+2002	Amphoe Mueang Surat Thani	Amphoe Mueang Surat Thani	อำเภอเมืองสุราษฎร์ธานี	11.0	100.0	A	ADM2	TH		02	0201			0		0	Asia/Bangkok	2026-01-01
+2003	Ban Klang	Ban Klang		11.001	100.001	P	PPL	TH		02	0201			0		0	Asia/Bangkok	2026-01-01

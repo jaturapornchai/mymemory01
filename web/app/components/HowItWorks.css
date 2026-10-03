@@ -1,0 +1,600 @@
+/* "ระบบนี้ทำงานยังไง?" (components/HowItWorks.tsx): the stat strip's last row, then the panel — a drawer over the side
+   panel (tablet and up), a bottom sheet on phones, a right drawer on short screens — with the flow, the per-app rows,
+   the activity heatmap and the dream card. Design tokens from globals.css. */
+
+/* ───────── strip row ───────── */
+.howrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 7px 10px 8px;
+  border-top: 1px solid var(--border);
+}
+.howrow__btns {
+  display: flex;
+  flex-wrap: wrap; /* 360 px: the third button wraps instead of overflowing */
+  gap: 8px;
+}
+.btn--sm {
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.howrow__open[aria-expanded='true'] {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.appkey {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.appkey li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.appkey__dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--c);
+}
+/* the lens greys hubs and memories at their family's luminance (nodes.ts): ≈ this grey */
+.appkey__dot--none {
+  background: #858585;
+}
+
+/* ───────── panel ───────── */
+.how {
+  grid-area: side; /* over the side panel; wider than its column, it overflows to the left (toward the brain) */
+  justify-self: end;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  width: clamp(380px, 44vw, 640px);
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  /* a reading surface: opaque page colour (the brain or the HUD behind it showed through the small type) */
+  --surface: var(--bg);
+  --surface-solid: var(--bg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.stage[data-how='on'] .side {
+  visibility: hidden; /* covered: its buttons leave the tab order */
+}
+.how__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px 16px 16px;
+}
+.how__lead {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.how__sec {
+  margin-top: 20px;
+}
+.how__sec h2 {
+  margin: 0 0 8px;
+  font: 600 13px/1.4 var(--font);
+}
+.how__sechead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.how__sechead h2 {
+  margin: 0;
+}
+.how__note {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ── the 4 steps: numbered cards joined by a dashed line ── */
+.flow {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.flow li {
+  position: relative;
+}
+.flow li + li::before {
+  content: '';
+  position: absolute;
+  left: 27px;
+  top: -11px;
+  height: 12px;
+  border-left: 1px dashed var(--border-strong);
+}
+.flow__step {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  grid-template-areas: 'n name count' 'n text text';
+  gap: 2px 10px;
+  align-items: center;
+  width: 100%;
+  padding: 10px 12px;
+  text-align: left;
+  background: var(--fill);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 120ms, background-color 120ms;
+}
+.flow__step:hover {
+  border-color: var(--text-3);
+}
+.flow__step[aria-pressed='true'],
+.approw[aria-pressed='true'] {
+  border-color: var(--accent);
+}
+.flow__n {
+  grid-area: n;
+  align-self: start;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-solid);
+}
+.flow__name {
+  grid-area: name;
+  font: 600 15px/1.3 var(--font);
+}
+.flow__count {
+  grid-area: count;
+  font-weight: 500;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.flow__text {
+  grid-area: text;
+  font-size: 12px;
+  color: var(--text-2);
+}
+/* the เชื่อม step's layout lens + what it does, under its card (a button can't nest in the step's own) */
+.flow__more {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 8px 0 0;
+  padding-left: 12px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ── per-app rows: name + messages, a share bar, then what it left ── */
+.apps {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.approw {
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+  grid-template-areas: 'dot name num' '. bar bar' '. meta meta';
+  gap: 3px 8px;
+  align-items: center;
+  width: 100%;
+  padding: 7px 8px;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 120ms, background-color 120ms;
+}
+.approw:hover {
+  background: var(--fill);
+}
+.approw .appkey__dot {
+  grid-area: dot;
+}
+.approw__name {
+  grid-area: name;
+  font-weight: 500;
+}
+.approw__num {
+  grid-area: num;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.approw__bar {
+  grid-area: bar;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(var(--c), var(--c)) 0 0 / max(3px, calc(var(--w) * 100%)) 100% no-repeat, var(--fill);
+}
+.approw__meta {
+  grid-area: meta;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* ── activity heatmap: blue ramp (dataviz reference sequential, validated --ordinal on each theme's panel) ── */
+.heat {
+  --cell: 9px;
+  --hgap: 2px;
+  --heat-0: rgba(255, 255, 255, 0.07);
+  --heat-1: #184f95;
+  --heat-2: #256abf;
+  --heat-3: #3987e5;
+  --heat-4: #86b6ef;
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 6px;
+}
+html[data-theme='light'] .heat {
+  --heat-0: rgba(0, 0, 0, 0.07);
+  --heat-1: #86b6ef;
+  --heat-2: #5598e7;
+  --heat-3: #2a78d6;
+  --heat-4: #184f95;
+}
+.heat__days {
+  display: grid;
+  grid-template-rows: repeat(7, var(--cell));
+  row-gap: var(--hgap);
+  margin-top: 18px; /* the month row */
+  font-size: 10px;
+  line-height: var(--cell);
+  color: var(--text-3);
+}
+.heat__scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  padding: 0 2px 6px; /* room for the focus ring and the current-day outline */
+  scrollbar-width: thin;
+}
+.heat__months,
+.heat__grid {
+  display: grid;
+  grid-template-columns: repeat(var(--cols), var(--cell));
+  column-gap: var(--hgap);
+  width: max-content;
+}
+.heat__months {
+  height: 16px;
+  margin-bottom: 2px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.heat__grid {
+  grid-template-rows: repeat(7, var(--cell));
+  grid-auto-flow: column;
+  row-gap: var(--hgap);
+  border-radius: 3px;
+}
+.heat__grid > span,
+.heat__legend > span {
+  width: var(--cell);
+  height: var(--cell);
+  border-radius: 2px;
+  background: var(--heat-0);
+}
+.heat__grid > .heat__pad {
+  background: none;
+}
+.heat [data-l='1'] {
+  background: var(--heat-1);
+}
+.heat [data-l='2'] {
+  background: var(--heat-2);
+}
+.heat [data-l='3'] {
+  background: var(--heat-3);
+}
+.heat [data-l='4'] {
+  background: var(--heat-4);
+}
+.heat__grid:focus-visible > [data-cur] {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+/* the scroller would clip a ring on the grid itself: it goes on the scroller */
+.heat__grid:focus-visible {
+  outline: none;
+}
+.heat__scroll:has(.heat__grid:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.heat__tip {
+  position: absolute;
+  z-index: 2;
+  padding: 4px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  background: var(--surface-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+.heat__foot {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.heat__legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.heat__table {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.heat__table summary {
+  padding: 4px 0;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.heat__table table {
+  width: 100%;
+  margin-top: 4px;
+  border-collapse: collapse;
+}
+.heat__table th,
+.heat__table td {
+  padding: 4px 8px;
+  text-align: left;
+  font-weight: 400;
+  border-bottom: 1px solid var(--border);
+}
+.heat__table thead th {
+  font-weight: 600;
+  color: var(--text-2);
+}
+.heat__table .num {
+  text-align: right;
+}
+
+/* ── last dream ── */
+.dream__when {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.dream__tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.dream__tiles > div {
+  min-width: 0;
+  padding: 8px 10px;
+}
+.dream__tiles > div + div {
+  border-left: 1px solid var(--border);
+}
+.dream__tiles dt {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.dream__tiles dd {
+  margin: 2px 0 0;
+  font: 500 20px/1.2 var(--font);
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.dream__show {
+  margin-top: 10px;
+}
+.dream__show:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ───────── ตัวเลขสมอง: label left, value right; a tap (or hover title) explains the row ───────── */
+.nums {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px 20px;
+}
+.nums__group h3 {
+  margin: 0 0 2px;
+  font: 500 12px/1.4 var(--font);
+  color: var(--text-3);
+}
+.nums__group ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nums__group li {
+  border-bottom: 1px solid var(--border);
+}
+/* the database's parts: indented under it, the bar along the bottom = their share of the database */
+.nums__group li[data-part],
+.nums__group li[data-sub] {
+  padding-left: 12px;
+}
+.nums__group li[data-part] {
+  background: linear-gradient(var(--text-3), var(--text-3)) 12px 100% / max(2px, calc(var(--w) * (100% - 12px))) 2px no-repeat;
+}
+.nums__row summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 13px;
+  list-style: none;
+  cursor: pointer;
+}
+.nums__row summary::-webkit-details-marker {
+  display: none;
+}
+.nums__row summary span {
+  min-width: 0;
+  color: var(--text-2);
+  text-decoration: underline dotted var(--text-3);
+  text-underline-offset: 3px;
+}
+.nums__row summary b {
+  font-weight: 500;
+  text-align: right;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.nums__row p {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ───────── touch: 44 px targets (after .btn--sm, which would win over globals' coarse .btn) ───────── */
+@media (pointer: coarse) {
+  .btn--sm {
+    height: 44px;
+  }
+  .nums__row summary {
+    min-height: 44px;
+    align-items: center;
+  }
+}
+
+/* ───────── phones: a bottom sheet; the brain stays visible above it (BrainScene frames above its top) ───────── */
+@media (max-width: 719px) {
+  .how {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    width: auto;
+    max-height: 52vh;
+    padding-bottom: env(safe-area-inset-bottom);
+    border-width: 1px 0 0;
+    border-radius: 14px 14px 0 0;
+  }
+  .how .panel__head {
+    padding-top: 14px;
+  }
+  .how::before {
+    content: '';
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    width: 38px;
+    height: 4px;
+    margin-left: -19px;
+    border-radius: 2px;
+    background: var(--border-strong);
+  }
+  .how__body {
+    padding: 10px 12px 14px;
+  }
+  /* covered by the opaque sheet: out of the tab order (details come back when it closes, as under ข้อมูล) */
+  .stage[data-how='on'] :is(.timeline, .caption, .details) {
+    visibility: hidden;
+  }
+  .howrow {
+    padding: 6px 8px 7px;
+  }
+}
+/* 360 px phones: the three strip buttons need 339 px in one row, 326 were left (a wrapped row took ~45 px of the brain) */
+@media (max-width: 374px) {
+  .howrow {
+    padding-inline: 6px;
+  }
+  .howrow__btns {
+    gap: 6px;
+  }
+  .howrow__btns .btn--sm {
+    padding: 0 8px;
+  }
+}
+
+/* ───────── short screens (landscape phones, zoom): a right drawer over the scrolling HUD column ───────── */
+@media (max-height: 480px) {
+  .how {
+    position: fixed;
+    top: var(--gap);
+    right: var(--gap);
+    bottom: var(--gap);
+    left: auto;
+    z-index: 6;
+    width: min(420px, 60vw);
+    max-height: none;
+    padding-bottom: 0;
+    border-width: 1px;
+    border-radius: 14px;
+  }
+  .how::before {
+    display: none;
+  }
+  .how .panel__head {
+    padding-top: 8px;
+  }
+  /* the drawer covers the header's right end and half the timeline (its handle and date too): both leave the tab order
+     (no focus hidden under it). visibility keeps the timeline's box, so BrainScene's framing does not move */
+  .stage[data-how='on'] :is(.hud-header__tools, .timeline) {
+    visibility: hidden;
+  }
+}
+
+/* sheet / drawer open: the panel's app rows carry the same colour key; on a phone the strip's copy took ~67 px of the
+   band left for the brain, in a landscape drawer it hid under the drawer */
+@media (max-width: 719px), (max-height: 480px) {
+  .stage[data-how='on'] .appkey {
+    display: none;
+  }
+}
+
+/* Windows High Contrast: pressed items and the heat levels keep their meaning */
+@media (forced-colors: active) {
+  .flow__step[aria-pressed='true'],
+  .approw[aria-pressed='true'],
+  .howrow__open[aria-expanded='true'] {
+    border-color: Highlight;
+  }
+  .heat__grid > span,
+  .heat__legend > span,
+  .appkey__dot,
+  .approw__bar {
+    forced-color-adjust: none;
+  }
+  /* the cells keep the site colours: the current-day ring needs a system colour, or it vanishes when the themes differ */
+  .heat__grid:focus-visible > [data-cur] {
+    outline-color: Highlight;
+  }
+}

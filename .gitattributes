@@ -1,0 +1,2 @@
+# Shell scripts run inside the Linux Postgres container: CRLF from a Windows checkout breaks first-run init
+*.sh text eol=lf

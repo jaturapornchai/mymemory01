@@ -83,7 +83,7 @@ const KEEP = [
   'cd "C:/Users/alice/.claude/projects/D--proj/e3a1c7d2-8b4f-4e19-a6d0-5f2c9b8e1a73/subagents"',
   'hired on upwork = good rates',
   'You are the third pass: read the file again',
-  'xrdp 192.0.2.10 terminal (GTK4) เปิดไม่ขึ้น',
+  'vnc 192.0.2.10 window เปิดไม่ขึ้น',
   'ssh 192.0.2.10 root access only via tunnel',
 ];
 

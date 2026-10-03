@@ -139,35 +139,35 @@ const base = { turn_uuid: 'u', header: 'h', score: 1, uses: 0, last: null, statu
 const d = (s: string) => new Date(s);
 const HITS: any[] = [
   { ...base, id: 'aaaaaaaaaaaaaaa1', ts: d('2026-09-20T10:00:00Z'), fid: 'F0000000a', kind: 'rule', fact_project: 'd:/demo', project: 'obsidian/memory-hub',
-    text: 'D: # F0000000a กฎ port\nกฎ: goldenport ของ memhub คือ 5441 เท่านั้น ห้ามใช้ 5434\n- from:: [[x]]', uses: 3, last: d('2026-09-29T00:00:00Z'),
-    evidence: [{ ...base, id: 'bbbbbbbbbbbbbbb2', ts: d('2026-09-19T08:00:00Z'), text: `U: ตั้ง goldenport เป็นอะไรดี ${'รายละเอียด detail '.repeat(30)}\nA: ใช้ 5441`, changed_to: ['F0000000c'] },
+    text: 'D: # F0000000a กฎ port\nกฎ: goldenport ของ memhub คือ 7100 เท่านั้น ห้ามใช้ 7200\n- from:: [[x]]', uses: 3, last: d('2026-09-29T00:00:00Z'),
+    evidence: [{ ...base, id: 'bbbbbbbbbbbbbbb2', ts: d('2026-09-19T08:00:00Z'), text: `U: ตั้ง goldenport เป็นอะไรดี ${'รายละเอียด detail '.repeat(30)}\nA: ใช้ 7100`, changed_to: ['F0000000c'] },
       { ...base, id: 'bbbbbbbbbbbbbbb3', ts: d('2026-09-18T08:00:00Z'), text: 'U: goldenport again' }] },
   { ...base, id: 'ccccccccccccccc4', ts: d('2026-09-01T00:00:00Z'), tool: 'codex', src_kind: 'subagent', session_id: 's2', text: `A: ${'goldenport codex long answer '.repeat(30)}` },
   { ...base, id: 'ddddddddddddddd5', ts: d('2025-01-01T00:00:00Z'), fid: 'F0000000b', kind: 'decision', status: 'superseded', superseded_by: 'F0000000c',
     project: 'obsidian/memory-hub', fact_project: 'd:/demo', text: 'D: # F0000000b old\ngoldenport = 7001' },
   { ...base, id: 'eeeeeeeeeeeeeee6', ts: d('2026-09-30T20:00:00Z'), fid: 'S0000000d', kind: 'card', project: 'obsidian/memory-hub', fact_project: 'd:/demo', text: 'D: # session card\nทำ goldenport' },
   { ...base, id: 'fffffffffffffff7', ts: d('2026-08-01T00:00:00Z'), tool: 'github', src_kind: 'doc', project: 'github/o/r', session_id: 'github:o/r#12', text: 'issue: goldenport broken', changed_to: ['F0000000c'] },
-  { ...base, id: '0000000000000008', ts: d('2026-09-25T00:00:00Z'), fid: 'F0000000e', kind: 'fact', status: 'pending', review_target: 'F0000000a', project: 'obsidian/memory-hub', fact_project: null, text: 'D: # F0000000e p\npending goldenport 5442' },
+  { ...base, id: '0000000000000008', ts: d('2026-09-25T00:00:00Z'), fid: 'F0000000e', kind: 'fact', status: 'pending', review_target: 'F0000000a', project: 'obsidian/memory-hub', fact_project: null, text: 'D: # F0000000e p\npending goldenport 7300' },
 ];
 
 test('full mode is byte-for-byte what it was before brief mode (golden hash of searchText on the fixture)', () => {
   mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T00:00:00Z') }); // hitLine prints ages
   try {
-    const outs = [searchText(HITS, 'goldenport 5441', true), searchText(HITS.slice(0, 2), 'goldenport', false), searchText([], 'x', true)];
-    assert.equal(createHash('sha256').update(outs.join('\0')).digest('hex'), '3ffa94db585ac078232bbf297bfcf2b77ffe73814267df7f5add35d7a01fa3a7', outs[0]);
+    const outs = [searchText(HITS, 'goldenport 7100', true), searchText(HITS.slice(0, 2), 'goldenport', false), searchText([], 'x', true)];
+    assert.equal(createHash('sha256').update(outs.join('\0')).digest('hex'), '7d4a34379f6c3d0b3ebc368c1522727f10db973c826f124a915824cafff8b34f', outs[0]);
   } finally { mock.timers.reset(); }
 });
 
 test('brief: one line per hit ≤ BRIEF_LINE, same ids/order as full, warnings + ↳ id + ≈tokens kept', async () => {
   const cost = new Map(HITS.map((h, i) => [h.id, 100 * (i + 1)]));
   const many = { ...HITS[4], id: '1111111111111119', changed_to: Array.from({ length: 12 }, (_, i) => `F00000${String(i).padStart(3, '0')}`) };
-  const out = briefText([...HITS, many], 'goldenport 5441', true, cost);
+  const out = briefText([...HITS, many], 'goldenport 7100', true, cost);
   const lines = out.split('\n');
   assert.match(lines[0], /^brief: ≈t = est\. tokens of memory_get\(id\)/);
   assert.equal(lines.length, HITS.length + 2);
   for (const l of lines) assert.ok(l.length <= BRIEF_LINE, `${l.length}: ${l}`);
   const ids = (s: string) => [...s.matchAll(/^\[(\w+)\]/gm)].map((m) => m[1]);
-  assert.deepEqual(ids(out).slice(0, HITS.length), ids(searchText(HITS, 'goldenport 5441', true)));
+  assert.deepEqual(ids(out).slice(0, HITS.length), ids(searchText(HITS, 'goldenport 7100', true)));
   assert.match(lines[1], /^\[F0000000a\] 2026-09-20 demo rule ≈100t ↳\[bbbbbbbbbbbbbbb2\]\+1: กฎ: goldenport/);
   assert.match(lines[2], /^\[ccccccccccccccc4\] 2026-09-01 demo codex subagent ≈200t: /);
   assert.match(lines[3], /OLD -> \[F0000000c\] ≈300t/);

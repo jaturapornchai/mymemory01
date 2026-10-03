@@ -1,7 +1,7 @@
 // node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search <query>|stats [--latency]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
 import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
 const [cmd, ...args] = process.argv.slice(2);
@@ -179,7 +179,7 @@ try {
     const b = await buildBrain(db, args.includes('--public') ? 'public' : 'local');
     const out = args[args.indexOf('--out') + 1];
     const json = JSON.stringify(b);
-    if (args.includes('--out') && out) writeFileSync(out, json);
+    if (args.includes('--out') && out) { mkdirSync(dirname(out), { recursive: true }); writeFileSync(out, json); }
     console.log(`${b.mode}: ${b.nodes.length} nodes, ${b.links.length} links, ${b.events.length} events, ${(json.length / 1024).toFixed(0)} KB, ${Date.now() - t0} ms`);
   } else if (cmd === 'brain-serve') {
     // Local viewer with real labels: web/out + /graph.json + /feed.json on 127.0.0.1 only (never exposed).

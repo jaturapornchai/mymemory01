@@ -16,3 +16,6 @@ deploy/
 .playwright-mcp/
 shots/
 web/public/graph.json
+
+# Claude Code per-user permissions
+.claude/settings.local.json

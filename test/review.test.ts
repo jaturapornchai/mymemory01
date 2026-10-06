@@ -156,3 +156,17 @@ test('hygiene lint: a fact distilled from a chat later hidden (Google seen) must
   const r = await lintReport(db, new Date('2026-10-04T00:00:00Z'));
   assert.ok(!r.expired.some((x) => String(x.path).includes('ZZHIDDENFACT')), 'lint lists a fact whose only source chat is hide_as=google');
 });
+
+test('a fact is dated by the chat it came from (since/until, age, recency), not by its file; memory_save by when he said it', async () => {
+  await chat('dt-s1', 'd:/demo', [[bkk('2026-08-02', '10:00'), 'ZZDATED เริ่มคุย'], [bkk('2026-08-03', '09:00'), 'ZZDATED ตกลงใช้ท่าแรก']]);
+  dreamNote('facts/demo/F0000d01 dated.md', 'F0000d01', 'decision', ['dt-s1-u1', 'dt-s1-u0'], 'ZZDATED ตัดสินใจใช้ท่าแรก');
+  writeNote('facts/demo/F0000d02 saved.md', { memhub: 'fact', id: 'F0000d02', kind: 'fact', scope: 'project', project: 'd:/demo', status: 'active',
+    source_uuids: ['obs:self'], md5: md5('ZZDATED จำไว้'), valid_at: '2026-08-05T00:00:00.000Z', created_at: '2026-08-05T03:00:00.000Z' }, 'ZZDATED จำไว้\n');
+  commitBatch(MEMORY_VAULT, 'dream r1: dated');
+  await indexVault(db, MEMORY_VAULT);
+  const ts = async (fid: string) => (await db.query(`SELECT c.ts FROM facts f JOIN chunks c ON c.source_id = f.source_id WHERE f.fid = $1`, [fid])).rows[0].ts.toISOString();
+  assert.equal(await ts('F0000d01'), bkk('2026-08-02', '10:00'), 'its earliest cited turn, not the file written today');
+  assert.equal(await ts('F0000d02'), '2026-08-05T03:00:00.000Z', 'memory_save cites its own note: created_at');
+  const { hits } = await search(db, 'ZZDATED', { semantic: false, limit: 8, since: '2026-08-01', until: '2026-08-31' });
+  assert.ok(hits.some((h) => h.fid === 'F0000d01') && hits.some((h) => h.fid === 'F0000d02'), 'an August range finds both facts written in October');
+});

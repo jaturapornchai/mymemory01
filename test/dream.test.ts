@@ -18,7 +18,8 @@ process.env.MEMHUB_NO_REINDEX = '1';
 process.env.MEMORY_HUB_INTERNAL = '1';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
-const { dream, filesRunner, rebuildCoaccess, buildDigests, packBatches, DREAM_LIMIT } = await import('../src/dream.ts');
+const { dream, filesRunner, buildDigests, packBatches, DREAM_LIMIT } = await import('../src/dream.ts');
+const { rebuildSynapses } = await import('../src/synapse.ts');
 const { parseNote, saveNote, fileName, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { search, hitLine } = await import('../src/search.ts');
@@ -298,7 +299,7 @@ test('co-access: sources opened together in one session get a Hebbian edge; sear
     db.query(`INSERT INTO access_log (kind, chunk_id, turn_uuid, session, ts) VALUES ($1, $2, $3, $4, now())`, [kind, c.id, c.turn_uuid, session]);
   await ins('get', ch[0], 'm1'); await ins('related', ch[1], 'm1');
   await ins('search', ch[0], 'm2'); await ins('search', ch[2], 'm2');
-  await rebuildCoaccess(db);
+  await rebuildSynapses(db, { plastic: true });
   const e = (await db.query(`SELECT a, b, w FROM edges WHERE kind = 'coaccess'`)).rows;
   assert.equal(e.length, 1);
   assert.deepEqual([String(e[0].a), String(e[0].b)].sort(), [String(ch[0].source_id), String(ch[1].source_id)].sort());

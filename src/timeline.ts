@@ -22,12 +22,15 @@ const GET_MAX = 6000; // memory_get's default max_chars
 export async function getTokens(db: pg.Pool, ids: string[]): Promise<Map<string, number>> {
   if (!ids.length) return new Map();
   const rows = (await db.query(
-    `SELECT c.id, left(c.ctx_header || ' | session ' || c.session_id || ' | ' || coalesce(c.project, '') || '\n\n' ||
+    `SELECT c.id, left(c.ctx_header || ' | session ' || c.session_id || ' | ' || coalesce(c.project, '') ||
+       CASE WHEN f.fid IS NULL THEN ' | src claude:abcdefgh#12' ELSE ' | src claude:abcdefgh#12 2026-01-01 ×2' END || '\n\n' ||
        coalesce(f.fid || ' ' || f.kind || ' active · valid: 2026-01-01 → present\n\n', '') ||
-       coalesce((SELECT string_agg('U: ' || t.text_redacted, '\n\n' ORDER BY t.seq) FROM turns t
+       coalesce((SELECT string_agg('U: ' || t.text_redacted || CASE WHEN t.uuid LIKE 'github:%' THEN '\nhttps://github.com/' || repeat('x', 50) ELSE '' END,
+                   '\n\n' ORDER BY t.seq) FROM turns t
                  WHERE t.source_id = c.source_id AND t.seq BETWEEN c.seq_from - 1 AND c.seq_to + 1), c.text) ||
-       coalesce('\n\nfrom:\n' || (SELECT string_agg('A 2026-01-01: ' || left(p.text_redacted, 300), '\n')
-                 FROM (SELECT text_redacted FROM turns p WHERE p.uuid = ANY(f.source_uuids) ORDER BY p.ts LIMIT 3) p), ''), $2) txt
+       coalesce('\n\nfrom (3 turns, 1 session):\n' || (SELECT string_agg('A 2026-01-01 claude:abcdefgh#12: ' || left(p.text_redacted, 240), '\n')
+                 FROM (SELECT text_redacted FROM turns p WHERE p.uuid = ANY(f.source_uuids) AND p.uuid NOT LIKE 'obs:%'
+                       ORDER BY p.role = 'user' DESC, p.ts LIMIT 6) p), ''), $2) txt
      FROM chunks c LEFT JOIN facts f ON f.source_id = c.source_id WHERE c.id = ANY($1)`, [ids, GET_MAX + 1])).rows;
   return new Map(rows.map((r) => [r.id, tokens(r.txt.slice(0, GET_MAX)) + (r.txt.length > GET_MAX ? 15 : 0)])); // + the "[cut at …]" tail
 }
@@ -47,8 +50,8 @@ type Line = { t: string; p: number; ids: string[]; near?: boolean }; // p: drop 
  * that session (under the round they came from), and the same project in other sessions/apps near then. A fact/card id
  * centres on the chat it was distilled from. ≤ TIMELINE_MAX chars, every line with ≈tokens of memory_get. null = unknown id.
  */
-export async function timeline(db: pg.Pool, id: string, o: { before?: number; after?: number; until?: Date; hide?: string[] } = {}) {
-  const { before = 3, after = 3, until = null, hide = [] } = o; // hide: guard.PRIVATE_TOOLS for callers that must not see them
+export async function timeline(db: pg.Pool, id: string, o: { before?: number; after?: number; until?: Date; hide?: string[]; own?: { since: Date; tool: string; project: string } } = {}) {
+  const { before = 3, after = 3, until = null, hide = [], own } = o; // own: search.ts SearchOpts.own — hide the caller's own live session // hide: guard.PRIVATE_TOOLS for callers that must not see them
   const q = async (sql: string, p: unknown[]) => (await db.query(sql, p)).rows;
   const [hit] = await q(
     `SELECT c.id, c.turn_uuid, c.source_id, c.seq_from, c.ts, c.project, c.session_id, s.tool, s.kind, f.fid, f.source_uuids, f.project fproject
@@ -72,7 +75,7 @@ export async function timeline(db: pg.Pool, id: string, o: { before?: number; af
        CROSS JOIN LATERAL (SELECT c.id, c.ctx_header FROM chunks c WHERE c.source_id = $1 AND c.seq_from >= r.seq AND (r.nxt IS NULL OR c.seq_from < r.nxt)
                            ORDER BY c.seq_from, c.seq_to, c.id LIMIT 1) k
        WHERE r.i BETWEEN a.i - $3 AND a.i + $4 AND ($5::timestamptz IS NULL OR r.ts IS NULL OR r.ts < $5) ORDER BY r.seq`,
-    [a.source_id, a.seq_from, before, after, until]),
+    [a.source_id, a.seq_from, before, after, own && a.tool === own.tool && a.project === own.project ? own.since : until]),
     q(`SELECT f.fid, f.kind, coalesce(s.status, 'active') status, f.superseded_by, k.id, k.ctx_header,
               (SELECT min(t.seq) FROM turns t WHERE t.uuid = ANY(f.source_uuids) AND t.source_id = $2) seq
        FROM facts f JOIN sources s ON s.id = f.source_id
@@ -84,8 +87,9 @@ export async function timeline(db: pg.Pool, id: string, o: { before?: number; af
          SELECT DISTINCT ON (c.session_id) c.id, c.ts, c.ctx_header, s.tool, s.kind, abs(extract(epoch FROM c.ts - $2)) dist
          FROM chunks c JOIN sources s ON s.id = c.source_id
          WHERE c.project = $1 AND c.session_id <> $3 AND s.tool <> 'obsidian' AND coalesce(s.hide_as, s.tool) <> ALL($6::text[]) AND ($4::timestamptz IS NULL OR c.ts < $4)
+           AND ($7::timestamptz IS NULL OR c.ts < $7 OR s.tool IS DISTINCT FROM $8 OR c.project IS DISTINCT FROM $9)
            AND c.ts BETWEEN $2::timestamptz - make_interval(days => $5) AND $2::timestamptz + make_interval(days => $5)
-         ORDER BY c.session_id, dist, c.id) z ORDER BY dist, id LIMIT 4`, [project, a.ts, a.session_id, until, NEAR_DAYS, hide]) : [],
+         ORDER BY c.session_id, dist, c.id) z ORDER BY dist, id LIMIT 4`, [project, a.ts, a.session_id, until, NEAR_DAYS, hide, own?.since ?? null, own?.tool ?? null, own?.project ?? null]) : [],
   ]);
   const cards = facts.filter((f) => f.kind === 'card');
   const inRound = (f: { seq: number | null }) => rounds.find((r) => f.seq !== null && r.seq <= f.seq && (r.nxt === null || f.seq < r.nxt));

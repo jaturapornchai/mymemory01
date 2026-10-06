@@ -149,7 +149,7 @@ EXISTS (SELECT 1 FROM facts f JOIN sources s ON s.id = f.source_id
 Command: `node src/cli.ts dream [--weekly]`, run by Windows Task Scheduler at 03:30 daily (pass C runs on Sunday). Code goes in `src/dream.ts`.
 
 **Steps:**
-1. **Lock.** `pg_try_advisory_lock(hashtext('memhub-dream'))` on the rw pool. Exit if another run holds it.
+1. **Lock.** `pg_try_advisory_lock(hashtext(current_schema() || ':memhub-dream'))` on the rw pool (per schema, so test schemas never block the live one). Exit if another run holds it.
 2. **Select sessions.**
    - Sources must have `tool='claude'` and `kind='main'`, so subagents and Obsidian notes are excluded.
    - A session counts as finished when its last turn is older than now − 1h (the Stop hook debounces for 10 min).
@@ -417,3 +417,70 @@ tags: [memhub/decision, project/proj-a]
 - **`memory_save` / `memory_forget` MCP tools** from the README. The MCP process can't know the current turn uuids, so a save would have no provenance. Forgetting is deleting the file or setting `rejected`, and pinning is `pinned: true` in Obsidian.
 
 **Caveat:** every number from the papers above (Mem0 LOCOMO, Zep DMR/LongMemEval, sleep-time 5×/2.5×, TREC MAP, HeLa-Mem/SYNAPSE F1) is paper-reported on other data and models. Only the local latency measurements come from this database (12,628 chunks).
+
+## 4b. Synapses, plasticity, associative channel (built 2026-10-04)
+
+**Objective.** One synapse table that memory_related, the '⇢ linked' channel and the brain view all read; usage that strengthens it
+(three-factor Hebbian) and a nightly downscaling that keeps it bounded; memory_search, memory_timeline and memory_related see
+what other apps did since this server started. Nothing here changes the top-k ranking.
+
+**Synapse kinds** (`edges`, a < b, no DDL; `src/synapse.ts` `rebuildSynapses`, each kind DELETE + INSERT, one transaction per part):
+
+| kind | rule | w | τ in spreading | rebuilt |
+|---|---|---|---|---|
+| `prov` | fact/card source ↔ the sources of its `source_uuids` turns (no `obs:` uuids, no rejected fact) | 1 | 0.8 | hourly (sync) + nightly |
+| `spawn` | subagent/headless source ↔ the main source with the same tool + session_id | 1 | 0.5 | hourly + nightly |
+| `next` | consecutive main sessions of one project (chunks.project ≠ ''), any app, ordered by first chunk ts, gap ≤ 24 h | 1 | 0.3 | hourly + nightly |
+| `coaccess` | see below | ≤ 1 | w (only w ≥ 0.15) | nightly (`dream --consolidate` = sleep) |
+| links (table `links`) | resolved wikilinks, src ≠ dst, both directions as one | — | 1.0 | obsidian.ts |
+
+No endpoint is ever a Claude-only source (`coalesce(hide_as, tool) ∈ PRIVATE_TOOLS`): filtered when built and again per caller.
+
+**Co-access** (pure function of access_log keyed by turn_uuid, so idempotent): a search call = (session, ts); two sources co-shown at
+rank ≤ 5 of one call are eligible; a get / related / timeline of either one in that session within 30 min is the reward →
+0.05·0.995^age_days (Hige 2015 dopamine-gated KC→MBON; Frémaux & Gerstner 2016 three-factor rule). The old co-open rule stays: both
+opened within 30 min → 0.1·0.995^age_days. Once per (session, pair, rule); w = min(1, Σ). Sleep downscaling (SHY, Tononi & Cirelli
+2014): w ← w·min(1, 1/Σw(a), 1/Σw(b)), so Σ co-access per node ≤ 1; prune w < 0.01.
+
+**associate()** (bounded spreading activation, the '⇢ linked' channel): graph in process memory (links + prov/spawn/next + coaccess
+w ≥ 0.15), per pool, reloaded stale-while-revalidate every 15 min. Scaffolding (daily notes; memory-vault `hubs/` notes) is left out,
+so it never relays or comes out. Per caller: hidden and rejected nodes are dropped before propagation; superseded ×0.5.
+Seeds = sources of the top 3 rendered hits, a_s = score/score₁. Hop 1: act(m) += a_s·τw/Σ_out τw(s) (input-fraction normalisation).
+Hop 2 only through relays m ∉ seeds with visible degree ≤ 24 (p99): act(x) += 0.5·act(m)·τw/Σ_out τw(m). Rendered sources never come
+out; top 2 with act ≥ θ = 0.15 (`MEMHUB_ASSOC_THETA`), each as its chunk nearest to the via hit's chunk, under the same project /
+since / until / before / own filters as search. Line: `⇢ linked [id] date proj what · via [hit id] kind: passage`, ≤ 220 chars.
+`shuffled(graph, seed)` = degree-preserving endpoint swaps within each kind (mulberry32), the eval's control graph.
+
+**memory_search** (`src/mcp.ts`):
+- Freshness: known apps (TOOL_OF: claude-code/claude-ai → claude, codex-mcp-client → codex, gemini-cli-mcp-client → gemini,
+  antigravity-client, zcode, lmstudio) pass `own: { since: server start, tool, project }` and no `before`; any other client keeps
+  `before: server start`.
+- Habituation (collapse hits already shown this session) was built and removed the same day: one MCP process is not one
+  conversation (Claude Code subagents, /clear and Codex /new share it), so a reader got "seen earlier" for text it never saw;
+  on the N3 replay it saved only 2 % chars. Dedupe per conversation needs a session id from the client (hook payload), not the process.
+- `MEMHUB_ASSOC=1` appends ≤ 2 linked lines (off by default). `assocText(rows, query)` is exported for scripts/eval.ts.
+
+**memory_related**: links, backlinks and used-together ordered by fan-normalised weight (w / max(1, degree in links + edges)),
+8 lines + `+N more` each; new `linked ⇢` section = associate(this source, a = 1, limit 5, θ 0.05) minus everything listed above.
+
+**Measured** (live DB, read-only, 2026-10-04; rebuild timings on a scratch copy of the live id/time columns):
+
+| what | number |
+|---|---|
+| dry-run rows (prov / spawn / next / coaccess) | 797 / 4,883 / 139 (62 cross-app) / 123 — spawn = 4,199 subagents, +684 because one Claude session_id has 2 main sources |
+| coaccess with w ≥ 0.15 (usable for spreading) | 0 (max 0.150) |
+| hidden endpoints in what would be written | 0 |
+| rebuild at live scale, structural / plastic | 80–93 ms / 14–16 ms |
+| graph after rebuild: nodes / edges / load | 5,244 / 7,114 / 12–13 ms (live today without the new kinds: 831 / 1,295 / 20 ms cold) |
+| associate() on 200 real queries, structural graph | p50 1.8 ms, p95 3.8 ms, max 10.5 ms; 110/200 calls get ≥ 1 line |
+| same, today's live graph (links only) | p50 0.8 ms, p95 1.9 ms; 55/200 calls get a line |
+| added chars when lines show | p95 443 (2 lines) |
+| memory_related linked section (limit 5, θ 0.05) | p50 1.2 ms, p95 3.8 ms; 102/200 seeds get ≥ 1 |
+
+**Gates** (design eval spec): linked lines stay off until the N1 holdout shows ≥ +10 net vs hybrid limit 8 (McNemar p < 0.05) and
+≥ +10 vs the shuffled graph; coaccess joins spreading only once ≥ 50 edges reach w ≥ 0.15 (0 today). Result: real graph beat the shuffled
+graph on tune (+12, p < 0.001) but on the N1 holdout only +3 vs limit 8 and +5 vs shuffled, so linked lines stay off. The first live `rebuildSynapses` writes ~5.8k derived rows (R1;
+reversible: `DELETE FROM edges WHERE kind IN ('prov','spawn','next')`).
+
+**Limitations.** `next` ignores sessions without a project. 2-hop paths never hit gold (0/33) and the linked chunk is chosen
+nearest the seed, not the query (right source, wrong chunk 11×).

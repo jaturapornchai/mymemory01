@@ -130,7 +130,7 @@ test('a save that throws still closes its batch: the next save snapshots his edi
   assert.equal(subjects()[0], `memory_save (unknown): ${rel}`);
   const blocker = `${join(MEMORY_VAULT, rel)}.tmp-${process.pid}`;
   mkdirSync(blocker); // its atomic write now throws (a locked note → EPERM in real life)
-  try { assert.throws(() => saveNote('ข้อเท็จจริง A', { now: new Date('2026-10-03T00:00:00Z') }), /EISDIR|EPERM/); }
+  try { assert.throws(() => saveNote('ข้อเท็จจริง A', { kind: 'rule' }), /EISDIR|EPERM/); } // a change (same text keeps its dates)
   finally { rmSync(blocker, { recursive: true }); }
   writeFileSync(join(MEMORY_VAULT, 'old note.md'), 'plan v3\n');
   const rel2 = saveNote('ข้อเท็จจริง B', { now: NOW });

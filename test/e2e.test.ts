@@ -37,9 +37,9 @@ function runNode(script: string, args: string[], input: string, env = ENV): Prom
     p.stdin.end(input);
   });
 }
-async function mcp(env = ENV, name = 'e2e') {
+async function mcp(env = ENV, name = 'e2e', cwd = tmp) {
   const client = new Client({ name, version: '0' });
-  await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(SRC, 'mcp.ts')], env, cwd: tmp, stderr: 'ignore' }));
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(SRC, 'mcp.ts')], env, cwd, stderr: 'ignore' }));
   const call = async (name: string, args: Record<string, unknown>) =>
     ((await client.callTool({ name, arguments: args })) as { content: { text: string }[] }).content[0].text;
   return { call, close: () => client.close() };
@@ -172,6 +172,37 @@ test('MEMHUB_ANTHROPIC_ONLY=1: a non-Anthropic backend gets nothing', async () =
   for (const [name, off] of [['codex-mcp-client', true], ['claude-code', false]] as const) {
     const c = await mcp(only, name);
     try { assert.equal(/memory-hub is off/.test(await c.call('memory_search', { query: '7731' })), off, name); } finally { await c.close(); }
+  }
+});
+
+test('freshness: what other apps did since server start is found at once (search, timeline, similar); the caller\'s own live session is not', async () => {
+  const { indexToolFile } = await import('../src/importer.ts');
+  // cwd ROOT = a project; cwd tmp (AppData temp) = currentProject '', but the importer still stores normProject(tmp) for its chats
+  for (const [cwd, word] of [[ROOT, 'freshzebra'], [tmp, 'freshokapi']] as const) {
+    const m = await mcp(ENV, 'codex-mcp-client', cwd);
+    try {
+      const at = new Date(Date.now() + 1000).toISOString();
+      const add = async (tool: string, sid: string, dir: string, tag: string) => {
+        const path = join(tmp, `${sid}.json`);
+        writeFileSync(path, tag);
+        const msgs = [{ uuid: `${sid}-1`, parentUuid: null, sessionId: sid, ts: at, cwd: dir, role: 'user' as const, text: `${word} ${tag}` }];
+        assert.equal(await indexToolFile(db, { tool, sync: () => ({}), isTranscript: () => true, parse: async () => ({ sessionId: sid, cwd: dir, kind: 'main', msgs }) }, path), 'indexed');
+        await db.query(`UPDATE chunks SET embedding = array_fill(0.1::real, ARRAY[1024])::vector::halfvec WHERE session_id = $1`, [sid]); // all alike → similar
+        return (await db.query(`SELECT id FROM chunks WHERE session_id = $1`, [sid])).rows[0].id as string;
+      };
+      const other = await add('claude', `${word}-other`, cwd, 'otherapp');          // another app, same project → found
+      const own = await add('codex', `${word}-own`, cwd, 'ownsession');             // this app, this project, after start → its own live session
+      const elsewhere = await add('codex', `${word}-else`, 'D:\\elsewhere', 'ownelsewhere'); // this app, another project → found
+      const out = await m.call('memory_search', { query: word, limit: 8 });
+      assert.ok(out.includes(`${word} otherapp`), cwd);
+      assert.ok(out.includes(`${word} ownelsewhere`), cwd);
+      assert.ok(!out.includes(`${word} ownsession`), `${cwd}: ${out}`); // the other cwd's own session is not ours
+      const tl = await m.call('memory_timeline', { id: other });
+      assert.match(tl, new RegExp(`^▶ \\[${other}\\] `, 'm'), cwd); // was cut at server start
+      assert.ok(!tl.includes(`[${own}]`), `${cwd}: ${tl}`); // 'other sessions near then' leaves out the caller's own live one
+      const related = await m.call('memory_related', { id: elsewhere, limit: 8 });
+      assert.ok(related.includes(`[${other}]`) && !related.includes(`[${own}]`), `${cwd}: ${related}`);
+    } finally { await m.close(); }
   }
 });
 

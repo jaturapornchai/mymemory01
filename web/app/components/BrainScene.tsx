@@ -13,12 +13,14 @@
  *                 - Replay grows the brain: nodes are appended in `t0` order; scrubbing backwards removes them.
  *                   The array is re-sliced whenever the visible count changes → diff by id, don't rebuild the world.
  *                 - Every link's endpoints are in `nodes`. Link kinds: in | spawn (structural), link (wikilink),
- *                   similar (semantic), coaccess (Hebbian, `w` = strength).
+ *                   similar (semantic), coaccess (Hebbian, `w` = strength), prov (fact/card ↔ the session it came
+ *                   from), next (the next session in a project).
  *  activeEvents   Events that fired since the previous batch (replay: the playhead passed them; LIVE: arrived via
  *                 feed). A NEW array identity is a NEW batch — process each distinct array exactly once; an unchanged
  *                 reference means nothing new. ≤ 64 per batch, busiest-first is NOT guaranteed, ids may be absent
  *                 from `graph` (ignore those). Semantics of one event [t, nodeId, kind, n]: "this node just fired
  *                 n times" → pulse the node, send signals along its links, optionally fly to the busiest one.
+ *                 A search/recall also lights its link/prov/next/coaccess neighbours at 0.4×, 150 ms later.
  *  follow         true → the scene may fly to an active node (≤ once / 4 s) and idle-orbit. Any user drag/zoom pauses
  *                 both for 20 s (scene-internal; announced through onAutoFollowPause).
  *  reducedMotion  true → no orbit, no particles/pulse motion, camera moves instantly.

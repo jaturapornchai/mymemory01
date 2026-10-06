@@ -9,7 +9,7 @@ import { createFx, type Fx } from './fx';
 import { ALIVE, NEVER, Nodes, type Uniforms } from './nodes';
 import { pick } from './pick';
 import { Governor, type GovAction } from './quality';
-import { addAdjacency, placeFallback, SlotTable, type Slot } from './slots';
+import { addAdjacency, echoOf, placeFallback, SlotTable, type Slot } from './slots';
 import { BASE_LINEAR, THEME, TIERS, TYPE_INDEX, TYPES, appLinear, fireAmp, hexToLinear, linkStyle, nodeRadius, rimLevel, type Theme, type Tier, type Vec3 } from './style';
 
 export type { View };
@@ -73,6 +73,10 @@ const PROBE_RAFS = 12; // governor cap probe: bare rAF intervals measured with r
 // uTime is a float32 uniform: past ~1 day its step exceeds 8 ms and every shader animation starts to stutter
 // (62 ms steps after a week). A remount restarts the clock; the view and tier carry over.
 const CLOCK_REBASE_S = 86400;
+// a search/recall also lights the node's 1-hop synapse neighbours, dimmer and a beat later (viewer-only: no data)
+const ECHO_KINDS: ReadonlySet<BrainLink['k']> = new Set(['link', 'prov', 'next', 'coaccess']);
+const ECHO_GAIN = 0.4;
+const ECHO_DELAY_S = 0.15;
 const NOOP_CB: EngineCallbacks = { hover() {}, select() {}, autoFollowPause() {}, lost() {} };
 
 /** Throws when WebGL2 is unavailable (the shell shows the T0 notice). */
@@ -368,6 +372,13 @@ export function createEngine(host: HTMLElement, o: EngineOptions): Engine {
         fanCursor.set(id, start + i);
       }
       if (n > bestN && shown(s)) [best, bestN] = [s, n];
+    }
+    // the echo, over adj (the neighbour index setGraph keeps); a node that fired itself keeps its own glow. The shader
+    // starts a future fire time on time; reduced motion: no delay, it joins the same static step
+    const from = new Map(events.filter((e) => e[2] !== 'turn' && sums.has(e[1])).map((e) => [e[1], fireAmp(sums.get(e[1])!)]));
+    for (const [id, amp] of echoOf(adj, linkSlots.items[0], ECHO_KINDS, from, sums)) {
+      const s = nodeSlots.byKey.get(id);
+      if (s?.live) nodes.fire(s.group, s.slot, reduced ? t : t + ECHO_DELAY_S, ECHO_GAIN * amp);
     }
     if (reduced) {
       // static 1.5 s brightness step: render at its start (now) and at its end, nothing in between

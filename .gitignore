@@ -3,6 +3,7 @@ node_modules/
 .scratch/
 *.log
 eval/*.json
+eval/*.jsonl
 tmp/
 bench/data/
 .env.*

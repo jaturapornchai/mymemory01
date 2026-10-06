@@ -19,10 +19,13 @@ export type Hit = {
   ev_of: string[] | null;                  // raw chat: ids of candidate facts distilled from its turns
   evidence?: Hit[];                        // fact: its source chat chunks among the results (shown under it, no slot of their own)
 };
-export type Result = { hits: Hit[]; semantic: boolean }; // semantic=false → vector leg skipped (keyword-only)
-// before: hide chunks newer than this (the caller's own live session is already in its context).
+export type Result = { hits: Hit[]; semantic: boolean; qvec?: string | null }; // semantic=false → vector leg skipped (keyword-only); qvec = the query embedding (halfvec text)
+// before: hide chunks newer than this, from every app; also the recency anchor (eval: the frozen clock).
+// own: hide only the caller's own live session — chunks newer than own.since from sources of own.tool in own.project;
+//   other apps and the same app's other projects stay findable (before would hide them too).
 // since/until: ISO dates (dateRange), a hard filter in every leg.
 export type SearchOpts = { project?: string; since?: string; until?: string; limit?: number; currentProject?: string; before?: Date; semantic?: boolean; perSession?: number;
+  own?: { since: Date; tool: string; project: string };
   tier?: number;      // priority boost τ (default RANK.tier); dream's neighbour lookup passes 0 = pure similarity
   now?: Date;         // anchor of relative time in the query (timeWindow); default before ?? now (eval: the frozen clock)
   showPrivate?: boolean }; // include PRIVATE_TOOLS (Gmail/Docs/Maps timeline): only for a caller guard.privateOk allows
@@ -65,34 +68,42 @@ export const RANK = {
 
 const LATIN = /^[a-z][a-z0-9_]{2,}$/;
 const RARE_FRACTION = 0.05; // terms in >5% of chunks don't select candidates (they still add score)
+// No rare term at all: the fallback candidates are the ≤ 3 lowest-df terms in ≤ this share of chunks; none → no words leg
+// (bigram + vector legs still run). Any df made the words leg a near-full scan: 270–330 ms for a term in 42,803 of 45,447
+// chunks (idf 0.05, PERF 2026-10-04). 1 = the old fallback (A/B: eval).
+const KW_FALLBACK_MAX_DF = Number(process.env.MEMHUB_KW_FALLBACK_MAX_DF ?? 0.5);
 
 // Keyword legs, run while Ollama embeds the query: $1 words tsquery, $2 bigram tsquery, $3 project, $4 since, $5 before,
-// $6/$7 every query term's tsquery / IDF, $8 tools to hide, $9 until (exclusive end: dateRange).
+// $6/$7 every query term's tsquery / IDF, $8 tools to hide, $9 until (exclusive end: dateRange), $10-$12 own (OWN).
 const PF = `pf AS (SELECT source_id FROM facts WHERE $3::text IS NOT NULL AND (project LIKE '%' || $3 || '%' OR scope = 'global'))`;
 // hidden sources (PRIVATE_TOOLS for a non-Claude caller) leave every leg, so they never take one of its 60 candidate slots
 const HIDE = (p: string) => `hide AS (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY(${p}::text[]))`; // hide_as: importer.indexFile
+// SearchOpts.own: the caller's live session (newer than since, its project, its app) leaves every leg
+const OWN = (since: string, project: string, tool: string) => `(${since}::timestamptz IS NULL OR ts < ${since}
+      OR project IS DISTINCT FROM ${project}::text OR source_id NOT IN (SELECT id FROM sources WHERE tool = ${tool}::text))`;
 const SQL_KEYWORD = `
 WITH ${PF}, ${HIDE('$8')},
 w AS (
   SELECT id, row_number() OVER (ORDER BY s DESC, ts DESC) r FROM (
-    SELECT id, ts, (SELECT sum(x.idf) FROM unnest($6::tsquery[], $7::float8[]) x(q, idf) WHERE words @@ x.q) s
-    FROM chunks
-    WHERE $1::text IS NOT NULL AND words @@ $1::tsquery
-      AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
-      AND source_id NOT IN (SELECT id FROM hide)
+    SELECT id, ts, (SELECT sum(x.idf) FROM unnest($6::tsquery[], $7::float8[]) x(q, idf) WHERE wd @@ x.q) s
+    FROM (SELECT id, ts, words || ''::tsvector wd FROM chunks -- words detoasted once per row, not once per query term:
+      WHERE $1::text IS NOT NULL AND words @@ $1::tsquery    -- 200 queries: p50/p95/p99 41/155/192 → 29/69/107 ms, same rows
+        AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
+        AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$10', '$11', '$12')}
+      OFFSET 0) c -- OFFSET 0: keeps the subquery (and its one detoast) from being flattened into the scoring
   ) z ORDER BY r LIMIT 60),
 b AS (
   SELECT id, row_number() OVER (ORDER BY ts_rank_cd(bigrams, $2::tsquery, 1) DESC, ts DESC) r
   FROM chunks
   WHERE $2::text IS NOT NULL AND bigrams @@ $2::tsquery
     AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
-    AND source_id NOT IN (SELECT id FROM hide)
+    AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$10', '$11', '$12')}
   ORDER BY r LIMIT 60)
 SELECT 'w' leg, id, r FROM w UNION ALL SELECT 'b', id, r FROM b`;
 
 // Vector leg + RRF + priors. The keyword legs come in as (id, rank) arrays in the slots SQL_KEYWORD's own inputs had:
 // $1/$2 words, $8/$9 bigrams; $15 tools to hide (the keyword legs already left them out); $16-$19 timeWindow() boost, $20 the daily-note tier;
-// $21 until: filter only — $7 (before) stays the recency anchor, so a date range never re-ranks by age.
+// $21 until: filter only — $7 (before) stays the recency anchor, so a date range never re-ranks by age. $22-$24 own (OWN).
 const SQL = `
 WITH ${PF}, ${HIDE('$15')},
 w AS (SELECT * FROM unnest($1::text[], $2::bigint[]) x(id, r)),
@@ -103,12 +114,12 @@ v AS (
     WHERE $10::text IS NOT NULL AND embedding IS NOT NULL
       AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($7::timestamptz IS NULL OR ts < $7)
       AND ($21::timestamptz IS NULL OR ts < $21)
-      AND source_id NOT IN (SELECT id FROM hide)
+      AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$22', '$23', '$24')}
     ORDER BY embedding <=> $10::halfvec LIMIT 60) s),
 f AS (SELECT id, sum(1.0 / (60 + r)) s FROM (SELECT * FROM w UNION ALL SELECT * FROM b UNION ALL SELECT * FROM v) x GROUP BY id),
 u AS (SELECT c.id, count(DISTINCT a.session) n, max(a.ts) last  -- recalls keyed by turn (stable across re-chunking)
       FROM f JOIN chunks c USING (id) JOIN access_log a ON a.turn_uuid = c.turn_uuid
-      WHERE a.kind IN ('get', 'related') AND a.ts < coalesce($7, now()) GROUP BY c.id),
+      WHERE a.kind IN ('get', 'related') AND a.ts < coalesce($7, $22::timestamptz, now()) GROUP BY c.id), -- own: not this session's own recalls
 x AS (
   SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header AS header, c.text, c.source_id, c.seq_from, c.seq_to, s.status, s.tool,
          s.kind src_kind, coalesce(u.n, 0)::int uses, u.last, fa.fid, fa.kind, fa.project fact_project, fa.superseded_by, fa.review_target,
@@ -194,18 +205,19 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     return { ...t, lit, df, idf: Math.log(1 + (n - df + 0.5) / (df + 0.5)) };
   });
   let cand = scored.filter((t) => t.df <= Math.max(50, RARE_FRACTION * n));
-  if (!cand.length) cand = [...scored].sort((a, b) => a.df - b.df).slice(0, 3);
+  if (!cand.length) cand = scored.filter((t) => t.df <= KW_FALLBACK_MAX_DF * n).sort((a, b) => a.df - b.df).slice(0, 3);
   const wq = cand.length ? cand.map((t) => t.lit).join(' | ') : null;
 
   const project = o.project?.toLowerCase() || null, before = o.before ?? null;
   const hide = o.showPrivate ? [] : [...PRIVATE_TOOLS];
+  const own = [o.own?.since ?? null, o.own?.project ?? null, o.own?.tool ?? null];
   const [legs, v] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(kq), project, since, before,
-    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until]), vec]);
+    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until, ...own]), vec]);
   const w = legs.rows.filter((r) => r.leg === 'w'), b = legs.rows.filter((r) => r.leg === 'b');
   const rows = (await db.query(SQL, [
     w.map((r) => r.id), w.map((r) => r.r), project, since, o.currentProject ?? '', Math.max(limit, 8) * 3, // ≥ 24 rows: same curated slot at every limit
     before, b.map((r) => r.id), b.map((r) => r.r), v,
-    RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide, tw.from ?? null, tw.to ?? null, tw.from ? T_WIN : 0, tw.recent ? T_REC : 0, RANK.daily, until,
+    RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide, tw.from ?? null, tw.to ?? null, tw.from ? T_WIN : 0, tw.recent ? T_REC : 0, RANK.daily, until, ...own,
   ])).rows;
   const ci = rows.slice(0, 24).findIndex((r) => r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active');
   if (ci >= RANK.slot && Number(rows[ci].score) >= RANK.slotRatio * Number(rows[0].score)) rows.splice(RANK.slot - 1, 0, ...rows.splice(ci, 1));
@@ -224,7 +236,7 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     perSession.set(r.session_id, n + 1);
     hits.push({ ...r, score: Number(r.score) });
   }
-  return { hits, semantic: v !== null };
+  return { hits, semantic: v !== null, qvec: v };
 }
 
 // Relative time → a soft boost on the fused rows (never a filter): ts in the window ×(1 + T_WIN); recency words ×(1 + T_REC·(1 −
@@ -293,7 +305,9 @@ function overlap(a: string, b: string): number {
 
 /** Recompute document frequencies (after bulk import; cheap enough to skip on per-session ingest). */
 export async function refreshTermDf(db: pg.Pool) {
-  await db.query(`BEGIN; TRUNCATE term_df;
+  // DELETE, not TRUNCATE: TRUNCATE's ACCESS EXCLUSIVE lock stalled every search for the ~0.8 s of ts_stat; readers now keep
+  // the old rows (MVCC) until COMMIT. ponytail: ~120k dead rows per refresh (hourly), autovacuum reclaims them
+  await db.query(`BEGIN; SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':memhub-termdf')); DELETE FROM term_df; -- 2 refreshes at once: 2nd waits, else term_df_pkey
     INSERT INTO term_df SELECT word, ndoc FROM ts_stat('SELECT words FROM chunks WHERE source_id NOT IN
       (SELECT id FROM sources WHERE coalesce(hide_as, tool) IN (${[...PRIVATE_TOOLS].map((t) => `''${t}''`).join(', ')}))');
     COMMIT; ANALYZE chunks; ANALYZE term_df;`);
@@ -323,8 +337,9 @@ export function age(d: Date | null, now = Date.now()): string {
 /** What a Claude-only hit is: google = Gmail thread (gmail:<id>, google/gmail) / Google Sheets (gsheet:) / Google Docs. */
 export const privateLabel = (h: Pick<Hit, 'tool' | 'project' | 'session_id'>) => h.tool === 'google-timeline' ? 'Google Maps timeline'
   : ((k) => (/gmail/.test(k) ? 'Gmail' : /sheet/.test(k) ? 'Google Sheets' : 'Google Docs'))(`${h.project} ${h.session_id.split(':')[0]}`);
-/** `[id] 2026-09-12 19d proj-a | decision cur | used 7x, last 2d` — old vs new and how often it was recalled. */
-export function hitLine(h: Hit, now = Date.now()): string {
+/** `[id] 2026-09-12 19d proj-a | decision cur | src claude:1a2b3c4d#42 | used 7x, last 2d` — old vs new, where it came from
+ *  (origins(); omitted when not given) and how often it was recalled. */
+export function hitLine(h: Hit, now = Date.now(), o?: Origin): string {
   const proj = projectName(h.fact_project ?? h.project ?? '') || 'global';
   let what = h.kind ? (h.kind === 'card' ? 'session card' : h.kind) : PRIVATE_TOOLS.has(h.tool) ? privateLabel(h) : h.project?.startsWith('obsidian/') ? (h.src_kind === 'daily' ? 'daily note' : 'note')
     : h.tool === 'github' ? `github ${/#\d+$/.test(h.session_id) ? 'issue/PR' : h.session_id.endsWith(':commits') ? 'commits' : 'repo'}`
@@ -334,6 +349,52 @@ export function hitLine(h: Hit, now = Date.now()): string {
   else if (h.kind && h.kind !== 'card' && h.kind !== 'insight') what += ' cur';
   if (h.changed_to) what += ` (decision here later changed -> [${h.changed_to.join('] [')}])`;
   const parts = [`[${h.fid && h.kind !== 'card' ? h.fid : h.id}] ${day(h.ts)} ${age(h.ts, now)} ${proj}`, what];
+  if (o) parts.push(originText(o));
   if (h.uses > 0) parts.push(`used ${h.uses}x, last ${age(h.last, now)}`);
   return parts.join(' | ');
 }
+
+/** Where a hit came from, for the reader to cite: app:session#turn (a subagent/headless run: app/sub:<its file>#turn), a GitHub
+ *  ref, a note path; a fact/card: its preferred cited turn (his own words first, then the earliest) with that turn's date,
+ *  ×N = sessions behind it, AI-only = no cited turn is his; memory_save = he asked to remember it (its own note is the source).
+ *  Looked up after ranking, so it never moves a hit; hidden and Claude-only sources are never cited. */
+export type Origin = { tag: string; ts?: Date | null; n?: number; ai?: boolean };
+const CITED = `FROM unnest(fa.source_uuids) u(uuid) JOIN turns t ON t.uuid = u.uuid JOIN sources ps ON ps.id = t.source_id
+  WHERE u.uuid NOT LIKE 'obs:%' AND coalesce(ps.hide_as, ps.tool) <> ALL($2::text[])`;
+const SQL_ORIGIN = `
+SELECT c.id, c.seq_from seq, c.turn_uuid turn, s.tool, s.kind, s.session_id sid, s.path, fa.fid IS NOT NULL fact,
+       NOT EXISTS (SELECT 1 FROM unnest(fa.source_uuids) x WHERE x NOT LIKE 'obs:%') saved, p.*, q.*
+FROM chunks c JOIN sources s ON s.id = c.source_id LEFT JOIN facts fa ON fa.source_id = c.source_id
+LEFT JOIN LATERAL (SELECT t.seq pseq, t.uuid pturn, t.ts pts, ps.tool ptool, ps.kind pkind, ps.session_id psid, ps.path ppath ${CITED}
+                   ORDER BY t.role = 'user' DESC, t.ts, t.seq LIMIT 1) p ON true
+LEFT JOIN LATERAL (SELECT count(DISTINCT t.source_id)::int n, coalesce(bool_or(t.role = 'user'), false) his ${CITED}) q ON true
+WHERE c.id = ANY($1::text[])`;
+
+/** origins of these chunk ids (hits, a memory_get chunk) for a caller that may not see `hide`. One query. */
+export async function origins(db: pg.Pool, ids: string[], hide: string[]): Promise<Map<string, Origin>> {
+  const out = new Map<string, Origin>();
+  if (!ids.length) return out;
+  for (const r of (await db.query(SQL_ORIGIN, [ids, hide])).rows) {
+    if (PRIVATE_TOOLS.has(r.tool)) continue; // Claude-only: the private label is all such a hit shows
+    if (!r.fact) out.set(r.id, { tag: place(r.tool, r.kind, r.sid, r.path, r.seq, r.turn) });
+    else if (r.saved) out.set(r.id, { tag: 'memory_save' });
+    else if (r.ptool && !PRIVATE_TOOLS.has(r.ptool)) out.set(r.id, { tag: place(r.ptool, r.pkind, r.psid, r.ppath, r.pseq, r.pturn), ts: r.pts, n: r.n, ai: !r.his });
+  }
+  return out;
+}
+
+/** The citation of one turn: github:owner/repo@sha7 | #N, note:<vault>/<path> (≤ 56 chars), app[/sub]:<last 8 of the session
+ *  (a subagent/headless run shares its main session's id and restarts seq: its own file names it)>#seq. */
+export function place(tool: string, kind: string, sid: string, path: string, seq: number, turn: string): string {
+  if (tool === 'github') {
+    const sha = /@([0-9a-f]{7,40})$/.exec(turn)?.[1], issue = /#\d+$/.exec(sid)?.[0];
+    return `github:${sid.replace(/^github:/, '').replace(/:commits$|#\d+$/, '')}${sha ? `@${sha.slice(0, 7)}` : issue ?? ''}`;
+  }
+  if (tool === 'obsidian') return `note:${sid.length <= 56 ? sid : `${sid.split('/')[0]}/…/${sid.split('/').at(-1)}`.slice(0, 56)}`;
+  const unit = kind === 'main' ? sid : path.split(/[\\/]/).at(-1)!.replace(/\.\w+$/, '');
+  return `${tool}${kind === 'main' ? '' : `/${kind === 'subagent' ? 'sub' : kind}`}:${unit.slice(-8)}#${seq}`;
+}
+
+/** `src claude:1a2b3c4d#42 2026-09-12 ×3 AI-only` ('' without an origin). */
+export const originText = (o?: Origin) =>
+  (o ? `src ${o.tag}${o.ts ? ` ${day(o.ts)}` : ''}${(o.n ?? 0) > 1 ? ` ×${o.n}` : ''}${o.ai ? ' AI-only' : ''}` : '');

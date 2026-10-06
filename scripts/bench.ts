@@ -5,7 +5,7 @@
 //   LongMemEval_S (cleaned): one project per question = its own ~50-session haystack; fixed-seed subset stratified by type.
 //   LoCoMo (locomo10): one project per conversation, all 1,986 questions.
 // Metric definitions, dataset URLs + sha256, results: docs/benchmarks.md.  Data files: bench/data/ (gitignored).
-// usage: node scripts/bench.ts [--lme 54] [--locomo 10] [--seed 1] [--json bench/data/results.json]
+// usage: node scripts/bench.ts [--lme 54] [--locomo 10] [--seed 1] [--json bench/data/results.json] (env EVAL_EXACT=1: exact vector leg)
 //   embedding runs at MEMHUB_EMBED_RATE (default 10/s, keep ≤ 10): ~600 chunks per LongMemEval question ≈ 1 min each
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -218,6 +218,7 @@ if (import.meta.main) {
     json: { type: 'string', default: 'bench/data/results.json' } } });
   process.env.MEMHUB_PG_SCHEMA = 'memhub_bench';
   const db = connect('rw');
+  if (process.env.EVAL_EXACT) (db as any).options.options += ' -c enable_indexscan=off'; // exact vector leg, as scripts/eval.ts EVAL_EXACT
   await db.query('CREATE SCHEMA IF NOT EXISTS memhub_bench');
   // guard: schema.sql replaces a view — it must never run against the main schema
   if ((await db.query('SELECT current_schema() s')).rows[0].s !== 'memhub_bench') throw new Error('search_path is not memhub_bench');

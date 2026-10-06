@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { FAMILY_COLOR, type BrainNode, type NodeType } from '../../lib/brain.ts';
-import { addAdjacency, placeFallback, SlotTable, type SlotDiff } from './slots.ts';
+import { addAdjacency, echoOf, placeFallback, SlotTable, type SlotDiff } from './slots.ts';
 import { BASE_LINEAR, fireColor, hexToLinear, srgb, TYPE_INDEX } from './style.ts';
 import { Governor, initialTier, type TierEnv } from './quality.ts';
 
@@ -80,6 +80,17 @@ test('adjacency encodes direction', () => {
   assert.deepEqual(adj.get('a'), [1]);
   assert.deepEqual(adj.get('b'), [-1, 6]);
   assert.deepEqual(adj.get('c'), [-6]);
+});
+
+test('echoOf: 1-hop over live links of the given kinds, both directions, strongest amp, fired nodes skipped', () => {
+  const ls: [string, string, string, boolean][] = [['x', 'a', 'prov', true], ['b', 'x', 'next', true], ['x', 'hub', 'in', true],
+    ['x', 'c', 'coaccess', false], ['y', 'a', 'link', true], ['x', 'y', 'link', true]];
+  const adj = new Map<string, number[]>();
+  const links = ls.map(([source, target, k, live], slot) => (addAdjacency(adj, source, target, slot), { slot, group: 0, live, item: { source, target, k } }));
+  const kinds = new Set(['link', 'prov', 'next', 'coaccess']);
+  const from = new Map([['x', 0.5], ['y', 0.9]]);
+  assert.deepEqual([...echoOf(adj, links, kinds, from, from)].sort(), [['a', 0.9], ['b', 0.5]]); // no hub ('in'), no dead link, y fired itself
+  assert.equal(echoOf(adj, links, kinds, new Map(), new Set()).size, 0);
 });
 
 function hueSat(lin: readonly number[]): [number, number] {

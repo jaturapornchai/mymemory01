@@ -140,7 +140,7 @@ test('lint: expired, duplicate pair, orphan, broken link, stale handoff — priv
   assert.deepEqual(r.handoffs.map((x) => x.title), ['ส่งเฉพาะ codex', 'ทำ migration ค้าง']);
 
   const dry = await runLint(db, { dry: true, now: NOW });
-  assert.match(dry, /^## 2026-10-04\nเลยวันหมดอายุ 1 · อาจซ้ำ 1 คู่ · แชตต้นทางหายหมด 1 · ลิงก์เสีย 1 · งานส่งต่อค้าง 2\n/);
+  assert.match(dry, /^## 2026-10-04\nเลยวันหมดอายุ 1 · อาจซ้ำ 1 คู่ · แชตต้นทางหายหมด 1 · ลิงก์เสีย 1 · งานส่งต่อค้าง 2 · หลักฐานไม่ตรง \d+ · อาจขัดกัน \d+\n/);
   assert.match(dry, /\[\[F0000f01 twin one\]\] ≈ \[\[F0000f02 twin two\]\] · 1\.000/);
   assert.match(dry, /\[\[F0000f04 links\]\] → `no such note`/);
   assert.match(dry, /\(ส่งถึง codex\)/);
@@ -163,8 +163,15 @@ test('lint: expired, duplicate pair, orphan, broken link, stale handoff — priv
 });
 
 test('forget --project: every chat under the path, its facts with it (edited one kept)', async () => {
+  const ids = async () => (await db.query(`SELECT id FROM sources WHERE tool <> 'obsidian'`)).rows.map((x) => `source:${x.id}`); // notes get re-indexed
+  const keys = (ks: string[]) => ks.flatMap((k) => [k, k + '@github', k + '@owner']).sort();
+  const before = await ids();
+  await db.query(`INSERT INTO state (k, v) VALUES ('layout', $1) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+    [Object.fromEntries(keys(before).map((k) => [k, [1, 2, 3]]))]);
   const r = await forget(db, 'project', 'D:\\demo');
   assert.equal(r.sources, 1); // session B (A went in the first test)
+  assert.deepEqual(Object.keys((await db.query(`SELECT v FROM state WHERE k = 'layout'`)).rows[0].v).filter((k) => keys(before).includes(k)).sort(), keys(await ids()),
+    'its layout pins go in every mode (brain.ts: public @github, local @owner); the others stay');
   assert.ok(r.retired.includes('F0000bbb F0000bbb multi') && r.retired.includes('F0000f01 F0000f01 twin one'), r.retired.join());
   assert.deepEqual(r.trimmed, []);
   // F0000ccc no longer cites a live chat: nothing new to route. The dream-written rule is his (user_owned): reviewed, not deleted
@@ -172,4 +179,20 @@ test('forget --project: every chat under the path, its facts with it (edited one
   assert.deepEqual((await db.query(`SELECT fid FROM facts WHERE kind <> 'card' ORDER BY fid`)).rows.map((x) => x.fid), ['F0000ccc', 'F0000f03']);
   assert.match(read('hubs/_review.md'), /## Forgotten chats, your notes[\s\S]*\[\[F0000f03 rule\]\]/);
   assert.ok(existsSync(file('hubs/demo hub.md'))); // the edited note keeps the project alive
+});
+
+test('prunePins: a source deleted outside forget (a removed note, a moved file) leaves both pin stores, every key form', async () => {
+  const { prunePins } = await import('../src/layout.ts');
+  const live = `source:${(await db.query(`SELECT id FROM sources ORDER BY id LIMIT 1`)).rows[0].id}`;
+  const gone = `source:${(await db.query(`SELECT coalesce(max(id), 0) + 1000 id FROM sources`)).rows[0].id}`;
+  const kept = [live, `${live}@owner`, 'project:d:/x', '#'];
+  for (const k of ['layout', 'layout:semantic']) {
+    await db.query(`INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+      [k, Object.fromEntries([...kept, gone, `${gone}@github`, `${gone}@owner`].map((x) => [x, [1, 2, 3]]))]);
+  }
+  assert.equal(await prunePins(db), 6);
+  for (const k of ['layout', 'layout:semantic']) {
+    assert.deepEqual(Object.keys((await db.query(`SELECT v FROM state WHERE k = $1`, [k])).rows[0].v).sort(), [...kept].sort(), k);
+  }
+  assert.equal(await prunePins(db), 0, 'nothing left to prune: no write');
 });

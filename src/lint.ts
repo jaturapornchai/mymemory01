@@ -14,6 +14,7 @@ import { indexVault } from './obsidian.ts';
 import { commitBatch } from './vault-git.ts';
 
 const CAP = 20, KEEP = 7, DUP = 0.95, STALE_HOURS = 48; // stale = nobody claimed it in 2 days (it expires after handoff.DAYS)
+const CONFLICT = 0.8; // same project, cosine CONFLICT..DUP: close enough to be about one thing, not a duplicate
 export const LINT_REL = 'hubs/_lint.md';
 const PUBLIC = 'coalesce(s.hide_as, s.tool) <> ALL($1::text[])'; // $1 = PRIVATE_TOOLS in every source query
 // a fact note is an obsidian source (never hide_as): what may be Claude-only is the chat it was dreamed from (= daily.ts)
@@ -46,13 +47,51 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
       ORDER BY s.path, l.dst_name LIMIT ${CAP}`, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`),
     handoffs: (await db.query(`SELECT id, from_app, to_app, project, title, created_at, count(*) OVER () total FROM handoffs
       WHERE status = 'open' AND created_at < $1::timestamptz - make_interval(hours => ${STALE_HOURS}) ORDER BY created_at, id LIMIT ${CAP}`, [now])).rows as Row[],
+    // a dream fact vs the turns it cites: are its hard anchors (numbers, ids, paths, versions) there? (the citation is only checked to exist)
+    support: unsupported(await q(`SELECT f.fid, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
+        (SELECT string_agg(t.text_redacted, ' ') FROM turns t WHERE t.uuid = ANY(f.source_uuids) AND t.uuid NOT LIKE 'obs:%') src
+      FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card' AND f.run IS NOT NULL ORDER BY s.path`)),
+    // close same-project pairs (not duplicates) whose numbers or negation differ: one may have replaced the other unnoticed
+    // (the dream only compares a NEW fact with ≤ 5 neighbours). Same shape as dups, all kinds.
+    conflicts: conflicting(await q(`WITH v AS (SELECT f.fid, coalesce(f.project, '') project, s.path,
+        (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
+        (SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) e
+        FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card')
+      SELECT a.fid a, a.path apath, a.body abody, b.fid b, b.path bpath, b.body bbody, 1 - (a.e <=> b.e) sim
+      FROM v a JOIN v b ON b.project = a.project AND a.fid < b.fid
+      WHERE a.e <=> b.e <= $2 AND a.e <=> b.e > $3 ORDER BY a.e <=> b.e, a.fid, b.fid LIMIT 500`, 1 - CONFLICT, 1 - DUP)),
   };
+}
+
+/** Body of a fact note's text ('# title\nbody\n- from:: [[…]]'): the title repeats the body, links are not claims. */
+const factText = (t: string) => String(t ?? '').replace(/^# [^\n]*\n/, '').replace(/^\s*- [a-z_]+:: .*$/gm, '');
+/** Hard anchors a paraphrase keeps verbatim: Latin/digit tokens with a digit, _ . / : or an inner '-' (dates, fids: the note's own). */
+const anchors = (s: string) => [...new Set((s.match(/[A-Za-z0-9_./:-]+/g) ?? []).map((w) => w.replace(/^[.:/-]+|[.:/-]+$/g, '').toLowerCase())
+  .filter((w) => w.length >= 3 && /[0-9_./:]|[a-z0-9]-[a-z0-9]/.test(w) && !/^\d{4}-\d\d-\d\d/.test(w) && !/^[fsi][0-9a-f]{8}$/.test(w)))];
+const withTotal = (rows: Row[]) => rows.slice(0, CAP).map((r) => ({ ...r, total: rows.length }));
+/** Facts with ≥ 2 anchors, more than half of them absent from every cited turn. ponytail: substring match on redacted text, Latin only. */
+function unsupported(rows: Row[]) {
+  return withTotal(rows.flatMap((r) => {
+    const a = anchors(factText(r.body)), src = String(r.src ?? '').toLowerCase(), miss = a.filter((w) => !src.includes(w));
+    return a.length >= 2 && miss.length * 2 > a.length ? [{ fid: r.fid, path: r.path, have: a.length - miss.length, of: a.length, miss: miss.slice(0, 3) }] : [];
+  }));
+}
+const NUMS = (s: string) => new Set(s.match(/\d[\d.,:]*\d/g) ?? []);
+const NEG = /ไม่|ห้าม|อย่า|ยกเลิก|เลิก|\b(?:not|no|never|don't|doesn't|removed?|stop(?:ped)?|instead)\b/i;
+/** Pairs where each side has a number the other lacks, or only one side negates/cancels. */
+function conflicting(rows: Row[]) {
+  return withTotal(rows.flatMap((r) => {
+    const a = factText(r.abody), b = factText(r.bbody), na = NUMS(a), nb = NUMS(b);
+    const why = [...na].some((x) => !nb.has(x)) && [...nb].some((x) => !na.has(x)) ? 'ตัวเลขต่างกัน' : NEG.test(a) !== NEG.test(b) ? 'ปฏิเสธ/ยกเลิก' : '';
+    return why ? [{ a: r.a, apath: r.apath, b: r.b, bpath: r.bpath, sim: r.sim, why }] : [];
+  }));
 }
 export type LintReport = Awaited<ReturnType<typeof lintReport>>;
 
 const total = (rows: Row[]) => Number(rows[0]?.total ?? 0);
 export const lintSummary = (r: LintReport) =>
-  `เลยวันหมดอายุ ${total(r.expired)} · อาจซ้ำ ${total(r.dups)} คู่ · แชตต้นทางหายหมด ${total(r.orphans)} · ลิงก์เสีย ${total(r.broken)} · งานส่งต่อค้าง ${total(r.handoffs)}`;
+  `เลยวันหมดอายุ ${total(r.expired)} · อาจซ้ำ ${total(r.dups)} คู่ · แชตต้นทางหายหมด ${total(r.orphans)} · ลิงก์เสีย ${total(r.broken)} · งานส่งต่อค้าง ${total(r.handoffs)}` +
+  ` · หลักฐานไม่ตรง ${total(r.support)} · อาจขัดกัน ${total(r.conflicts)}`;
 
 /** One dated section (Asia/Bangkok day). Wikilinks to notes; a broken target is plain code (a link would be broken itself). */
 export function renderLint(r: LintReport, now = new Date()): string {
@@ -62,6 +101,10 @@ export function renderLint(r: LintReport, now = new Date()): string {
     sec('ข้อเท็จจริงเลยวันหมดอายุแต่ยัง active', r.expired, (x) => `[[${title(x.path)}]] · หมด ${day(x.ended)}`) +
     sec(`อาจซ้ำกัน (โปรเจกต์ + ชนิดเดียวกัน, cosine ≥ ${DUP})`, r.dups, (x) => `[[${title(x.apath)}]] ≈ [[${title(x.bpath)}]] · ${Number(x.sim).toFixed(3)}`) +
     sec('แชตต้นทางถูกลืม/หายจากดัชนีหมดแล้ว', r.orphans, (x) => `[[${title(x.path)}]]`) +
+    sec('ข้อความไม่ตรงกับแชตที่อ้าง (ตัวเลข/ชื่อเฉพาะส่วนใหญ่หาไม่พบในแชตต้นทาง)', r.support,
+      (x) => `[[${title(x.path)}]] · พบ ${x.have}/${x.of} · ไม่พบ \`${x.miss.join(' ').replace(/`/g, '')}\``) +
+    sec(`อาจขัดกัน (โปรเจกต์เดียวกัน, cosine ${CONFLICT}–${DUP})`, r.conflicts,
+      (x) => `[[${title(x.apath)}]] ↔ [[${title(x.bpath)}]] · ${x.why} · ${Number(x.sim).toFixed(3)}`) +
     sec('ลิงก์เสีย', r.broken, (x) => `[[${title(x.path)}]] → \`${String(x.dst_name).replace(/`/g, '')}\``) +
     sec(`งานส่งต่อค้าง (เปิดเกิน ${STALE_HOURS} ชม.)`, r.handoffs, (x) => `#${x.id} ${x.from_app} ${ago(x.created_at, +now)} · ` +
       `${x.project ? projectName(x.project) : 'global'}: ${x.to_app ? `(ส่งถึง ${x.to_app})` : x.title}`); // targeted: only that app may read it

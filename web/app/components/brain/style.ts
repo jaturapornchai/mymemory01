@@ -57,6 +57,8 @@ export function linkStyle(k: LinkKind, w: number): Vec3 {
     case 'in': return [0.35, 1.2, 0];
     case 'link': return [0.5, 1, 0];
     case 'similar': return [0.08, 1, 1];
+    case 'prov': return [0.3, 1, 0];
+    case 'next': return [0.25, 1, 1];
     case 'coaccess': {
       const s = Math.min(1, Math.max(0, w));
       return [0.1 + 0.4 * s, 0.8 + s, 0];

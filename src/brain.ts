@@ -27,7 +27,7 @@ export type BrainNode = {
   xyz?: [number, number, number]; // baked layout (src/layout.ts): integer world units, stable across exports; absent → the scene places it
   s?: [number, number, number];   // semantic layout (src/layout.ts bakeSemantic): by meaning, same units; absent = no vectors (hubs: children's mean)
 };
-export type LinkKind = 'in' | 'spawn' | 'link' | 'similar' | 'coaccess';
+export type LinkKind = 'in' | 'spawn' | 'link' | 'similar' | 'coaccess' | 'prov' | 'next';
 export type BrainLink = { source: string; target: string; k: LinkKind; w: number };
 export type EventKind = 'turn' | 'search' | 'recall';
 export type BrainEvent = [t: number, node: string, kind: EventKind, n: number];
@@ -53,12 +53,18 @@ const LOG_DAYS = 7, LOG_MAX = 200;
 // dream run counters that may be published; the run id and batches[].candidates (fact text) never leave this file
 const DREAM_STATS = ['sessions', 'windows', 'batches', 'cards', 'ADD', 'NOOP', 'UPDATE', 'SUPERSEDE', 'pending_review'];
 const DAY = 86400, BKK = 7 * 3600, ACTIVITY_DAYS = 371; // heatmap: 53 weeks of Bangkok (UTC+7) days
-// GitHub repos without a local clone (project 'github/<owner>/<repo>') share one hub: ~350 hubs of 1-3 nodes were clutter.
-// Public: cloned repos too. Their commit/issue times are public on GitHub to the second, so in their project's hub they
-// would name its alias (and every AI session in it); in the shared hub they only show the repo is his
+// GitHub repos without a local clone (project 'github/<owner>/<repo>'): one hub per owner locally (~350 hubs of 1-3 nodes
+// were clutter; one hub for all hid whose repos they are). Public: one shared hub for every GitHub item, cloned repos too.
+// Their commit/issue times are public on GitHub to the second, so in their project's hub they would name its alias (and
+// every AI session in it); in the shared hub they only show the repo is his
 const GITHUB_HUB = 'github/*';
-const hubOf = (s: { tool: string; project: string | null }, pub: boolean) =>
-  (s.tool === 'github' && (pub || s.project?.startsWith('github/')) ? GITHUB_HUB : s.project ?? '?');
+const ghOwner = (s: { tool: string; project: string | null }) => (s.tool === 'github' ? /^github\/([^/]+)/.exec(s.project ?? '')?.[1] : undefined);
+const hubOf = (s: { tool: string; project: string | null }, pub: boolean) => {
+  const owner = ghOwner(s);
+  return s.tool === 'github' && pub ? GITHUB_HUB : owner ? `github/${owner}/*` : s.project ?? '?';
+};
+/** The hub a node had before per-owner hubs: its layout pin. A node in another hub gets a pin of its own (pins never move). */
+const homeOf = (s: { tool: string; project: string | null }) => (ghOwner(s) ? GITHUB_HUB : s.project ?? '?');
 const isApp = (a: unknown): a is App => (APPS as readonly unknown[]).includes(a);
 
 /** Per-install secret so public ids can't be reversed by hashing known session ids. Lazily added to .env. */
@@ -81,14 +87,15 @@ export async function buildBrain(db: pg.Pool, mode: 'public' | 'local', since?: 
   };
 
   const all = (await db.query(`
-    SELECT s.id, s.tool, s.kind, s.session_id, s.project, s.status,
+    SELECT s.id, s.tool, s.kind, s.session_id, s.project, s.status, s.hide_as,
            count(c.id)::int n, count(c.embedding)::int ne, min(c.ts) t0, max(c.ts) t1,
            (SELECT left(t.text_redacted, 80) FROM turns t WHERE t.source_id = s.id AND t.role = 'user' ORDER BY t.seq LIMIT 1) first
     FROM sources s JOIN chunks c ON c.source_id = s.id -- empty sources (meta-only sessions) are not brain cells
     GROUP BY s.id`)).rows;
   const sources = all.filter((s) => !PRIVATE_TOOLS.has(s.tool));
+  // by turn, not chunk: chunk ids change on a re-chunk (turn uuids don't), and one turn can span several chunks
   const uses = new Map<string, number>((await db.query(`
-    SELECT c.source_id::text sid, count(*)::int u FROM access_log a JOIN chunks c ON c.id = a.chunk_id
+    SELECT t.source_id::text sid, count(*)::int u FROM access_log a JOIN turns t ON t.uuid = a.turn_uuid
     WHERE a.kind <> 'search' GROUP BY 1`)).rows.map((r) => [r.sid, r.u]));
 
   const nodes: BrainNode[] = [];
@@ -107,7 +114,7 @@ export async function buildBrain(db: pg.Pool, mode: 'public' | 'local', since?: 
     const vault = p.startsWith('obsidian/');
     const node: BrainNode = {
       id: id('project:' + p), type: 'project',
-      label: pub ? (vault ? `V${++vN}` : `P${++pN}`) : vault ? p : p === GITHUB_HUB ? 'GitHub' : shortName(p),
+      label: pub ? (vault ? `V${++vN}` : `P${++pN}`) : vault ? p : p.startsWith('github/') ? `GitHub · ${p.split('/')[1]}` : shortName(p),
       n: 0, t0: Infinity, t1: 0, u: 0,
     };
     projects.set(p, node);
@@ -116,12 +123,12 @@ export async function buildBrain(db: pg.Pool, mode: 'public' | 'local', since?: 
   const apps: Brain['apps'] = {};
   for (const s of all) if (PRIVATE_TOOLS.has(s.tool)) (apps.google ??= { sessions: 0, subagents: 0, turns: 0, chunks: 0, t1: 0 }).chunks += s.n;
   for (const s of sources) {
-    const hub = projects.get(hubOf(s, pub))!;
+    const h = hubOf(s, pub), hub = projects.get(h)!;
     // 'subagent' also takes Codex 'headless' runs (codex exec): on purpose, another agent or a script starts them
     const type: NodeType = s.tool === 'obsidian' ? (s.project === VAULT_MEMORY ? 'memory' : 'note') : s.kind === 'main' ? 'session' : s.kind === 'doc' ? 'note' : 'subagent';
-    // a node public mode moved to the GitHub hub (hubOf) gets a layout key of its own: pins never move (layout.ts), and
-    // its shared pin sits in its project's cluster
-    const raw = 'source:' + s.id + (hubOf(s, pub) === hubOf(s, false) ? '' : '@github');
+    // a node outside its home hub gets a layout key of its own (pins never move, layout.ts): public moves cloned repos to the
+    // GitHub hub ('@github'), local moves non-cloned ones to their owner's hub ('@owner'); public keys are unchanged
+    const raw = 'source:' + s.id + (h === homeOf(s) ? '' : pub ? '@github' : '@owner');
     const n: BrainNode = { id: id(raw), type, p: hub.id, n: s.n, t0: sec(s.t0), t1: sec(s.t1), u: uses.get(String(s.id)) ?? 0 };
     if (!pub && type !== 'subagent') {
       n.label = type === 'session' ? (s.first ?? s.session_id).replace(/\s+/g, ' ').slice(0, 60) : String(s.session_id).replace(/^.*\/|\.md$/g, '');
@@ -156,16 +163,25 @@ export async function buildBrain(db: pg.Pool, mode: 'public' | 'local', since?: 
     if (r.tool !== 'github' && r.tool !== 'obsidian') chats += r.n;
   }
 
-  // [[wikilinks]] between notes, Hebbian co-access edges, and semantic neighbours (centroid cosine, top-2 per session/note).
+  // [[wikilinks]] between notes, the edges table (Hebbian co-access, fact/card provenance, next session in a project;
+  // 'spawn' is derived above), and semantic neighbours (centroid cosine, top-2 per session/note).
   for (const r of (await db.query('SELECT src_id, dst_id FROM links WHERE dst_id IS NOT NULL AND dst_id <> src_id')).rows) {
     links.push({ source: nodeOf.get(String(r.src_id))!, target: nodeOf.get(String(r.dst_id))!, k: 'link', w: 1 });
   }
-  for (const r of (await db.query(`SELECT a, b, w FROM edges WHERE kind = 'coaccess'`)).rows) {
-    links.push({ source: nodeOf.get(String(r.a))!, target: nodeOf.get(String(r.b))!, k: 'coaccess', w: Number(r.w) });
+  // PRIVATE_TOOLS endpoints are no node (live() drops their edges); a hide_as session is a node (counts only), never a synapse
+  const hidden = new Set(all.filter((s) => s.hide_as).map((s) => String(s.id)));
+  // a synapse from a GitHub item (public times, shared hub: see GITHUB_HUB) out of that hub would name the other end's alias:
+  // coaccess to a session of the cloned repo's project, prov to a fact citing it (next/spawn skip GitHub). Local builds drop it
+  // too: both maps show the same synapses
+  const gh = new Set(sources.filter((s) => s.tool === 'github').map((s) => String(s.id)));
+  for (const r of (await db.query(`SELECT a, b, kind, w FROM edges WHERE kind IN ('coaccess', 'prov', 'next')`)).rows) {
+    if (hidden.has(String(r.a)) || hidden.has(String(r.b))) continue;
+    if (gh.has(String(r.a)) !== gh.has(String(r.b))) continue;
+    links.push({ source: nodeOf.get(String(r.a))!, target: nodeOf.get(String(r.b))!, k: r.kind, w: Number(r.w) });
   }
   const sim = (await db.query(`
     WITH c AS (SELECT c.source_id id, avg(c.embedding) e FROM chunks c JOIN sources s ON s.id = c.source_id
-               WHERE c.embedding IS NOT NULL AND s.kind IN ('main', 'note') AND s.tool <> ALL($1::text[]) GROUP BY 1)
+               WHERE c.embedding IS NOT NULL AND s.kind IN ('main', 'note') AND s.tool <> ALL($1::text[]) AND s.hide_as IS NULL GROUP BY 1)
     SELECT a.id a, b.id b, b.sim FROM c a CROSS JOIN LATERAL (
       SELECT x.id, 1 - (a.e <=> x.e) sim FROM c x WHERE x.id <> a.id ORDER BY a.e <=> x.e LIMIT 2) b
     WHERE b.sim > 0.55 ORDER BY 1, 2`, [[...PRIVATE_TOOLS]])).rows; // ordered: which direction of a pair is seen first feeds the layout bake (determinism)
@@ -186,9 +202,9 @@ export async function buildBrain(db: pg.Pool, mode: 'public' | 'local', since?: 
     events.push([Number(r.t), nodeOf.get(String(r.source_id))!, 'turn', r.n]);
   }
   for (const r of (await db.query(`
-    SELECT c.source_id, extract(epoch FROM date_bin('1 minute', a.ts, 'epoch'))::bigint t,
+    SELECT u.source_id, extract(epoch FROM date_bin('1 minute', a.ts, 'epoch'))::bigint t,
            CASE WHEN a.kind = 'search' THEN 'search' ELSE 'recall' END k, count(*)::int n
-    FROM access_log a JOIN chunks c ON c.id = a.chunk_id WHERE a.ts > $1 GROUP BY 1, 2, 3`, [after])).rows) {
+    FROM access_log a JOIN turns u ON u.uuid = a.turn_uuid WHERE a.ts > $1 GROUP BY 1, 2, 3`, [after])).rows) { // by turn, as uses above
     events.push([Number(r.t), nodeOf.get(String(r.source_id))!, r.k, r.n]);
   }
   events.sort((a, b) => a[0] - b[0]);

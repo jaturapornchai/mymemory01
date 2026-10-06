@@ -8,7 +8,7 @@ import { Glyph } from './Hud';
 
 const FEED_ROWS = 8;
 const EVENT_NAME: Record<EventKind, string> = { turn: 'ข้อความ', search: 'ค้นหา', recall: 'เรียกใช้' };
-const LINK_NAME: Record<LinkKind, string> = { in: 'สังกัด', spawn: 'เอเจนต์ย่อย', link: 'ลิงก์โน้ต', similar: 'คล้ายกัน', coaccess: 'ใช้ร่วมกัน' };
+const LINK_NAME: Record<LinkKind, string> = { in: 'สังกัด', spawn: 'เอเจนต์ย่อย', link: 'ลิงก์โน้ต', similar: 'คล้ายกัน', coaccess: 'ใช้ร่วมกัน', prov: 'ที่มา', next: 'ต่อเนื่อง' };
 
 export type SideTab = 'feed' | 'log';
 

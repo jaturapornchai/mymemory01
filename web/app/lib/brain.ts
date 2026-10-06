@@ -17,7 +17,7 @@ export type BrainNode = {
   xyz?: [number, number, number]; // baked layout (src/layout.ts): integer world units, stable across exports; absent → the scene places it
   s?: [number, number, number]; // position by meaning (bge-m3 embeddings → 3D, src/layout.ts bakeSemantic); absent: none (no embedded chunks, public GitHub items)
 };
-export type LinkKind = 'in' | 'spawn' | 'link' | 'similar' | 'coaccess';
+export type LinkKind = 'in' | 'spawn' | 'link' | 'similar' | 'coaccess' | 'prov' | 'next';
 export type BrainLink = { source: string; target: string; k: LinkKind; w: number };
 export type EventKind = 'turn' | 'search' | 'recall';
 /** [t unix s, node id, kind, count] */

@@ -83,14 +83,14 @@ test('lastDream: the latest record of the newest run file, any age; none → und
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('buildBrain: per-app counts, node app, unmapped GitHub repos under one hub; feedOf carries apps/activity/dream', async () => {
+test('buildBrain: per-app counts, node app, unmapped GitHub repos under one hub per owner (public: one shared hub); feedOf carries apps/activity/dream', async () => {
   const day = (d: number) => new Date(Date.UTC(2026, 8, d));
   const src = (id: number, tool: string, kind: string, project: string, n: number, d: number, session_id = `s${id}`) =>
     ({ id, tool, kind, session_id, project, status: null, n, ne: id === 7 ? 0 : n, t0: day(d), t1: day(d + 1), first: 'hi' }); // 7: not embedded yet
   const sources = [
     src(1, 'claude', 'main', 'd:/work/app', 5, 1), src(2, 'claude', 'subagent', 'd:/work/app', 2, 2, 's1'),
     src(3, 'codex', 'headless', 'd:/work/app', 1, 3), src(4, 'github', 'doc', 'github/acme/widget-repo', 1, 4),
-    src(5, 'github', 'doc', 'github/acme/gadget-repo', 3, 5), src(6, 'github', 'doc', 'd:/work/app', 1, 6), // a cloned repo
+    src(5, 'github', 'doc', 'github/other/gadget-repo', 3, 5), src(6, 'github', 'doc', 'd:/work/app', 1, 6), // a cloned repo
     src(7, 'obsidian', 'note', 'obsidian/vault', 2, 7), src(8, 'obsidian', 'note', MEMORY_PROJECT, 1, 8),
   ];
   const hour = Math.floor(Date.now() / 3600_000) * 3600;
@@ -106,13 +106,14 @@ test('buildBrain: per-app counts, node app, unmapped GitHub repos under one hub;
     : sql.startsWith('SELECT s.tool, count(*)') ? [{ tool: 'claude', n: 40 }, { tool: 'github', n: 4 }, { tool: 'mystery', n: 1 }]
     : sql.includes(`date_bin('1 hour'`) ? [{ t: String(hour), n: 6 }]
     : sql.includes('pg_database_size') ? [{ turns: 0, chunks: 0, vectors: 0, hits7d: 0, recalls7d: 0, sessions7d: 0, db: 0 }]
-    : sql.includes(`k = 'layout'`) ? [{ v: { 'source:6': [999, 999, 999] } }] // the cloned repo's pin, in its project's cluster
+    : sql.includes(`k = 'layout'`) ? [{ v: { 'source:6': [999, 999, 999], 'source:4': [777, 777, 777] } }] // pins: the cloned repo's (its project's cluster), a repo's in the shared hub
     : [] }) } as unknown as pg.Pool;
   const b = await buildBrain(db, 'local');
   const hubs = b.nodes.filter((n) => n.type === 'project');
-  const gh = hubs.find((n) => n.label === 'GitHub')!;
-  assert.equal(hubs.length, 4); // app, GitHub, the vault, the memory vault
-  assert.deepEqual(b.nodes.filter((n) => n.p === gh.id).map((n) => n.id), ['source:4', 'source:5']);
+  assert.equal(hubs.length, 5); // app, GitHub · acme, GitHub · other, the vault, the memory vault
+  const under = (label: string) => b.nodes.filter((n) => n.p === hubs.find((h) => h.label === label)!.id).map((n) => n.id);
+  assert.deepEqual([under('GitHub · acme'), under('GitHub · other')], [['source:4@owner'], ['source:5@owner']]);
+  assert.notDeepEqual(b.nodes.find((n) => n.id === 'source:4@owner')!.xyz, [777, 777, 777], 'local: a spot by its owner hub, not the shared-hub pin');
   assert.equal(b.nodes.find((n) => n.id === 'source:6')!.p, 'project:d:/work/app');
   const t1 = (d: number) => day(d + 1).getTime() / 1000;
   assert.deepEqual(b.apps, {
@@ -121,7 +122,7 @@ test('buildBrain: per-app counts, node app, unmapped GitHub repos under one hub;
     github: { sessions: 0, subagents: 0, turns: 4, chunks: 5, t1: t1(6) },
     obsidian: { sessions: 0, subagents: 0, turns: 0, chunks: 3, t1: t1(8) },
   });
-  assert.deepEqual(b.nodes.map((n) => n.a), [undefined, undefined, undefined, undefined, // hubs
+  assert.deepEqual(b.nodes.map((n) => n.a), [undefined, undefined, undefined, undefined, undefined, // hubs
     'claude', 'claude', 'codex', 'github', 'github', 'github', 'obsidian', undefined]); // memory note: no app
   assert.equal(b.activity.turns.length, 371);
   assert.equal(b.activity.turns[370], 6);
@@ -135,6 +136,7 @@ test('buildBrain: per-app counts, node app, unmapped GitHub repos under one hub;
   assert.deepEqual([ghHubs.length, new Set(ghHubs).size], [3, 1]);
   assert.deepEqual(b.nodes.find((n) => n.id === 'source:6')!.xyz, [999, 999, 999]);
   assert.ok(!pb.nodes.some((n) => n.xyz?.[0] === 999), 'public: a fresh spot by the GitHub hub, not the shared pin');
+  assert.ok(pb.nodes.some((n) => String(n.xyz) === '777,777,777'), 'public keys unchanged: a non-cloned repo keeps its pin');
   // semantic layout: every node with vectors (none for the unembedded note); public GitHub items get none (see hubOf)
   assert.deepEqual(b.nodes.filter((n) => n.type !== 'project' && !n.s).map((n) => n.id), ['source:7']);
   assert.deepEqual(pb.nodes.filter((n) => n.type !== 'project' && n.s).map((n) => n.a), ['claude', 'claude', 'codex', undefined]);

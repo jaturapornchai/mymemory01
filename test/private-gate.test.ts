@@ -250,6 +250,10 @@ test('a Claude chat shown a Claude-only hit is Claude-only too: its answers, sum
       for (const k of ['subamarker', 'mainamarker', 'mainbmarker', 'subbmarker']) assert.equal(out.includes(k), sees, `${name} ${k}`);
     } finally { await m.close(); }
   }
+  // both on disk, main indexed first and alone (ingest order; the subagent's commit may come later or never): hidden from its own commit
+  file('cs-e', true, chat('cs-e', priv, 'subemarker'));
+  await indexFile(db, file('cs-e', false, chat('cs-e', null, 'mainemarker')));
+  assert.deepEqual((await db.query(`SELECT kind || ' ' || coalesce(hide_as, '-') f FROM sources WHERE session_id = 'cs-e'`)).rows.map((r) => r.f), ['main google-timeline']);
 });
 
 test('a rewritten source that gains a turn in front: kept chunks follow their turn (memory_get reads the right one)', async () => {
@@ -263,4 +267,34 @@ test('a rewritten source that gains a turn in front: kept chunks follow their tu
   const rows = (await db.query(`SELECT c.turn_uuid, t.uuid FROM chunks c JOIN sources s ON s.id = c.source_id AND s.path = $1
     LEFT JOIN turns t ON t.source_id = c.source_id AND t.seq = c.seq_from ORDER BY c.seq_from`, [path])).rows;
   assert.deepEqual(rows.map((r) => [r.turn_uuid, r.uuid]), [['rn-new', 'rn-new'], ['rn-a', 'rn-a'], ['rn-b', 'rn-b']]);
+});
+
+test('synapses: linked lines and memory_related never show or relay through a Claude-only source', async () => {
+  await guard();
+  // control chat A — Claude-only G (Gmail), T (Maps timeline), H (a Claude chat flagged above) — visible B; A — visible V
+  await index('zcode', 'zc-b', 'main', ROOT, 'relaytarget zebra note');
+  await index('zcode', 'zc-v', 'main', ROOT, 'visiblelinked zebra note');
+  const [A, B, V, G, T] = ['zc-1', 'zc-b', 'zc-v', 'gmail:t1', 'google-timeline'].map((k) => ids[k].source);
+  const H = (await db.query(`SELECT id::text FROM sources WHERE hide_as IS NOT NULL ORDER BY id LIMIT 1`)).rows[0].id;
+  for (const [x, y, k] of [[A, H, 'prov'], [A, T, 'next'], [G, B, 'prov'], [H, B, 'spawn'], [T, B, 'next'], [A, V, 'next']]) {
+    await db.query(`INSERT INTO edges (a, b, kind, w) VALUES (least($1::bigint, $2::bigint), greatest($1::bigint, $2::bigint), $3, 1)`, [x, y, k]);
+  }
+  const hiddenIds = (await db.query(`SELECT c.id FROM chunks c JOIN sources s ON s.id = c.source_id WHERE coalesce(s.hide_as, s.tool) = ANY($1)`,
+    [['google', 'google-timeline']])).rows.map((r) => r.id); // full ids: an earlier test gave a hidden and a visible chunk one 8-char prefix
+  const PRIV = /gmail marker|timeline marker|ไอซ์แลนด์|subamarker|mainamarker|mainbmarker|subbmarker|getmarker|relaytarget|Gmail|Google/;
+  const env = { MEMHUB_ASSOC: '1', MEMHUB_ASSOC_THETA: '0.01' };
+  const m = await mcp('codex-mcp-client', env);
+  try {
+    const q = { query: WORD, limit: 8 };
+    const out = { first: await m.call('memory_search', q),
+      brief: await m.call('memory_search', { ...q, detail: 'brief' }), related: await m.call('memory_related', { id: ids['zc-1'].chunk }) };
+    assert.match(out.first, /⇢ linked \[[0-9a-f]{16}\] [^\n]*visiblelinked/, 'the channel works for codex through visible synapses');
+    for (const [k, v] of Object.entries(out)) {
+      assert.doesNotMatch(v, PRIV, k);
+      for (const p of hiddenIds) assert.ok(!v.includes(p), `${k}: hidden id ${p}`);
+    }
+  } finally { await m.close(); }
+  // control: Claude on Anthropic may see the hidden nodes, so B is reachable through them
+  const c = await mcp('claude-code', env);
+  try { assert.match(await c.call('memory_related', { id: ids['zc-1'].chunk }), /linked ⇢\n[^]*relaytarget/); } finally { await c.close(); }
 });

@@ -1,4 +1,4 @@
-// brain-stats: the export's big-picture numbers (counts and sizes only) on a throwaway schema per run (never public).
+// brain-stats: the export's big-picture numbers (counts and sizes only) on a throwaway schema per run (never public); also buildBrain's synapse edges.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -101,4 +101,63 @@ test('brainStats: no ms column (older schema), no archive, no vectors → those 
   for (const k of ['timed7d', 'p50ms', 'p95ms', 'rawBytes', 'rawFiles', 'dims']) assert.equal(stats[k], undefined, k);
   assert.equal(model, undefined);
   assert.equal(stats.ghRepos, 3);
+});
+
+test('buildBrain: synapses from the edges table (prov/next/coaccess, any subset), none to a hide_as session; recalls count by turn', async () => {
+  await guard();
+  const { buildBrain } = await import('../src/brain.ts');
+  const ids: number[] = [];
+  for (const sid of ['syn-1', 'syn-2', 'syn-3']) {
+    const id = await source('claude', sid, 'D:/work/syn', [['2026-03-06T00:00:00Z', 'x']]);
+    // one turn in two chunks: a recall of it is still one use
+    for (const k of [1, 2]) await db.query(`INSERT INTO chunks (id, source_id, turn_uuid, seq_from, seq_to, session_id, ts, ctx_header, text, words, bigrams, chunker_ver)
+      VALUES ($1, $2, $3, 0, 0, $4, now(), '', 'x', ''::tsvector, ''::tsvector, 't')`, [`${sid}-k${k}`, id, `${sid}-0`, sid]);
+    ids.push(id);
+  }
+  const [s1, s2, s3] = ids;
+  await db.query(`UPDATE sources SET hide_as = 'google' WHERE id = $1`, [s3]);
+  const edge = (a: number, b: number, kind: string, w = 1) =>
+    db.query(`INSERT INTO edges (a, b, kind, w) VALUES (least($1::bigint, $2::bigint), greatest($1::bigint, $2::bigint), $3, $4)`, [a, b, kind, w]);
+  await edge(s1, s2, 'prov');
+  await edge(s1, s3, 'next'); // hidden endpoint
+  await edge(s2, s3, 'coaccess', 0.5); // hidden endpoint
+  await edge(s1, s2, 'spawn'); // brain.ts derives spawn itself: never read from edges
+  // a recall logged under a chunk id that a re-chunk has since replaced: found by its turn
+  await db.query(`INSERT INTO access_log (ts, kind, chunk_id, turn_uuid, rank) VALUES (now(), 'get', 'gone', 'syn-1-0', 1)`);
+  const syn = async () => {
+    const b = await buildBrain(db, 'local');
+    const mine = new Set(ids.map((i) => `source:${i}`));
+    return { b, links: b.links.filter((l) => mine.has(l.source) && mine.has(l.target)).map((l) => [l.k, l.source, l.target, l.w].join()).sort() };
+  };
+  let { b, links } = await syn();
+  assert.deepEqual(links, [['prov', `source:${s1}`, `source:${s2}`, 1].join()]);
+  assert.equal(b.nodes.find((n) => n.id === `source:${s1}`)?.u, 1);
+  assert.ok(b.events.some((e) => e[1] === `source:${s1}` && e[2] === 'recall'), 'the re-chunked recall still glows');
+  assert.equal(b.nodes.find((n) => n.id === `source:${s3}`)?.a, 'claude'); // the hidden session is still a node (counts only)
+  await edge(s1, s2, 'next');
+  ({ links } = await syn());
+  assert.deepEqual(links, [['next', `source:${s1}`, `source:${s2}`, 1].join(), ['prov', `source:${s1}`, `source:${s2}`, 1].join()]);
+});
+
+test('buildBrain public: no synapse from a GitHub item out of the GitHub hub (it would name a cloned repo\'s project alias)', async () => {
+  await guard();
+  const { buildBrain } = await import('../src/brain.ts');
+  const chunked = async (tool: string, sid: string) => {
+    const id = await source(tool, sid, 'D:/work/cloned', [['2026-03-07T00:00:00Z', 'x']]);
+    await db.query(`INSERT INTO chunks (id, source_id, turn_uuid, seq_from, seq_to, session_id, ts, ctx_header, text, words, bigrams, chunker_ver)
+      VALUES ($1, $2, $1, 0, 0, $3, '2026-03-07T00:00:00Z', '', 'x', ''::tsvector, ''::tsvector, 't')`, [`${sid}-0`, id, sid]);
+    return id;
+  };
+  const [s, g1, g2] = [await chunked('claude', 'gh-sess'), await chunked('github', 'gh-1'), await chunked('github', 'gh-2')];
+  for (const [a, b] of [[s, g1], [g1, g2]]) {
+    await db.query(`INSERT INTO edges (a, b, kind, w) VALUES (least($1::bigint, $2::bigint), greatest($1::bigint, $2::bigint), 'coaccess', 0.5)`, [a, b]);
+  }
+  const gh = (b: Awaited<ReturnType<typeof buildBrain>>) => {
+    const isGh = new Set(b.nodes.filter((n) => n.a === 'github').map((n) => n.id));
+    return b.links.filter((l) => l.k === 'coaccess').map((l) => [isGh.has(l.source), isGh.has(l.target)].sort().join());
+  };
+  // local too: both maps show the same synapses
+  assert.deepEqual(gh(await buildBrain(db, 'local')), ['true,true']);
+  process.env.MEMHUB_PUBLIC_SALT ??= 'test-salt'; // never append one to the real .env
+  assert.deepEqual(gh(await buildBrain(db, 'public')), ['true,true']);
 });

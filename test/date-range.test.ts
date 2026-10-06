@@ -2,7 +2,7 @@
 // stay hidden, and the vector leg keeps its HNSW index. Own throwaway schema + temp vault per run, no Ollama needed.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,12 +47,10 @@ async function privateSource(tool: string, sessionId: string) {
   assert.equal(await indexToolFile(db, { tool, sync: () => ({}), isTranscript: () => true, parse } as never, path), 'indexed');
 }
 
-function fact(fid: string, mtime: string) {
-  const at = new Date(mtime).toISOString();
+/** Fact chunk ts = its earliest cited turn, else created_at (obsidian.indexVault), never the file's mtime. */
+function fact(fid: string, created: string, uuids: string[]) {
   writeNote(`facts/demo/${fid}.md`, { memhub: 'fact', id: fid, kind: 'fact', scope: 'project', project: 'd:/demo', status: 'active', importance: '5',
-    valid_at: at, created_at: at, source_uuids: ['dr0-u'], md5: md5(fid), run: 'r1' }, `${WORD} fact ${fid}\n`);
-  const p = join(MEMORY_VAULT, 'facts', 'demo', `${fid}.md`);
-  utimesSync(p, new Date(mtime), new Date(mtime)); // fact chunk ts = note mtime (obsidian.indexVault)
+    valid_at: created, created_at: created, source_uuids: uuids, md5: md5(fid), run: 'r1' }, `${WORD} fact ${fid}\n`);
 }
 
 before(async () => {
@@ -63,8 +61,8 @@ before(async () => {
   for (const [i, ts] of DAYS.entries()) await chat(i, ts);
   await privateSource('google', 'gmail:dr');
   await privateSource('google-timeline', 'google-timeline');
-  fact('Fe0000001', '2026-09-14T05:00:00Z'); // in range; its source chat dr0 (09-10) is not
-  fact('Fe0000002', '2026-09-24T05:00:00Z'); // after the range
+  fact('Fe0000001', '2026-09-30T05:00:00Z', ['dr1-u', 'dr3-u']); // dated by dr1 (09-15, in range); its other source chat dr3 (09-20) is not
+  fact('Fe0000002', '2026-09-24T05:00:00Z', ['gone-u']); // no cited turn left → created_at, after the range
   await guard();
   await indexVault(db, MEMORY_VAULT);
   await db.query(`UPDATE chunks SET embedding = $1::halfvec`, [FAKE_VEC]); // every chunk equally similar to FAKE_VEC
@@ -132,7 +130,7 @@ test('since + until = one day; fact notes and their source chats (↳) obey the 
   const r = await search(spy().db, WORD, { semantic: false, since: '2026-09-11', until: '2026-09-16', limit: 8 });
   assert.ok(inRange(r.hits, '2026-09-10T17', '2026-09-16T17'), stamps(r.hits));
   assert.deepEqual(r.hits.filter((h) => h.fid).map((h) => h.fid), ['Fe0000001']); // Fe0000002 (09-24) is out
-  assert.ok(!all(r.hits).some((h) => h.ts?.toISOString().startsWith('2026-09-10')), 'its source chat (09-10) is not attached');
+  assert.ok(!all(r.hits).some((h) => h.ts?.toISOString().startsWith('2026-09-20')), 'its source chat dr3 (09-20) is not attached');
 });
 
 test('a date range never brings back Claude-only sources (hide filter in every leg); Claude sees them', async () => {

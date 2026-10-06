@@ -1,10 +1,27 @@
-// node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
-import { randomBytes } from 'node:crypto';
+// node src/cli.ts <init|migrate [--force]|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
 const [cmd, ...args] = process.argv.slice(2);
+
+// health:<job> in state = last run ok / failed (+ redacted first line of the error): SessionStart warns when a job failed or
+// went stale (session-start.ts). Never fails the job; the job's exit code stays its own. A run skipped by a lock keeps the previous
+// row (a hung job holding the lock must still go stale); a sync with a failed source records jobErr.
+let skipped = false, jobErr: Error | undefined;
+const JOB = cmd === 'dream' ? (args.includes('--consolidate') ? 'consolidate' : 'dream') : ['sync', 'lint', 'daily', 'embed'].includes(cmd) ? cmd : '';
+async function health(db: { query: (q: string, p: unknown[]) => Promise<unknown> }, job: string, e?: unknown) {
+  if (!job) return;
+  const { redact, redactPersonal } = await import('./redact.ts');
+  // every app sees it: from a local path (Windows user name; vault note names carry titles, with spaces) to the end of the
+  // line, and any quoted string holding a slash → <path>
+  const msg = String((e as Error)?.message ?? e).trim().split('\n')[0].replace(/(?:\b[A-Za-z]:[\\/]|\\\\|\/(?:home|Users)\/|~[\\/]).*$/, '<path>')
+    .replace(/(['"`])[^'"`]*[\\/][^'"`]*\1/g, '<path>');
+  const err = e === undefined ? {} : { err: redact(redactPersonal(msg).text).text.slice(0, 120) };
+  await db.query(`INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+    [`health:${job}`, { ok: e === undefined, at: new Date().toISOString(), ...err }]).catch(() => {});
+}
 
 if (cmd === 'init') {
   const env = join(ROOT, '.env');
@@ -75,9 +92,13 @@ if (cmd === 'lint') {
   // lint [--dry]: nightly report-only checks → hubs/_lint.md (--dry prints instead). Reads the DB with the read-only role.
   const { connect } = await import('./db.ts');
   const db = connect('ro');
+  let err: unknown;
   try { console.log(await (await import('./lint.ts')).runLint(db, { dry: args.includes('--dry') })); }
-  catch (e) { console.error(`lint: ${(e as Error).message}`); process.exitCode = 1; }
+  catch (e) { err = e; console.error(`lint: ${(e as Error).message}`); process.exitCode = 1; }
   finally { await db.end(); }
+  const rw = connect('rw'); // lint itself stays read-only; only its health row is written
+  await health(rw, JOB, err);
+  await rw.end();
   process.exit();
 }
 
@@ -85,19 +106,36 @@ const { connect } = await import('./db.ts');
 const db = connect('rw');
 try {
   if (cmd === 'migrate') {
-    await db.query(readFileSync(join(ROOT, 'sql', 'schema.sql'), 'utf8'));
-    console.log('schema ok');
+    // hourly runs this first: ALTER … IF NOT EXISTS still queues an exclusive lock, so give up after 2 s instead of stalling searches
+    const sql = readFileSync(join(ROOT, 'sql', 'schema.sql'), 'utf8');
+    const sha = createHash('sha256').update(sql).digest('hex');
+    // every ALTER queues ACCESS EXCLUSIVE even when IF NOT EXISTS makes it a no-op, so skip an unchanged schema (fresh DB: no state table → run)
+    // the stamp names its schema: an empty scratch schema on the search_path must not read public's stamp as its own
+    const done = !args.includes('--force') && (await db.query(`SELECT v->>'sha' sha FROM state WHERE k = 'schema' AND v->>'schema' = current_schema()`)
+      .catch(() => ({ rows: [] }))).rows[0]?.sha === sha;
+    if (!done) {
+      await db.query(`SET lock_timeout = '2s';\n${sql}`); // one simple query = one connection: a separate SET may land on another
+      await db.query(`INSERT INTO state (k, v) VALUES ('schema', jsonb_build_object('sha', $1::text, 'schema', current_schema(), 'at', now()))
+        ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [sha]);
+    }
+    console.log(done ? 'schema ok (unchanged)' : 'schema ok');
   } else if (cmd === 'sync' || cmd === 'import') {
     // One at a time: a long first import must not overlap the hourly run (two appenders would corrupt an archive file).
     const lock = await db.connect();
     try {
-      if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext('memhub-sync')) ok`)).rows[0].ok) console.log(`${cmd}: another sync/import is running, skipped`);
+      if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext(current_schema() || ':memhub-sync')) ok`)).rows[0].ok) {
+        skipped = true;
+        console.log(`${cmd}: another sync/import is running, skipped`);
+      }
       else {
         const imp = await import('./importer.ts');
         const t0 = Date.now();
         if (args.includes('--google-full')) process.env.MEMHUB_GOOGLE_FULL = '1'; // every matching Gmail thread / Drive file, not just new ones
         if (cmd === 'sync') {
-          console.log('archive', JSON.stringify(imp.syncArchive()));
+          const a = imp.syncArchive();
+          console.log('archive', JSON.stringify(a));
+          // generic text: every app sees the line, so it names no tool or account
+          if (imp.syncFailed(a.tools)) jobErr = new Error('บาง source นำเข้าไม่สำเร็จ ดู logs/hourly.log');
           const t = await import('./tools/google-timeline.ts');
           const stale = t.staleWarning(t.dataAgeDays(join(imp.ARCHIVE_ROOT, t.tool))); // hourly.log: the phone export is getting old
           if (stale) console.log(stale);
@@ -106,11 +144,22 @@ try {
         const force = args.includes('--force');
         console.log('index', file ? await imp.indexFile(db, file, force) : await imp.indexArchive(db, force), `${Date.now() - t0} ms`);
         if (!file) console.log('vaults', await (await import('./obsidian.ts')).indexVaults(db));
-        if (!file) await (await import('./search.ts')).refreshTermDf(db);
-        console.log('embedded', await (await import('./embed.ts')).backfill(db).catch((e) => `skipped: ${e.message}`));
+        // a deleted / moved note or re-imported file leaves its brain-map pins behind: one sweep per hour
+        if (!file) console.log('pins pruned', await (await import('./layout.ts')).prunePins(db));
+        if (!file) {
+          await (await import('./search.ts')).refreshTermDf(db);
+          // a failed rebuild (the nightly holds its lock past the timeout) must not skip this hour's embeddings
+          console.log('synapses', await (await import('./synapse.ts')).rebuildSynapses(db, { structural: true }).then(JSON.stringify, (e) => `failed: ${e.message}`));
+        }
+        // Ollama down = search silently keyword-only: recorded as health:embed (SessionStart warns), the sync itself goes on
+        const { backfill } = await import('./embed.ts');
+        let emb: unknown;
+        try { emb = await backfill(db); await health(db, 'embed'); }
+        catch (e) { emb = `skipped: ${(e as Error).message}`; await health(db, 'embed', e); }
+        console.log('embedded', emb);
       }
     } finally {
-      await lock.query(`SELECT pg_advisory_unlock(hashtext('memhub-sync'))`).catch(() => {});
+      await lock.query(`SELECT pg_advisory_unlock(hashtext(current_schema() || ':memhub-sync'))`).catch(() => {});
       lock.release();
     }
   } else if (cmd === 'ingest') {
@@ -122,7 +171,9 @@ try {
     const files = [live, ...(existsSync(subDir) ? readdirSync(subDir, { recursive: true, encoding: 'utf8' }).map((f) => join(subDir, f)) : [])]
       .filter((f) => f.endsWith('.jsonl'));
     try {
-      for (const f of files) { imp.syncOne(f); await imp.indexFile(db, imp.archivePath(f)); }
+      for (const f of files) imp.syncOne(f);
+      const arch = files.map(imp.archivePath), hideAs = await imp.sessionHideAs(db, arch); // before any commit: see sessionHideAs
+      for (const f of arch) await imp.indexFile(db, f, false, hideAs);
       await (await import('./embed.ts')).backfill(db, 8, () => {}).catch(() => 0); // Ollama down → vectors filled by next import
     } catch (e) {
       appendFileSync(join(ROOT, 'ingest.log'), `${new Date().toISOString()} ${live}: ${(e as Error).message}\n`);
@@ -178,7 +229,7 @@ try {
     for (const [k, xs] of [['retired (note deleted)', r.retired], ['kept, provenance trimmed', r.trimmed], ['kept: edited by you, see hubs/_review.md', r.review], ['daily notes you edited (may still quote it)', r.daily]] as const)
       if (xs.length) console.log(`${k}: ${xs.length}\n${xs.map((x) => `  ${x}`).join('\n')}`);
   } else if (cmd === 'dream') {
-    // dream [--runner claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, co-access, hubs)
+    // dream [--runner claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, synapses, hubs)
     const d = await import('./dream.ts');
     const opt = (k: string) => (args.includes(k) ? args[args.indexOf(k) + 1] : undefined);
     if (args.includes('--consolidate')) {
@@ -193,6 +244,7 @@ try {
       const dir = join(ROOT, 'tmp', 'dream', run);
       const r = await d.dream(db, { run, force: args.includes('--force'), limit: Number(opt('--limit')) || undefined,
         llm: runner === 'files' ? d.filesRunner(dir) : d.claudeRunner() });
+      if (r.status === 'locked') skipped = true;
       console.log(JSON.stringify({ run, status: r.status, stats: r.stats }));
       if (r.pending) console.log(`pending requests (answer each <id>.request.json with <id>.result.json, then rerun):\n${r.pending.map((p) => join(dir, `${p}.request.json`)).join('\n')}`);
     }
@@ -331,9 +383,22 @@ try {
     const r = await db.query(`SELECT (SELECT count(*) FROM sources) sources, (SELECT count(*) FROM turns) turns,
       (SELECT count(*) FROM chunks) chunks, (SELECT pg_size_pretty(pg_database_size('memhub'))) db_size`);
     console.table(r.rows);
+  } else if (cmd === 'mute') {
+    // mute [-]<fid>…: keep facts/cards out of SessionStart, still searchable; -<fid> = unmute. One state row per fid: a re-index
+    // never loses it and no note is touched. memory_save mute runs this (the MCP server only holds the read-only role).
+    const fids = args.filter((a) => /^-?[FSI][0-9a-f]{8}$/.test(a));
+    const on = fids.filter((f) => f[0] !== '-'), un = fids.filter((f) => f[0] === '-').map((f) => f.slice(1));
+    if (on.length) await db.query(`INSERT INTO state (k, v) SELECT 'mute:' || f, jsonb_build_object('at', now()) FROM unnest($1::text[]) f
+      ON CONFLICT (k) DO NOTHING`, [on]);
+    if (un.length) await db.query(`DELETE FROM state WHERE k = ANY($1::text[])`, [un.map((f) => `mute:${f}`)]);
+    console.log(`muted: ${on.join(' ') || '-'} · unmuted: ${un.join(' ') || '-'}`);
   } else {
-    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|brain [--public] [--out file]|brain-serve [--port n]|publish [--build] [--force]>');
+    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|brain [--public] [--out file]|brain-serve [--port n]|publish [--build] [--force]|mute [-]<fid>...>');
   }
+  if (!skipped) await health(db, JOB, jobErr);
+} catch (e) {
+  await health(db, JOB, e); // e.g. the dream's "OAuth session expired" from claude -p
+  throw e;
 } finally {
   await db.end();
 }

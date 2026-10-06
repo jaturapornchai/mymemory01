@@ -100,3 +100,15 @@ export function addAdjacency(adj: Map<string, number[]>, source: string, target:
     else adj.set(id, [v]);
   }
 }
+
+/** 1-hop neighbours of the `from` nodes (id → amp) over live links of `kinds` → the strongest amp reaching each; nodes in `skip` are left out. */
+export function echoOf(adj: Map<string, number[]>, links: readonly Slot<{ source: string; target: string; k: string }>[], kinds: ReadonlySet<string>,
+  from: ReadonlyMap<string, number>, skip: { has(id: string): boolean }): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [id, amp] of from) for (const v of adj.get(id) ?? []) {
+    const l = links[Math.abs(v) - 1];
+    const nb = v > 0 ? l.item.target : l.item.source;
+    if (l.live && kinds.has(l.item.k) && !skip.has(nb)) out.set(nb, Math.max(out.get(nb) ?? 0, amp));
+  }
+  return out;
+}

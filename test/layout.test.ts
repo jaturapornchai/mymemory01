@@ -48,6 +48,17 @@ test('relax: adding nodes moves pinned ones by exactly 0; new ones land near the
   }
 });
 
+test('relax: prov/next links (strength 0) never move a node, on a first bake or an incremental one', () => {
+  const synapses = (links: LayoutLink[], keys: string[]): LayoutLink[] => [...links, ...keys.slice(1).flatMap((k, i): LayoutLink[] =>
+    [{ source: keys[i], target: k, k: 'next', w: 1 }, { source: k, target: keys[(i * 7) % keys.length], k: 'prov', w: 1 }])];
+  const g = graph(), keys = g.nodes.filter((n) => n.key.split('-').length === 2).map((n) => n.key); // sessions
+  const first = relax(g.nodes, g.links, 300);
+  assert.deepEqual([...relax(g.nodes, synapses(g.links, keys), 300)], [...first]);
+  const g2 = graph(2), pinned = g2.nodes.map((n) => ({ ...n, pin: first.get(n.key) }));
+  const keys2 = g2.nodes.filter((n) => n.key.split('-').length === 2).map((n) => n.key);
+  assert.deepEqual([...relax(pinned, synapses(g2.links, keys2), 60)], [...relax(pinned, g2.links, 60)]);
+});
+
 test('relax: 0 ticks with everything pinned returns the pins', () => {
   const nodes: LayoutNode[] = [{ key: 'project:a', t0: 1, pin: [1, -2, 3] }, { key: 'source:1', t0: 2, parent: 'project:a', pin: [4, 5, -6] }];
   assert.deepEqual([...relax(nodes, [], 0)], [['project:a', [1, -2, 3]], ['source:1', [4, 5, -6]]]);

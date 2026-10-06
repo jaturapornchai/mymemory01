@@ -1,5 +1,5 @@
 // Dream: distil finished AI sessions (every app: sources.tool except obsidian) into session cards + facts (notes in the
-// memory-hub vault), reconcile new facts with existing ones (ADD / NOOP / UPDATE / SUPERSEDE, never delete), then rebuild Hebbian co-access edges and hub notes.
+// memory-hub vault), reconcile new facts with existing ones (ADD / NOOP / UPDATE / SUPERSEDE, never delete), then rebuild the synapses (synapse.ts) and hub notes.
 // LLM = Claude only (claude -p with Anthropic auth, or answered by Claude agents through request/result files).
 // Design + sources: docs/research/phase4-design.md §3–5.
 import { spawn } from 'node:child_process';
@@ -12,9 +12,10 @@ import { ROOT } from './db.ts';
 import { backfill } from './embed.ts';
 import { offsiteBackend } from './guard.ts';
 import { projectName } from './importer.ts';
-import { fileName, type Fm, fmStr, isEdited, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
+import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { search } from './search.ts';
+import { rebuildSynapses } from './synapse.ts';
 import { beforeMachineWrite, commitBatch } from './vault-git.ts';
 
 export const RUNS_DIR = process.env.MEMHUB_DREAM_RUNS ?? join(homedir(), 'ai-archive', 'raw', 'memhub-dream');
@@ -235,7 +236,7 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
   const stats: DreamStats = { sessions: 0, batches: 0, cards: 0, proposed: 0, rejected_ids: 0, dropped: 0, ADD: 0, NOOP: 0, UPDATE: 0, SUPERSEDE: 0, pending_review: 0, kept_user_edit: 0 };
   const lock = await db.connect();
   try {
-    if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext('memhub-dream')) ok`)).rows[0].ok) return { status: 'locked', stats };
+    if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext(current_schema() || ':memhub-dream')) ok`)).rows[0].ok) return { status: 'locked', stats };
     // The plan (turn ranges + batches) is frozen per run id, so a files-runner run resumes with the same digests →
     // the same request ids, whatever ลุงจืด said in the meantime.
     const planKey = `dream:plan:${o.run}`;
@@ -299,7 +300,7 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
   } finally {
     // one vault commit per run, whatever path it left by (done / skipped / pending / error): all of it is machine work
     commitBatch(MEMORY_VAULT, `dream ${o.run}: +${stats.ADD} ADD, ${stats.UPDATE} UPDATE, ${stats.SUPERSEDE} SUPERSEDE`);
-    await lock.query(`SELECT pg_advisory_unlock(hashtext('memhub-dream'))`).catch(() => {});
+    await lock.query(`SELECT pg_advisory_unlock(hashtext(current_schema() || ':memhub-dream'))`).catch(() => {});
     lock.release();
   }
 }
@@ -483,10 +484,10 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
 
 // ---------------- nightly consolidation (no LLM) ----------------
 
-/** Approvals, Hebbian co-access rebuild, hub + review notes. Safe to run every night. */
+/** Approvals, synapse rebuild ('sleep': structural kinds + co-access with downscaling, synapse.ts), hub + review notes. Safe to run every night. */
 export async function consolidate(db: pg.Pool, now = new Date()) {
   await applyApprovals(db, now);
-  await rebuildCoaccess(db);
+  await rebuildSynapses(db, { structural: true, plastic: true, now });
   await writeHubs(db);
 }
 
@@ -506,25 +507,6 @@ async function applyApprovals(db: pg.Pool, now: Date) {
   if (changed) { await indexVault(db, MEMORY_VAULT); await resolveLinks(db); }
 }
 
-/**
- * Hebbian co-access, recomputed from access_log (never cascaded, so idempotent and cheap): two different sources both
- * opened (get/related) in one MCP session within 30 min, once per session; w = min(1, Σ 0.1·0.995^age_days).
- */
-export async function rebuildCoaccess(db: pg.Pool) {
-  await db.query(`BEGIN; DELETE FROM edges WHERE kind = 'coaccess';
-    INSERT INTO edges (a, b, kind, w, updated_at)
-    SELECT a, b, 'coaccess', least(1, sum(0.1 * power(0.995, extract(epoch FROM now() - at) / 86400))), max(at)
-    FROM (
-      SELECT x.session, least(x.src, y.src) a, greatest(x.src, y.src) b, max(greatest(x.ts, y.ts)) at
-      FROM (SELECT DISTINCT a.session, a.ts, c.source_id src FROM access_log a JOIN chunks c ON c.turn_uuid = a.turn_uuid
-            WHERE a.kind IN ('get', 'related')) x
-      JOIN (SELECT DISTINCT a.session, a.ts, c.source_id src FROM access_log a JOIN chunks c ON c.turn_uuid = a.turn_uuid
-            WHERE a.kind IN ('get', 'related')) y
-        ON y.session = x.session AND x.src < y.src AND abs(extract(epoch FROM x.ts - y.ts)) <= 1800
-      GROUP BY 1, 2, 3) per_session
-    GROUP BY a, b HAVING sum(0.1 * power(0.995, extract(epoch FROM now() - at) / 86400)) >= 0.01;
-    COMMIT;`);
-}
 
 /** SQL on `facts f`: no cited turn is indexed any more (forgotten / gone). obs: = a note citing itself, not a chat. */
 export const ORPHAN = `NOT EXISTS (SELECT 1 FROM unnest(f.source_uuids) u WHERE u LIKE 'obs:%' OR EXISTS (SELECT 1 FROM turns t WHERE t.uuid = u))`;
@@ -546,7 +528,7 @@ export async function retireForgotten(db: pg.Pool, facts: { fid: string; path: s
       const { fm, body } = parseNote(readFileSync(file, 'utf8'));
       // = existingFacts' "hand", + owned (indexFact's user_owned): a NOOP never adds provenance to an owned fact, so a rule he
       // restated in later chats still cites only the first one; deleting it would tombstone the rule for good → _review instead
-      const hand = isEdited(fm, body) || fmStr(fm.pinned) === 'true' || !fmStr(fm.run) || ['rule', 'feedback'].includes(fmStr(fm.kind)) || fmStr(fm.owner) === 'user';
+      const hand = isHis(fm, body);
       const label = `${f.fid} ${basename(rel, '.md')}`;
       if (!f.keep.length && !hand) {
         beforeMachineWrite(MEMORY_VAULT, rel); // vault history: this deletion is the forget commit, not "ลุงจืด แก้เอง"

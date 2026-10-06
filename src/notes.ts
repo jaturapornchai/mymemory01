@@ -66,6 +66,9 @@ export const fmList = (v: string | string[] | undefined) => (Array.isArray(v) ? 
 
 /** Body edited by ลุงจืด (or never machine-written)? */
 export const isEdited = (fm: Fm, body: string) => !fm.body_sha || fm.body_sha !== sha(body);
+/** ลุงจืด's note, read from the file (an edit not indexed yet counts): edited, pinned, not dream-written, rule/feedback, owner user. */
+export const isHis = (fm: Fm, body: string) =>
+  isEdited(fm, body) || fmStr(fm.pinned) === 'true' || !fmStr(fm.run) || ['rule', 'feedback'].includes(fmStr(fm.kind)) || fmStr(fm.owner) === 'user';
 
 export type WriteResult = 'written' | 'unchanged' | 'kept-user-edit';
 
@@ -95,27 +98,44 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
 
 export const projectSlug = (project?: string | null) => (project ? fileName(project.split('/').filter(Boolean).at(-1) ?? project, 40) : '_global');
 
-/** memory_save: ลุงจืด asked to remember → a user-owned fact note (redacted), indexed in the background. */
-export function saveNote(content: string, opts: { title?: string; project?: string; kind?: string; global?: boolean; client?: string; now?: Date } = {}) {
+/** memory_save: ลุงจืด asked to remember → a user-owned fact note (redacted), indexed in the background. replaces (mcp.ts):
+ *  supersede = AI-owned notes it corrects, made OLD at once as the dream does; review = fid of his own note it would replace →
+ *  this note is saved pending with review_target (hubs/_review.md: he sets it active = accept, consolidate applies it).
+ *  A pending note supersedes nothing yet (else neither would be current); the same text already active stays active. */
+export function saveNote(content: string, opts: { title?: string; project?: string; kind?: string; global?: boolean; client?: string; now?: Date;
+  supersede?: string[]; review?: string } = {}) {
   const now = opts.now ?? new Date();
   const text = clean(content).trim();
-  const fid = 'F' + md5(text).slice(0, 8);
+  const fid = noteFid(content);
   const scope = opts.global || !opts.project ? 'global' : 'project';
   const rel = `facts/${scope === 'global' ? '_global' : projectSlug(opts.project)}/${fid} ${fileName(opts.title || text.split('\n')[0], 40)}.md`;
   const path = join(MEMORY_VAULT, rel);
-  const body = `${text}\n`;
+  // the same text again keeps what the note already has: its status (a pending note stays pending until he approves it),
+  // kind, importance and dates (a rule re-saved without kind stays a rule)
+  const old = existsSync(path) ? parseNote(readFileSync(path, 'utf8')).fm : undefined;
+  const status = old ? fmStr(old.status) || 'active' : opts.review ? 'pending' : 'active';
+  const review = old ? '' : opts.review ?? '';
+  const sup = status === 'active' ? opts.supersede ?? [] : [];
+  // the dream's "- supersedes:: [[old]]" (link edges / synapses); fid and md5 come from the text alone
+  const body = `${text}\n${sup.length ? `\n${sup.map((r) => `- supersedes:: [[${basename(r, '.md')}]]`).join('\n')}\n` : ''}`;
   try {
     writeNote(rel, {
-      memhub: 'fact', id: fid, kind: opts.kind ?? 'fact', scope, project: scope === 'global' ? '' : opts.project ?? '',
-      status: 'active', owner: 'user', importance: '8', valid_at: now.toISOString(), created_at: now.toISOString(),
+      memhub: 'fact', id: fid, kind: opts.kind ?? (fmStr(old?.kind) || 'fact'), scope, project: scope === 'global' ? '' : opts.project ?? '',
+      ...(old ? {} : { status, review_target: review }),
+      owner: 'user', importance: fmStr(old?.importance) || '8', valid_at: fmStr(old?.valid_at) || now.toISOString(), created_at: fmStr(old?.created_at) || now.toISOString(),
       source_uuids: [noteUuid(path)], tags: ['memhub/saved'], md5: md5(text), ...(opts.client ? { client: opts.client } : {}),
     }, body);
+    for (const r of sup) // ponytail: an edit by him in the ms since mcp.ts checked it = writeNote keeps it
+      writeNote(r, { status: 'superseded', superseded_by: fid, expired_at: now.toISOString(), invalid_at: now.toISOString() });
   } finally { // a failed write (EPERM on a locked note) must still close the batch, or this process never snapshots again
     commitBatch(MEMORY_VAULT, `memory_save (${opts.client ?? 'unknown'}): ${rel}`);
   }
   reindexSoon();
   return rel;
 }
+
+/** fid saveNote gives this content (same text = same note). */
+export const noteFid = (content: string) => 'F' + md5(clean(content).trim()).slice(0, 8);
 
 /** Index the memory vault in a detached rw process (the MCP server only holds the read-only role). */
 export function reindexSoon() {

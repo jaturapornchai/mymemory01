@@ -133,6 +133,9 @@ export function syncArchive() {
   }
   return { ...stats, tools };
 }
+/** A source's sync threw or stopped early (Google token refresh, rate limit): health:sync records a failure (cli.ts). */
+export const syncFailed = (tools: ReturnType<typeof syncArchive>['tools']) =>
+  Object.values(tools).some((v) => (typeof v === 'string' ? v.startsWith('failed') : 'stopped' in v));
 
 // ---------------- other AI apps ----------------
 
@@ -251,9 +254,9 @@ export async function store(db: pg.Pool, m: SourceMeta, turns: StoredTurn[], inT
          SELECT id, $1, tu, sf, st, $2, $3, NULLIF(t, '')::timestamptz, h, x, w::tsvector, bg::tsvector, $4
          FROM unnest($5::text[], $6::text[], $7::int[], $8::int[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[])
            AS v(id, tu, sf, st, t, h, x, w, bg)
-         ON CONFLICT (id) DO UPDATE SET turn_uuid = EXCLUDED.turn_uuid, seq_from = EXCLUDED.seq_from, seq_to = EXCLUDED.seq_to
-           WHERE chunks.source_id = EXCLUDED.source_id AND (chunks.turn_uuid, chunks.seq_from, chunks.seq_to)
-             IS DISTINCT FROM (EXCLUDED.turn_uuid, EXCLUDED.seq_from, EXCLUDED.seq_to)`, // a rewritten source (replace) renumbers its turns
+         ON CONFLICT (id) DO UPDATE SET turn_uuid = EXCLUDED.turn_uuid, seq_from = EXCLUDED.seq_from, seq_to = EXCLUDED.seq_to, ts = EXCLUDED.ts
+           WHERE chunks.source_id = EXCLUDED.source_id AND (chunks.turn_uuid, chunks.seq_from, chunks.seq_to, chunks.ts)
+             IS DISTINCT FROM (EXCLUDED.turn_uuid, EXCLUDED.seq_from, EXCLUDED.seq_to, EXCLUDED.ts)`, // a rewritten source (replace) renumbers its turns; a re-dated note (obsidian.ts) moves its ts
         [sourceId, m.sessionId, m.project, CHUNKER_VER, b.map((k) => k.id), b.map((k) => k.turnUuid), b.map((k) => k.seqFrom),
           b.map((k) => k.seqTo), b.map((k) => k.ts), b.map((k) => k.ctxHeader), b.map((k) => k.text),
           b.map((k) => toTsvector(words(`${k.ctxHeader}
@@ -271,7 +274,35 @@ ${k.text}`))), b.map((k) => bigramTsvector(bigramRuns(k.text)))],
   }
 }
 
-export async function indexFile(db: pg.Pool, path: string, force = false): Promise<'skip' | 'excluded' | 'indexed' | 'empty'> {
+/** Claude-only tool one of these memory-hub inputs/replies (parseClaude hub) showed a hit of, else null. */
+async function hideAsOf(db: pg.Pool, hub: string[]): Promise<string | null> {
+  // ids and the 8+ hex prefixes memory_get/timeline/related accept. ponytail: a hit re-chunked before this transcript is
+  // indexed no longer resolves; match its labels too if that shows up
+  const ids = [...new Set(hub.join('\n').match(/\b[0-9a-f]{8,16}\b/g) ?? [])].map((id) => `${id}%`);
+  return ids.length ? (await db.query(`SELECT s.tool FROM sources s JOIN chunks c ON c.source_id = s.id
+    WHERE s.tool = ANY($2::text[]) AND c.id LIKE ANY($1) LIMIT 1`, [ids, [...PRIVATE_TOOLS]])).rows[0]?.tool ?? null : null;
+}
+
+/** <dir>/<sid>.jsonl and every journal under <dir>/<sid>/subagents are one session: its key <dir>/<sid>. */
+const sessionDir = (path: string) => { const p = path.split(sep), i = p.indexOf('subagents'); return i > 0 ? p.slice(0, i).join(sep) : path.replace(/\.jsonl$/, ''); };
+
+/** hide_as for one session's files (main + subagents) indexed as a batch: a main that quotes its subagent's Claude-only
+ *  hit (no ids of its own) must not commit visible before that subagent does. Files already indexed have theirs in sources. */
+export async function sessionHideAs(db: pg.Pool, files: string[], force = false): Promise<string | null> {
+  if (files.length < 2) return null; // one file: indexFile's own scan
+  const old = new Map((await db.query('SELECT path, size, mtime_ms FROM sources WHERE path = ANY($1)', [files])).rows.map((r) => [r.path, r]));
+  const hub: string[] = [];
+  for (const f of files) {
+    const st = statSync(f), o = old.get(f);
+    if (!force && o && Number(o.size) === st.size && Number(o.mtime_ms) === Math.round(st.mtimeMs)) continue;
+    const raw = readFileSync(f, 'utf8');
+    if (raw.includes('__memory_')) parseClaude(raw, undefined, hub); // parseSubagent collects the same hub
+  }
+  return hideAsOf(db, hub);
+}
+
+/** shared = sessionHideAs of the batch this file is indexed with (undefined: scanned here, over its session's files). */
+export async function indexFile(db: pg.Pool, path: string, force = false, shared?: string | null): Promise<'skip' | 'excluded' | 'indexed' | 'empty'> {
   const st = statSync(path);
   const prev = await db.query('SELECT id, size, mtime_ms, sha256 FROM sources WHERE path = $1', [path]);
   const old = prev.rows[0];
@@ -299,11 +330,9 @@ export async function indexFile(db: pg.Pool, path: string, force = false): Promi
   const turns = msgs.map((m, i) => ({ uuid: m.uuid, parentUuid: m.parentUuid, seq: i, role: m.role, ts: m.ts, text: clean(m.text) }));
   // memory-hub showed this chat a Claude-only chunk (its id in a reply / a get) → its answers, /compact summaries and Agent
   // results may quote it: the whole session (main + subagents) is hidden wherever that tool is (sources.hide_as).
-  // ids and the 8+ hex prefixes memory_get/timeline/related accept. ponytail: a hit re-chunked before this transcript is
-  // indexed no longer resolves; match its labels too if that shows up
-  const ids = [...new Set(hub.join('\n').match(/\b[0-9a-f]{8,16}\b/g) ?? [])].map((id) => `${id}%`);
-  const hideAs: string | null = ids.length ? (await db.query(`SELECT s.tool FROM sources s JOIN chunks c ON c.source_id = s.id
-    WHERE s.tool = ANY($2::text[]) AND c.id LIKE ANY($1) LIMIT 1`, [ids, [...PRIVATE_TOOLS]])).rows[0]?.tool ?? null : null;
+  const dir = sessionDir(path);
+  const hideAs = (await hideAsOf(db, hub)) ?? (shared !== undefined ? shared
+    : await sessionHideAs(db, [`${dir}.jsonl`, ...walk(join(dir, 'subagents'))].filter((f) => f.endsWith('.jsonl') && existsSync(f)), force));
   await store(db, {
     tool: 'claude', path, kind: isSub ? 'subagent' : 'main', sessionId, project,
     size: st.size, mtimeMs: st.mtimeMs, sha256: hash, label: projectName(project), isSub, hideAs,
@@ -344,12 +373,17 @@ export async function forget(db: pg.Pool, what: 'session' | 'project', value: st
      FROM facts f JOIN sources s ON s.id = f.source_id
      WHERE f.session_ids && $2::text[] OR f.source_uuids && array(SELECT uuid FROM turns WHERE source_id = ANY($1::bigint[]))`,
     [doomed.map((s) => s.id), what === 'session' ? [v] : [...new Set(doomed.map((s) => s.session_id).filter(Boolean))]])).rows;
+  // its recalls (access_log; queries may quote it): by turn (stable across re-chunking), or by chunk for rows logged before
+  // turn_uuid. Only these: purging every row whose chunk id is gone also wiped the history of every re-chunked turn
+  const used = (await db.query(`SELECT array(SELECT uuid FROM turns WHERE source_id = ANY($1::bigint[])) turns,
+    array(SELECT id FROM chunks WHERE source_id = ANY($1::bigint[])) chunks`, [doomed.map((s) => s.id)])).rows[0];
   const r = await db.query(`DELETE FROM sources WHERE ${where} RETURNING id, project`, [v]);
   // and their layout pins (src/layout.ts): forgotten raw keys must not linger in state, and the pin store stays bounded
-  const pins = r.rows.flatMap((s) => [`source:${s.id}`, `source:${s.id}@github`]); // @github: a cloned repo's public spot (brain.ts)
-  if (what === 'project') pins.push(...new Set(r.rows.map((s) => `project:${s.project ?? '?'}`))); // ponytail: a session forget keeps its hub's pin
-  if (pins.length) await db.query(`UPDATE state SET v = v - $1::text[] WHERE k = 'layout'`, [pins]);
-  await db.query('DELETE FROM access_log a WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.id = a.chunk_id)'); // queries may quote it
+  if (what === 'project') { // ponytail: a session forget keeps its hub's pin
+    await db.query(`UPDATE state SET v = v - $1::text[] WHERE k = 'layout'`, [[...new Set(r.rows.map((s) => `project:${s.project ?? '?'}`))]]);
+  }
+  await (await import('./layout.ts')).prunePins(db);
+  await db.query('DELETE FROM access_log WHERE turn_uuid = ANY($1) OR chunk_id = ANY($2)', [used.turns, used.chunks]);
   // the SessionStart log names the project and the chats it showed (session-start.ts); absent before migrate
   await db.query(`DELETE FROM injections WHERE ${what === 'session' ? `session = $1 OR 'session:' || $1 = ANY(ids)` : `project = $1 OR starts_with(project, $1 || '/')`}`, [v])
     .catch(() => {});
@@ -364,10 +398,20 @@ export async function forget(db: pg.Pool, what: 'session' | 'project', value: st
 
 export async function indexArchive(db: pg.Pool, force = false) {
   const stats: Record<string, number> = { skip: 0, excluded: 0, indexed: 0, empty: 0, failed: 0 };
+  const sessions = new Map<string, string[]>(); // <dir>/<sid>.jsonl + <dir>/<sid>/subagents/** = one batch (sessionHideAs)
   for (const f of walk(ARCHIVE_DIR)) {
     if (!f.endsWith('.jsonl') || f.split(sep).includes('tool-results')) continue;
-    try { stats[await indexFile(db, f, force)]++; }
-    catch (e) { stats.failed++; console.error(`index failed: ${f}: ${(e as Error).message}`); }
+    const k = sessionDir(f);
+    (sessions.get(k) ?? sessions.set(k, []).get(k)!).push(f);
+  }
+  for (const files of sessions.values()) {
+    let hideAs: string | null;
+    try { hideAs = await sessionHideAs(db, files, force); } // failed scan: skip the session (next run retries), never index it visible
+    catch (e) { stats.failed += files.length; console.error(`index failed: ${files[0]}: ${(e as Error).message}`); continue; }
+    for (const f of files) {
+      try { stats[await indexFile(db, f, force, hideAs)]++; }
+      catch (e) { stats.failed++; console.error(`index failed: ${f}: ${(e as Error).message}`); }
+    }
   }
   for (const t of TOOLS) {
     for (const f of walk(join(ARCHIVE_ROOT, t.tool))) {

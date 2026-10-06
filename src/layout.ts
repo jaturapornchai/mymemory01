@@ -18,6 +18,9 @@ const LINK: Record<LinkKind, { d: number; s: (w: number) => number }> = {
   link: { d: 20, s: () => 0.15 }, // weak: cross-links shape the brain without collapsing it
   similar: { d: 30, s: (w) => 0.1 * w },
   coaccess: { d: 25, s: (w) => 0.05 + 0.1 * w },
+  // strength 0: drawn, never a force (relax leaves them out), so they can't move a baked or pinned node
+  prov: { d: 20, s: () => 0 },
+  next: { d: 20, s: () => 0 },
 };
 const CHARGE = -15;
 const CHARGE_MAX = 120; // no far-field push: without it the whole mass flings small projects out to R ~1100
@@ -56,7 +59,9 @@ export function relax(nodes: LayoutNode[], links: LayoutLink[], ticks: number): 
   sim.forEach(place);
 
   if (ticks > 0) {
-    const ls = links.filter((l) => byKey.has(l.source) && byKey.has(l.target)).map((l) => ({ ...l })) // forceLink mutates links
+    // strength-0 links out: even with no force they'd add to forceLink's per-node degree (the other links' bias) and draw
+    // jiggle() randoms for endpoints on one axis (the seeded sequence)
+    const ls = links.filter((l) => byKey.has(l.source) && byKey.has(l.target) && LINK[l.k].s(l.w) > 0).map((l) => ({ ...l })) // forceLink mutates links
       .sort((a, b) => cmp(a.source, b.source) || cmp(a.target, b.target) || cmp(a.k, b.k));
     const s = forceSimulation(sim, 3).stop().randomSource(rand)
       .alphaDecay(1 - Math.pow(0.001, 1 / ticks)) // cool fully within `ticks`, also on the short incremental run
@@ -70,6 +75,19 @@ export function relax(nodes: LayoutNode[], links: LayoutLink[], ticks: number): 
 }
 
 const isVec3 = (p: unknown): p is Vec3 => Array.isArray(p) && p.length === 3 && p.every(Number.isFinite);
+
+/** Drops the pins of sources that no longer exist (forget, a deleted or moved note, a re-imported file) from both stores, in
+ *  every key form ('source:<id>', public '@github', local '@owner'): deletion paths call this instead of knowing the forms. */
+export async function prunePins(db: pg.Pool): Promise<number> {
+  const r = await db.query(`
+    WITH dead AS (
+      SELECT s.k, array_agg(key) keys FROM state s, jsonb_object_keys(s.v) key
+      WHERE s.k IN ('layout', $1) AND key ~ '^source:[0-9]+'
+        AND NOT EXISTS (SELECT 1 FROM sources WHERE id = substring(key from '^source:([0-9]+)')::bigint)
+      GROUP BY s.k)
+    UPDATE state s SET v = s.v - dead.keys FROM dead WHERE s.k = dead.k RETURNING cardinality(dead.keys) n`, [SEM_STATE]);
+  return r.rows.reduce((t, x) => t + x.n, 0);
+}
 
 /** Sets `xyz` on every node. 300 ticks on a first bake / after --rebake, 60 when a node is new, 0 otherwise (brain-serve's 5 s rebuild stays free). */
 export async function bakeLayout(db: pg.Pool, nodes: BrainNode[], links: BrainLink[], rawOf: Map<string, string>) {
@@ -321,8 +339,8 @@ export function fromVectorSend(b: Buffer): Float32Array {
  */
 export async function bakeSemantic(db: pg.Pool, nodes: BrainNode[], rawOf: Map<string, string>, vectors: Map<string, number>, hide = (_: BrainNode) => false) {
   const t = performance.now();
-  // one galaxy for both modes: meaning doesn't depend on the hub, so a public '@github' key shares the local spot
-  const keyOf = (n: BrainNode) => rawOf.get(n.id)!.replace(/@github$/, '');
+  // one galaxy for both modes: meaning doesn't depend on the hub, so an '@github' / '@owner' key shares the home key's spot
+  const keyOf = (n: BrainNode) => rawOf.get(n.id)!.replace(/@(github|owner)$/, '');
   const count = new Map(nodes.filter((n) => n.type !== 'project' && vectors.get(n.id)! > 0).map((n) => [keyOf(n), vectors.get(n.id)!]));
   if (!count.size) return;
   const store: Record<string, unknown> = (await db.query(`SELECT v FROM state WHERE k = $1`, [SEM_STATE])).rows[0]?.v ?? {};

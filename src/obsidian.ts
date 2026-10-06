@@ -53,7 +53,13 @@ export async function indexVault(db: pg.Pool, vault: string) {
     const title = basename(path, '.md');
     // daily/ notes (daily.ts): sources.kind 'daily' → ranked below chats (search.ts tier −1), dated by their day, not the 03:30 write
     const daily = own && fmStr(fm.memhub) === 'daily';
-    const ts = (daily && isoOr(fmStr(fm.valid_at), null)) || st.mtime.toISOString();
+    // a fact/card/insight is dated by the chat it came from (its earliest cited turn), not by its file: every machine rewrite
+    // (status, mention count) moved the mtime and with it since/until, the age shown and the recency prior. memory_save: when he said it
+    const distilled = own && ['fact', 'card', 'insight'].includes(fmStr(fm.memhub));
+    const born = distilled ? (await db.query(`SELECT min(ts) t FROM turns WHERE uuid = ANY($1::text[]) AND uuid NOT LIKE 'obs:%'`,
+      [fmList(fm.source_uuids)])).rows[0]?.t as Date | null : null;
+    const ts = (daily && isoOr(fmStr(fm.valid_at), null)) || (born && born.toISOString()) || (distilled && isoOr(fmStr(fm.created_at), null))
+      || st.mtime.toISOString();
     const uuid = 'obs:' + createHash('sha256').update(path).digest('hex').slice(0, 24);
     await store(db, {
       tool: 'obsidian', path, kind: daily ? 'daily' : 'note', sessionId: `${name}/${rel}`, project,
@@ -61,7 +67,7 @@ export async function indexVault(db: pg.Pool, vault: string) {
       label: name, replace: true,
     }, [{ uuid, parentUuid: null, seq: 0, role: 'note', ts, text: clean(`# ${title}\n${body}`) }],
     async (c, sourceId) => {
-      if (own) await indexFact(c, sourceId, fm, body, uuid, ts);
+      if (own) await indexFact(c, sourceId, fm, body, uuid, st.mtime.toISOString());
       await c.query('DELETE FROM links WHERE src_id = $1', [sourceId]);
       await c.query('INSERT INTO links (src_id, dst_name) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING', [sourceId, wikilinks(raw)]);
     });

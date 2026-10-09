@@ -93,6 +93,17 @@ test('SessionStart (Claude Code + other apps via --app): rules first, then the o
   assert.ok(ruleLines.length && ruleLines.every((l) => l.length <= 314), 'whole rule lines only, each ≤ 300 chars of text');
   assert.ok(ruleLines.every((l) => /(?:ยาว|มาก|long|rule|text)…$/.test(l)), `cut between words: ${ruleLines[0]}`);
   assert.match(ctx, /^- …อีก \d+ ข้อ \(memory_search\)$/m, 'the rules that did not fit are counted');
+  // a ~300-char preference: 8 long rules + the other-app line used to leave it < 200 chars, so the whole block vanished
+  const ps = (await db.query(`INSERT INTO sources (tool, path, kind, session_id, project, size, mtime_ms, sha256)
+    VALUES ('obsidian', 'facts/p0.md', 'note', 'facts/p0.md', 'obsidian/memory-hub', 1, 1, 'x') RETURNING id`)).rows[0].id;
+  await db.query(`INSERT INTO turns (uuid, source_id, seq, session_id, role, text_redacted) VALUES ('hs-pref-0', $1, 0, 'facts/p0.md', 'note', $2)`,
+    [ps, `# F0000000a preference\nลุงจืดชอบ ${'คำตอบสั้น ตรงประเด็น short answers '.repeat(12)}`]);
+  await db.query(`INSERT INTO facts (source_id, fid, kind, project, valid_at, created_at, source_uuids, md5)
+    VALUES ($1, 'F0000000a', 'preference', $2, now(), now(), '{x}', 'F0000000a')`, [ps, PROJECT]);
+  const withPref = await sessionStart();
+  assert.ok(withPref.length <= 2000, `${withPref.length} chars`);
+  assert.match(withPref, /^ลุงจืดชอบแบบนี้ [^\n]*:\n- \[F0000000a\] /m, 'the top preference survives a full rules block');
+  assert.match(withPref, /^ล่าสุด codex ทำงานนี้ 3 ชม\.ก่อน: /m, 'and the other-app line stays');
   const codex = await sessionStart('codex');
   assert.ok(codex.length <= 2000 && !codex.includes('ล่าสุด codex'), 'codex: no "codex worked here" line');
 });

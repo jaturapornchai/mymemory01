@@ -1,4 +1,4 @@
-// Progressive disclosure: memory_timeline (rounds around an id, facts/cards from its session, other apps near then, hard cap)
+// Progressive disclosure: memory_get view timeline (rounds around an id, facts/cards from its session, other apps near then, hard cap)
 // and memory_search detail:"brief" (one capped line per hit; full mode byte-for-byte unchanged). Own throwaway schema + vault.
 import { after, before, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,7 +79,7 @@ test('chunk id: rounds in time order around it (before/after), facts under the r
   assert.match(lines[lines.findIndex((l) => l.startsWith('-1 ')) + 1], /^ {3}⇢ \[F0000a003\] decision ≈\d+t: decided in round three/, 'fact under its round');
   assert.match(t, /^more facts from this session: \[F0000a007\] ≈\d+t$/m, 'a fact from outside the window: id only');
   assert.match(t, /^session card \[S0000a000\] ≈\d+t: tl-a # session tl-a/m); // note title, then its body
-  assert.ok(lines[0].startsWith(`timeline [`) && lines[0].includes('demo · claude ·'), lines[0]);
+  assert.ok(lines[0].startsWith(`[`) && lines[0].includes('] timeline') && lines[0].includes('demo · claude ·'), lines[0]);
   const shown = (await timeline(db, await chunk('a', 4), { before: 0, after: 0 }))!.text;
   assert.deepEqual(offsets(shown), ['▶']);
   const live = (await timeline(db, await chunk('a', 4), { until: new Date('2026-09-20T10:05:30Z') }))!.text; // newer = in the caller's context
@@ -89,7 +89,7 @@ test('chunk id: rounds in time order around it (before/after), facts under the r
 test('fact and card ids centre on the chat they came from; a hand-saved fact on its own note', async () => {
   const f = (await timeline(db, 'F0000a003'))!.text;
   assert.match(f, new RegExp(`^▶ \\[${await chunk('a', 3)}\\]`, 'm'), f);
-  assert.match(f.split('\n')[0], /^timeline \[F0000a003\] → its source chat: demo/);
+  assert.match(f.split('\n')[0], /^\[F0000a003\] timeline → its source chat: demo/);
   const card = (await timeline(db, 'S0000a000'))!.text;
   assert.deepEqual(offsets(card), ['▶', '+1', '+2', '+3'], 'the card starts at the first turn of its session');
   const hand = (await timeline(db, 'F0000b001'))!.text;

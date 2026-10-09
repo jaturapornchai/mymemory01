@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type pg from 'pg';
-import { activityOf, assertAnonymous, buildBrain, dreamLog, feedOf, lastDream } from '../src/brain.ts';
+import { activityOf, assertAnonymous, buildBrain, dreamLog, feedOf, forShare, lastDream } from '../src/brain.ts';
 import { MEMORY_PROJECT } from '../src/notes.ts';
 
 test('dreamLog: whitelisted counters only; old, broken and text lines dropped', () => {
@@ -164,4 +164,11 @@ test('assertAnonymous: app names are public, project/repo names still are not', 
     { dream: { t: 1, c: {}, text: 'a fact' } },
     { nodes: [{ id: 'a', type: 'note', p: 'b', a: 'github' }, { id: 'c', type: 'note', p: 'd', a: 'github' }] }, // GitHub nodes in two hubs
   ]) await assert.rejects(assertAnonymous(db, brain(bad)), /public brain leaks/, JSON.stringify(bad));
+});
+
+test('forShare (brain-serve --share): the owner\'s own AI searches / recalls never reach a friend; chat turns stay', () => {
+  const b = { events: [[1, 'source:1', 'turn', 2], [1, 'source:1', 'search', 1], [2, 'source:2', 'recall', 1]], log: [{ t: 1, k: 'recall', c: {} }, { t: 2, k: 'ingest', c: {} }] };
+  const s = forShare(b as unknown as Parameters<typeof forShare>[0]);
+  assert.deepEqual(s.events, [[1, 'source:1', 'turn', 2]]);
+  assert.deepEqual(s.log.map((l) => l.k), ['ingest']);
 });

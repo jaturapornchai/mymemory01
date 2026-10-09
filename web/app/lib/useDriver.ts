@@ -93,8 +93,11 @@ export function useDriver(store: BrainStore, sceneReady: boolean) {
         }
       }
 
+      // live-call light is for the moment of the request: dropped, not held, while a replay owns the clock
+      const flash = store.flash.length ? store.flash.splice(0) : null;
       if (c.head === null) {
         if (store.pending.length) fired = fired.concat(store.pending.splice(0));
+        if (flash) fired = fired.concat(flash);
       } else if (c.playing) {
         const end = store.domain()[1];
         const prev = c.head;

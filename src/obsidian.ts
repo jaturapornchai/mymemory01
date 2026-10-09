@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, relative } from 'node:path';
 import type pg from 'pg';
-import { clean, normProject, store } from './importer.ts';
+import { clean, hideDreamed, normProject, store } from './importer.ts';
 import { type Fm, fmList, fmStr, isEdited, md5, MEMORY_VAULT, parseNote } from './notes.ts';
 
 export const VAULTS = [...(process.env.MEMHUB_VAULTS ?? '')
@@ -67,7 +67,7 @@ export async function indexVault(db: pg.Pool, vault: string) {
       label: name, replace: true,
     }, [{ uuid, parentUuid: null, seq: 0, role: 'note', ts, text: clean(`# ${title}\n${body}`) }],
     async (c, sourceId) => {
-      if (own) await indexFact(c, sourceId, fm, body, uuid, st.mtime.toISOString());
+      if (own) { await indexFact(c, sourceId, fm, body, uuid, st.mtime.toISOString()); await hideDreamed(c, null, sourceId); } // cites a hidden chat → hidden before commit
       await c.query('DELETE FROM links WHERE src_id = $1', [sourceId]);
       await c.query('INSERT INTO links (src_id, dst_name) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING', [sourceId, wikilinks(raw)]);
     });

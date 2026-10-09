@@ -20,7 +20,9 @@
  *                 reference means nothing new. ≤ 64 per batch, busiest-first is NOT guaranteed, ids may be absent
  *                 from `graph` (ignore those). Semantics of one event [t, nodeId, kind, n]: "this node just fired
  *                 n times" → pulse the node, send signals along its links, optionally fly to the busiest one.
- *                 A search/recall also lights its link/prov/next/coaccess neighbours at 0.4×, 150 ms later.
+ *                 A search/recall (a request: LIVE also straight from /live.json, one event per node a call hit) sends
+ *                 longer, wider, brighter comets than a chat turn and flashes the node to ≥ 0.9; it also lights its
+ *                 link/prov/next/coaccess neighbours at 0.4×, 150 ms later.
  *  follow         true → the scene may fly to an active node (≤ once / 4 s) and idle-orbit. Any user drag/zoom pauses
  *                 both for 20 s (scene-internal; announced through onAutoFollowPause).
  *  reducedMotion  true → no orbit, no particles/pulse motion, camera moves instantly.

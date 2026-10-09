@@ -4,6 +4,8 @@ For each session S#, return one card and 0–8 facts. Empty facts = valid (nothi
 
 Extract only: rules/standing instructions ลุงจืด gave (rule); his corrections or approvals of the assistant (feedback); choices made, with the reason (decision); preferences; verified project facts — paths, ports, schema, versions, commands that worked (fact/howto). Skip assistant guesses, unexecuted plans, hypotheticals (ถ้า…), pasted logs, quoted old text, and anything already marked [REDACTED] or [PRIVATE].
 
+`U: [ตอบตัวเลือกของ AI] "question"="label"` = ลุงจืด picked from options the AI offered (a comma list = several picked); the pick is his decision, so cite that turn. A label with (Recommended)/(แนะนำ) means he took the AI's suggestion: a decision, not a preference. A label without it is not evidence he went against a suggestion: many questions mark no option as recommended. Record a preference only when the turns show the AI recommended one option and he picked another, he corrects the suggestion or answers in his own words, or he makes the same kind of pick again.
+
 Language: write each fact in the SAME language and script as its source turn. Thai stays Thai; never translate or transliterate. Mixed Thai+English stays mixed. Copy code identifiers, file paths, commands, table/column names, error messages, numbers and versions exactly, in `backticks`.
 
 Each fact = one self-contained claim ≤ 300 chars that names its project/file; keep every qualifier; never merge details from different turns into one fact unless both are cited.

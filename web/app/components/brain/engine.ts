@@ -346,13 +346,19 @@ export function createEngine(host: HTMLElement, o: EngineOptions): Engine {
     if (o.probe || !events.length) return;
     const t = clock();
     const sums = new Map<string, number>();
-    for (const e of events) if (nodeSlots.byKey.get(e[1])?.live) sums.set(e[1], (sums.get(e[1]) ?? 0) + e[3]);
+    const asked = new Set<string>(); // nodes a search / recall hit: a request, not a chat turn being indexed
+    for (const e of events) {
+      if (!nodeSlots.byKey.get(e[1])?.live) continue;
+      sums.set(e[1], (sums.get(e[1]) ?? 0) + e[3]);
+      if (e[2] !== 'turn') asked.add(e[1]);
+    }
     let budget = spec.budget;
     let best: Slot<BrainNode> | null = null;
     let bestN = -1;
     for (const [id, n] of sums) {
       const s = nodeSlots.byKey.get(id)!;
-      nodes.fire(s.group, s.slot, t, fireAmp(n));
+      const strong = asked.has(id);
+      nodes.fire(s.group, s.slot, t, strong ? Math.max(0.9, fireAmp(n)) : fireAmp(n));
       // comets on up to `fanout` incident edges (rotating, so repeats light other edges), within the batch budget;
       // events over budget only light the node
       const list = adj.get(id);
@@ -364,7 +370,7 @@ export function createEngine(host: HTMLElement, o: EngineOptions): Engine {
           const v = list[(start + i) % list.length];
           const slot = Math.abs(v) - 1;
           if (!linkSlots.items[0][slot].live) continue;
-          const travel = edges.fire(slot, t, v > 0 ? 1 : -1, EU.uSpeed.value as number);
+          const travel = edges.fire(slot, t, v > 0 ? 1 : -1, EU.uSpeed.value as number, strong);
           if (!reduced) animUntil = Math.max(animUntil, t + travel);
           fan--;
           budget--;
@@ -700,7 +706,7 @@ export function createEngine(host: HTMLElement, o: EngineOptions): Engine {
     },
     camera: () => Array.from(rig.camera.matrixWorld.elements),
     focus: (id: string) => engine.focus(id),
-    fire: (ids: string[]) => fire(ids.map((id): BrainEvent => [0, id, 'turn', 1])),
+    fire: (ids: string[], kind: BrainEvent[2] = 'turn') => fire(ids.map((id): BrainEvent => [0, id, kind, 1])),
     ids: (type?: string) => [...nodeSlots.byKey.values()].filter((s) => s.live && (!type || s.item.type === type)).map((s) => s.item.id),
     project(id: string) {
       const s = nodeSlots.byKey.get(id);
@@ -720,16 +726,21 @@ export function createEngine(host: HTMLElement, o: EngineOptions): Engine {
       for (let i = 0; i < px.length; i++) hsh = Math.imul(hsh ^ px[i], 16777619);
       return hsh >>> 0;
     },
-    /** palette check over the whole frame: share of saturated pixels near the 3 family hues + near-white share */
+    /**
+     * palette check over the whole frame: share of saturated pixels near the 3 family hues + near-white share. A pixel whose
+     * 3x3 neighbourhood holds two different on-palette families is an antialiasing resolve between two nodes (the 4x MSAA
+     * mix of blue|green|orange lands between their hues): counted in `blend`, left out of the ratio. A hue shift inside a
+     * node (3+ px wide) has no such neighbours and still counts as off.
+     */
     hueStats() {
       const W = gl.drawingBufferWidth;
       const H = gl.drawingBufferHeight;
       const px = readPixels(0, 0, W, H);
       const HUES = [213, 159, 17];
+      const cls = new Int16Array(W * H).fill(-1); // -1 not saturated, 0..2 = HUES index, 100 + 10° bin = off palette
       let sat = 0;
       let on = 0;
       let white = 0;
-      const off: Record<number, number> = {};
       for (let i = 0; i < px.length; i += 4) {
         const r = px[i];
         const g = px[i + 1];
@@ -740,10 +751,25 @@ export function createEngine(host: HTMLElement, o: EngineOptions): Engine {
         if (max < 0.15 * 255 || d / max <= 0.35) continue;
         sat++;
         const hh = (((max === r ? (g - b) / d : max === g ? (b - r) / d + 2 : (r - g) / d + 4) * 60) + 360) % 360;
-        if (HUES.some((c) => Math.abs(((hh - c + 540) % 360) - 180) <= 18)) on++;
-        else off[Math.floor(hh / 10) * 10] = (off[Math.floor(hh / 10) * 10] ?? 0) + 1;
+        const k = HUES.findIndex((c) => Math.abs(((hh - c + 540) % 360) - 180) <= 18);
+        cls[i >> 2] = k >= 0 ? k : 100 + Math.floor(hh / 10);
+        if (k >= 0) on++;
       }
-      return { total: W * H, saturated: sat, onPalette: sat ? on / sat : 1, white250: white / (W * H), off };
+      const off: Record<number, number> = {};
+      let blend = 0;
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const c = cls[y * W + x];
+          if (c < 100) continue;
+          let near = 0;
+          for (let yy = Math.max(0, y - 1); yy <= Math.min(H - 1, y + 1); yy++) {
+            for (let xx = Math.max(0, x - 1); xx <= Math.min(W - 1, x + 1); xx++) if (cls[yy * W + xx] >= 0 && cls[yy * W + xx] < 100) near |= 1 << cls[yy * W + xx];
+          }
+          if (near & (near - 1)) blend++;
+          else off[(c - 100) * 10] = (off[(c - 100) * 10] ?? 0) + 1;
+        }
+      }
+      return { total: W * H, saturated: sat, blend, onPalette: sat > blend ? on / (sat - blend) : 1, white250: white / (W * H), off };
     },
   };
   if (o.debug) (window as unknown as { __brain?: unknown }).__brain = dbg;

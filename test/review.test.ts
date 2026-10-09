@@ -20,7 +20,6 @@ const { indexVault } = await import('../src/obsidian.ts');
 const { commitBatch } = await import('../src/vault-git.ts');
 const { search } = await import('../src/search.ts');
 const { writeDaily } = await import('../src/daily.ts');
-const { openHandoffs } = await import('../src/handoff.ts');
 const { lintReport } = await import('../src/lint.ts');
 
 const db = connect('rw');
@@ -88,17 +87,6 @@ test('hygiene × lint: forget drops the retired note from the older sections of 
   assert.match(readFileSync(lint, 'utf8'), /\[\[F0000l01 ZZLINTGONE ended\]\]/);
   assert.deepEqual((await forget(db, 'session', 'l-s1')).retired, ['F0000l01 F0000l01 ZZLINTGONE ended']);
   assert.doesNotMatch(readFileSync(lint, 'utf8'), /ZZLINTGONE/);
-});
-
-test('daily: a handoff sent to one app (to_app) must not be written where every app reads it', async () => {
-  await chat('h-s1', 'd:/demo', [[bkk('2026-10-05', '09:00'), 'งานปกติ']]);
-  await db.query(`INSERT INTO handoffs (project, from_app, to_app, title, body, created_at) VALUES ('d:/demo', 'claude', 'claude', 'ZZCLAUDEONLY ต่องาน', 'x', $1)`,
-    [bkk('2026-10-05', '11:00')]);
-  assert.equal((await openHandoffs(db, 'd:/demo', 'codex-mcp-client')).filter((h) => h.title.includes('ZZCLAUDEONLY')).length, 0, 'codex is not shown it');
-  await writeDaily(db, '2026-10-05');
-  await indexVault(db, MEMORY_VAULT);
-  const { hits } = await search(db, 'ZZCLAUDEONLY', { semantic: false, limit: 8 }); // what codex's memory_search returns
-  assert.equal(hits.length, 0, `codex finds the claude-only handoff through ${hits.map((h) => h.session_id).join(',')}`);
 });
 
 test('daily × hygiene: forget --project must also drop the SessionStart injection log of that project', async () => {

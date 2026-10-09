@@ -61,9 +61,14 @@ const before = process.env.EVAL_BEFORE ? new Date(process.env.EVAL_BEFORE) : new
 const md5 = (s: string) => createHash('md5').update(s).digest('hex');
 const out: Record<string, any> = { at: new Date().toISOString(), before: before.toISOString(), search: process.env.EVAL_SEARCH ?? 'src/search.ts', mcp: process.env.EVAL_MCP ?? 'src/mcp.ts', rank: mod.RANK ?? null, per_session: perSession ?? null,
   set: arg.set, exact: !!process.env.EVAL_EXACT, ef_search: process.env.EVAL_EF_SEARCH ?? null, assoc: process.env.EVAL_ASSOC ?? null, compete: process.env.EVAL_COMPETE ?? null, shuffle: process.env.EVAL_ASSOC_SHUFFLE ?? null, shuffle_kinds: process.env.EVAL_SHUFFLE_KINDS ?? null, compete_kinds: process.env.MEMHUB_COMPETE_KINDS ?? null, schema: process.env.MEMHUB_PG_SCHEMA ?? null };
-// the code itself: HEAD + md5 of the uncommitted src/ diff (untracked files not included)
+// the code itself: HEAD + md5 of the uncommitted src/ diff incl. untracked src files (an untracked one once made a baseline unrecoverable)
 const git = (...a: string[]) => execFileSync('git', a, { cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'] }).toString();
-const srcDiff = (() => { try { return `${git('rev-parse', '--short', 'HEAD').trim()}+${md5(git('diff', 'HEAD', '--', 'src'))}`; } catch { return 'n/a'; } })();
+const srcDiff = (() => { try {
+  const untracked = git('ls-files', '-o', '--exclude-standard', '-z', '--', 'src').split('\0').filter(Boolean);
+  const dirty = git('diff', 'HEAD', '--', 'src') + untracked.map((f) => f + readFileSync(join(ROOT, f), 'utf8')).join('');
+  if (dirty) console.error('!!! uncommitted src/: commit before measuring, or this result can never be re-run on the same code');
+  return `${git('rev-parse', '--short', 'HEAD').trim()}+${md5(dirty)}`;
+} catch { return 'n/a'; } })();
 /** Everything results depend on besides the code: index identity + options, session settings, frozen corpus, IDF table, facts. */
 const snapshot = async () => ({ ...(await db.query(`SELECT c.oid::int idx, c.reloptions::text opts, i.indisvalid valid,
     current_setting('hnsw.ef_search') ef_search, current_setting('enable_indexscan') indexscan,
@@ -297,7 +302,7 @@ for (const it of todo) {
     row.B = {};
     for (const l of BRIEF_LIMITS) {
       const res = await run(it.question, { limit: l, project });
-      // gold visible by id = the id the caller would pass to memory_timeline / memory_get is printed (result or ↳)
+      // gold visible by id = the id the caller would pass to memory_get is printed (result or ↳)
       const ids = it.type === 'fact' || it.type === 'currency' ? [it.gold.fid] : it.type === 'judge' ? [] : [...await goldIds(res.hits, [it.gold])];
       // chunk memory_get(gold id) reads: the fact's own chunk, else the chat chunk (getTokens = its ≈tokens)
       const getId = it.type === 'fact' || it.type === 'currency' ? res.hits.find((h) => h.fid === it.gold.fid)?.id : ids[0];

@@ -1,5 +1,5 @@
 // Daily activity note (daily.ts): one local day per project — apps, sessions, first/last time, topics (card title, else first
-// prompt), GitHub, facts created/superseded, handoffs — with nothing Claude-only and no place; the vault write keeps ลุงจืด's
+// prompt), GitHub, facts created/superseded — with nothing Claude-only and no place; the vault write keeps ลุงจืด's
 // edit, commits via vault-git, and the note ranks below the chats it lists. Own throwaway schema + temp vault, keyword-only.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -63,7 +63,6 @@ before(async () => {
   fact('facts/proj-a/F44444444 older fact.md', { id: 'F44444444', created_at: at('12:00', '2026-09-30') }, 'older fact\n');
   commitBatch(MEMORY_VAULT, 'test seed');
   await indexVault(db, MEMORY_VAULT);
-  await db.query(`INSERT INTO handoffs (project, from_app, to_app, title, body, created_at) VALUES ('d:/proj-a', 'codex-mcp-client', 'claude', 'ต่อ README', 'next: x', $1)`, [at('17:00')]);
 });
 after(async () => {
   await db.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
@@ -71,7 +70,7 @@ after(async () => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-test('one day per project: apps + counts, first–last time, topics, GitHub, facts, handoffs (local Asia/Bangkok day)', async () => {
+test('one day per project: apps + counts, first–last time, topics, GitHub, facts (local Asia/Bangkok day)', async () => {
   const n = (await dailyNote(db, D))!;
   assert.equal(n.rel, `daily/${D}.md`);
   assert.deepEqual([n.fm.memhub, n.fm.date, n.fm.sessions, n.fm.valid_at], ['daily', D, '4', at('23:30')]); // c1 x1 z1 p1; last event 23:30
@@ -85,7 +84,6 @@ test('one day per project: apps + counts, first–last time, topics, GitHub, fac
   assert.ok(b.includes('- issue/PR: #7 login broken (open)\n'));
   assert.ok(b.includes('- ความจำใหม่ 2: [[F11111111 ใช้ Postgres 5441]] · +1 ([[proj-a hub]])\n'), 'the trip fact counts but is not named');
   assert.ok(b.includes('- ถูกแทนที่ 1: [[F22222222 ใช้ Postgres 5432]]\n'));
-  assert.ok(b.includes('- ส่งต่องาน #1 codex-mcp-client → claude: (ส่งถึงแอปเดียว) (open)\n'), 'a targeted handoff: only claude may read its title');
   assert.ok(b.includes('\n## proj-b · 20:00–20:00 · zcode 1\n- 20:00 zcode (ซ่อน: สถานที่)\n'), 'a non-Claude chat asking about a trip: no place');
   assert.ok(b.indexOf('## proj-a') < b.indexOf('## proj-b'), 'projects in order of first activity');
   assert.ok(b.includes('\n## (ซ่อน: สถานที่)\n- commits 1: def5678 init\n'), 'a project folder named after a place: no name, no hub link');

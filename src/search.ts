@@ -19,7 +19,30 @@ export type Hit = {
   ev_of: string[] | null;                  // raw chat: ids of candidate facts distilled from its turns
   evidence?: Hit[];                        // fact: its source chat chunks among the results (shown under it, no slot of their own)
 };
-export type Result = { hits: Hit[]; semantic: boolean; qvec?: string | null }; // semantic=false → vector leg skipped (keyword-only); qvec = the query embedding (halfvec text)
+/** familiarity of a query (metamemory, not used by ranking): cosine of vector hit 1 / 10 / mean of the top 60, the best keyword
+ *  chunk's share of the query's IDF, and the IDF share of Latin words no visible chunk has ever held. Only for a query that names a
+ *  catalogued project (h = 1): agree = how many of the vector top 10 are also in the words top 60, pun = IDF share of its other
+ *  terms that project's chunks never hold. Optional: a Signal without them is h = 0 (the first rule alone). */
+export type Signal = { cos1: number | null; cos10: number | null; cosMean: number | null; kw: number; unseen: number; agree?: number; pun?: number; h?: 0 | 1 };
+// "ไม่รู้" rule (tmp/abstain2: PREREG.md, fit-final.ts, holdout.ts): logistic fit on eval questions + real memory_search queries judged
+// by 2 blind judges vs off-domain / invented-name / unseen-topic queries; threshold = ≤ 5 % of answerable flagged in BOTH groups.
+// Round 2 holdout 2026-10-06 (read once): 1.6 % wrong on real answerable queries, invented names 61 %, off-domain 85 %, but a real
+// project + a topic never discussed in it only 46 % (the project name alone makes every vector/keyword feature look familiar).
+// Round 3 (tmp/abstain3: PREREG.md, r3.json, holdout.ts): UNFAMILIAR = that rule refit on all tune; UNFAMILIAR_NAMED fires only when the
+// query names a catalogued project and adds agree + pun, fitted on the 617 project-naming tune rows. Fresh holdout 2026-10-08 (read once,
+// "then" regime = unseen/pun as of each item's time) vs the round-2 rule: real project + new topic caught 85.3 → 95.5 % (McNemar p = 1.5e-4);
+// wrong ไม่รู้ on new questions 2.6 → 4.7 % (bar 5 %), on real answerable queries 6.3 → 3.2 %; invented names 82.2 → 67.8 % (= the refit alone,
+// the price of the recalibration); off-domain 81.5 % unchanged.
+const UNFAMILIAR = { b: -10.6052, cos1: 17.874162, cos10: 6.557755, cosMean: -9.793096, kw: 6.865481, unseen: -9.095657 };
+const UNFAMILIAR_NAMED = { b: -10.133143, cos1: 37.364348, cos10: 0.408989, cosMean: -24.840211, kw: 5.859402, unseen: -2.582439, agree: 0.329367, pun: -4.159387 };
+/** true = memory has nothing on this query ("ไม่รู้"). Keyword-only search (no vector evidence) never says so. */
+export function unfamiliar(s?: Signal): boolean {
+  if (!s || s.cos1 === null || s.cosMean === null) return false;
+  const cos1 = s.cos1, cosMean = s.cosMean, cos10 = s.cos10 ?? cosMean, { kw, unseen } = s; // locals: the null guard above does not reach into the closure
+  const lin = (u: typeof UNFAMILIAR) => u.b + u.cos1 * cos1 + u.cos10 * cos10 + u.cosMean * cosMean + u.kw * kw + u.unseen * unseen;
+  return lin(UNFAMILIAR) < 0 || (s.h === 1 && lin(UNFAMILIAR_NAMED) + UNFAMILIAR_NAMED.agree * (s.agree ?? 0) + UNFAMILIAR_NAMED.pun * (s.pun ?? 0) < 0);
+}
+export type Result = { hits: Hit[]; semantic: boolean; qvec?: string | null; signal?: Signal; explain?: Explain }; // semantic=false → vector leg skipped (keyword-only); qvec = the query embedding (halfvec text)
 // before: hide chunks newer than this, from every app; also the recency anchor (eval: the frozen clock).
 // own: hide only the caller's own live session — chunks newer than own.since from sources of own.tool in own.project;
 //   other apps and the same app's other projects stay findable (before would hide them too).
@@ -28,9 +51,18 @@ export type SearchOpts = { project?: string; since?: string; until?: string; lim
   own?: { since: Date; tool: string; project: string };
   tier?: number;      // priority boost τ (default RANK.tier); dream's neighbour lookup passes 0 = pure similarity
   now?: Date;         // anchor of relative time in the query (timeWindow); default before ?? now (eval: the frozen clock)
-  showPrivate?: boolean }; // include PRIVATE_TOOLS (Gmail/Docs/Maps timeline): only for a caller guard.privateOk allows
+  showPrivate?: boolean;   // include PRIVATE_TOOLS (Gmail/Docs/Maps timeline): only for a caller guard.privateOk allows
+  explain?: boolean };     // brain view's test ask (brain-live.ts tracer): also return what each step saw; the MCP never sets it
+/** what search() saw on the way (explain only): the query's terms (df = chunks holding it; used = rare enough for the words leg),
+ *  Latin words no visible chunk holds, the time phrase, each keyword leg's [chunk id, rank], and every row scored after RRF in
+ *  rank order with why it got no slot: fold:<fact> (attached under that fact), cap (per-session cap), full (limit reached) */
+export type Explain = { corpus: number; time: { from: string | null; to: string | null; recent: boolean } | null;
+  terms: { key: string; df: number; used: boolean }[]; unseen: string[]; kw: [string, number][]; bi: [string, number][]; fused: number;
+  rows: { id: string; score: number; why: string }[] };
 
-const EMBED_TIMEOUT_MS = 300; // hot path: GPU busy → keyword-only rather than stall Claude (a cold model is waited for: embedQuery)
+// hot path: GPU busy → keyword-only rather than stall Claude (a cold model is waited for: embedQuery). A CPU-only box
+// (the server: hot bge-m3 query ≈ 360 ms on 2 cores) needs more, or every search is keyword-only: MEMHUB_EMBED_WAIT_MS=1500.
+const EMBED_TIMEOUT_MS = Number(process.env.MEMHUB_EMBED_WAIT_MS) || 300;
 const PER_SESSION = 3;       // diversity: a long session must not fill every slot (eval: 3 keeps R@10 = uncapped, 2 costs ~5 pts)
 
 // Bounded priors on the RRF score (RRF gaps between neighbouring ranks are only ~2-3 %, so they must stay mild):
@@ -76,15 +108,29 @@ const KW_FALLBACK_MAX_DF = Number(process.env.MEMHUB_KW_FALLBACK_MAX_DF ?? 0.5);
 // Keyword legs, run while Ollama embeds the query: $1 words tsquery, $2 bigram tsquery, $3 project, $4 since, $5 before,
 // $6/$7 every query term's tsquery / IDF, $8 tools to hide, $9 until (exclusive end: dateRange), $10-$12 own (OWN).
 const PF = `pf AS (SELECT source_id FROM facts WHERE $3::text IS NOT NULL AND (project LIKE '%' || $3 || '%' OR scope = 'global'))`;
+/** SQL: source ids a caller hiding tools ${p} must not see: those tools' sources and every source hidden like them (hide_as:
+ *  importer.indexFile; fact/card notes dreamed from a chat hidden later: importer.hideDreamed, so no read-time join here —
+ *  that one cost non-Claude keyword search +4 ms p50 in an ABAB run, tmp/privacy/ab.ts). */
+export const HIDDEN = (p: string) => `SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY(${p}::text[])`;
+/** Reply-text mask for a caller hiding tools `hide`: a note hidden from it (importer.hideDreamed) can still be NAMED in visible
+ *  text written before the hide — another note's [[<fid> <title>]], a session card's fact list, a hub or daily note — so its fid
+ *  and the name after it (up to ] | … or the line end) become "?". ponytail: one query per reply; no hidden note = no-op. */
+export async function hiddenNameMask(db: pg.Pool, hide: string[]): Promise<(s: string) => string> {
+  const fids = hide.length ? (await db.query(`SELECT f.fid FROM facts f JOIN sources s ON s.id = f.source_id
+    WHERE s.tool = 'obsidian' AND s.hide_as = ANY($1::text[])`, [hide])).rows.map((r) => r.fid as string) : [];
+  if (!fids.length) return (s) => s;
+  const re = new RegExp(`\\b(?:${fids.join('|')})\\b[^\\]\\n|…]*`, 'gi');
+  return (s) => s.replace(re, '?');
+}
 // hidden sources (PRIVATE_TOOLS for a non-Claude caller) leave every leg, so they never take one of its 60 candidate slots
-const HIDE = (p: string) => `hide AS (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY(${p}::text[]))`; // hide_as: importer.indexFile
+const HIDE = (p: string) => `hide AS (${HIDDEN(p)})`;
 // SearchOpts.own: the caller's live session (newer than since, its project, its app) leaves every leg
 const OWN = (since: string, project: string, tool: string) => `(${since}::timestamptz IS NULL OR ts < ${since}
       OR project IS DISTINCT FROM ${project}::text OR source_id NOT IN (SELECT id FROM sources WHERE tool = ${tool}::text))`;
 const SQL_KEYWORD = `
 WITH ${PF}, ${HIDE('$8')},
 w AS (
-  SELECT id, row_number() OVER (ORDER BY s DESC, ts DESC) r FROM (
+  SELECT id, row_number() OVER (ORDER BY s DESC, ts DESC) r, s FROM (
     SELECT id, ts, (SELECT sum(x.idf) FROM unnest($6::tsquery[], $7::float8[]) x(q, idf) WHERE wd @@ x.q) s
     FROM (SELECT id, ts, words || ''::tsvector wd FROM chunks -- words detoasted once per row, not once per query term:
       WHERE $1::text IS NOT NULL AND words @@ $1::tsquery    -- 200 queries: p50/p95/p99 41/155/192 → 29/69/107 ms, same rows
@@ -99,7 +145,7 @@ b AS (
     AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
     AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$10', '$11', '$12')}
   ORDER BY r LIMIT 60)
-SELECT 'w' leg, id, r FROM w UNION ALL SELECT 'b', id, r FROM b`;
+SELECT 'w' leg, id, r, s FROM w UNION ALL SELECT 'b', id, r, NULL FROM b`; // s: IDF of the query terms a chunk has (signal)
 
 // Vector leg + RRF + priors. The keyword legs come in as (id, rank) arrays in the slots SQL_KEYWORD's own inputs had:
 // $1/$2 words, $8/$9 bigrams; $15 tools to hide (the keyword legs already left them out); $16-$19 timeWindow() boost, $20 the daily-note tier;
@@ -109,14 +155,16 @@ WITH ${PF}, ${HIDE('$15')},
 w AS (SELECT * FROM unnest($1::text[], $2::bigint[]) x(id, r)),
 b AS (SELECT * FROM unnest($8::text[], $9::bigint[]) x(id, r)),
 v AS (
-  SELECT id, row_number() OVER (ORDER BY d) r FROM (
+  SELECT id, d, row_number() OVER (ORDER BY d) r FROM (
     SELECT id, embedding <=> $10::halfvec d FROM chunks
     WHERE $10::text IS NOT NULL AND embedding IS NOT NULL
       AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($7::timestamptz IS NULL OR ts < $7)
       AND ($21::timestamptz IS NULL OR ts < $21)
       AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$22', '$23', '$24')}
     ORDER BY embedding <=> $10::halfvec LIMIT 60) s),
-f AS (SELECT id, sum(1.0 / (60 + r)) s FROM (SELECT * FROM w UNION ALL SELECT * FROM b UNION ALL SELECT * FROM v) x GROUP BY id),
+f AS (SELECT id, sum(1.0 / (60 + r)) s FROM (SELECT * FROM w UNION ALL SELECT * FROM b UNION ALL SELECT id, r FROM v) x GROUP BY id),
+vs AS (SELECT json_build_object('n', count(*), 'd1', min(d), 'd10', (array_agg(d ORDER BY d))[10], 'dm', avg(d),
+         'ag', count(*) FILTER (WHERE r <= 10 AND id IN (SELECT id FROM w))) j FROM v), -- ag: signal.agree, the vector top 10 also in the words top 60
 u AS (SELECT c.id, count(DISTINCT a.session) n, max(a.ts) last  -- recalls keyed by turn (stable across re-chunking)
       FROM f JOIN chunks c USING (id) JOIN access_log a ON a.turn_uuid = c.turn_uuid
       WHERE a.kind IN ('get', 'related') AND a.ts < coalesce($7, $22::timestamptz, now()) GROUP BY c.id), -- own: not this session's own recalls
@@ -147,9 +195,9 @@ ev AS (  -- candidate raw chat → the best candidate active fact distilled from
 z AS (SELECT y.*, greatest(base, (SELECT max(e.base) FROM ev e WHERE e.fact_id = y.id)) * power(1 + $14::float8, tier) score,
              (SELECT array_agg(DISTINCT e.fact_id) FROM ev e WHERE e.raw_id = y.id) ev_of FROM y),
 sup AS (SELECT fx.fid, fx.superseded_by nxt, fx.source_uuids FROM facts fx JOIN sources sx ON sx.id = fx.source_id
-        WHERE sx.status = 'superseded' AND fx.superseded_by IS NOT NULL)
+        WHERE sx.status = 'superseded' AND fx.superseded_by IS NOT NULL AND sx.id NOT IN (SELECT id FROM hide))
 SELECT y.id, y.turn_uuid, y.ts, y.project, y.session_id, y.header, y.text, y.status, y.src_kind, y.tool, y.uses, y.last, y.fid, y.kind, y.fact_project,
-       y.superseded_by, y.review_target, y.score, y.ev_of,
+       y.superseded_by, y.review_target, y.score, y.ev_of, (SELECT j FROM vs) vsig,
        CASE WHEN y.tool <> 'obsidian' THEN (  -- a later-superseded fact never down-ranks its source chats, only annotates them
          WITH RECURSIVE ch(fid, d) AS (       -- with the current END of each supersede chain (A → B → C: C, never the OLD B)
            SELECT nxt, 1 FROM sup WHERE source_uuids && (
@@ -177,6 +225,38 @@ export function dateRange(since?: string, until?: string): { since: string | nul
   return { since: local(since), until: local(end) };
 }
 
+// Projects a query can name (Signal.h): basename of a project with ≥ 20 visible chunks, ≥ 3 chars, no whitespace, no leading dot, and not an
+// everyday word (term_df ≤ 3× its chunks). Built from public chunks like term_df, so it is per pool and goes stale with it: refreshTermDf
+// drops it, and an hour's TTL covers a long-lived MCP process (the hourly refresh runs in another one). A failed build = no project named.
+type Named = { name: string; raw: string[] };
+const CATALOGUE = new WeakMap<pg.Pool, { at: number; p: Promise<Named[]> }>();
+function projectCatalogue(db: pg.Pool): Promise<Named[]> {
+  const c = CATALOGUE.get(db);
+  if (c && Date.now() - c.at < 36e5) return c.p;
+  const p = db.query(`SELECT c.name, c.raw, c.n, coalesce(d.ndoc, 0) df FROM (
+      SELECT lower(regexp_replace(project, '^.*[/\\\\:]', '')) name, array_agg(DISTINCT project) raw, count(*)::int n FROM chunks
+      WHERE project IS NOT NULL AND source_id NOT IN (${HIDDEN('$1')}) GROUP BY 1 HAVING count(*) >= 20) c LEFT JOIN term_df d ON d.word = c.name`,
+    [[...PRIVATE_TOOLS]]).then((r) => r.rows.filter((x) => x.name.length >= 3 && !/\s/.test(x.name) && !x.name.startsWith('.') && x.df <= 3 * x.n)
+    .map((x): Named => ({ name: x.name, raw: x.raw })), () => { CATALOGUE.delete(db); return []; });
+  CATALOGUE.set(db, { at: Date.now(), p });
+  return p;
+}
+/** Signal.h / Signal.pun: does the query name a catalogued project (a whole token) and still have another scored term; if so, the IDF
+ *  share of those other terms that no visible chunk of that project (older than `before`) holds. One EXISTS per term, one statement. */
+async function projectPun(db: pg.Pool, cat: Promise<Named[]> | null, query: string, scored: { key: string; lit: string; idf: number }[],
+  hide: string[], before: Date | null): Promise<{ h: 0 | 1; pun: number }> {
+  const ql = query.toLowerCase(), none = { h: 0 as const, pun: 0 };
+  const named = (await cat)?.filter((p) => (/^[a-z0-9_-]+$/.test(p.name) ? ql.split(/[^a-z0-9_-]+/).includes(p.name) : ql.includes(p.name))) ?? [];
+  const parts = named.flatMap((p) => [p.name, ...p.name.split(/[-_]/)]);
+  const rest = scored.filter((t) => !parts.some((n) => t.key === n || t.key.includes(n)));
+  if (!named.length || !rest.length) return none;
+  const has = (await db.query(`SELECT EXISTS (SELECT 1 FROM chunks c WHERE c.project = ANY($1::text[]) AND c.words @@ x.q AND ($2::timestamptz IS NULL OR c.ts < $2)
+      AND c.source_id NOT IN (${HIDDEN('$3')})) e FROM unnest($4::tsquery[]) WITH ORDINALITY x(q, i) ORDER BY i`,
+    [named.flatMap((p) => p.raw), before, hide, rest.map((t) => t.lit)])).rows.map((r) => r.e as boolean);
+  const total = rest.reduce((a, t) => a + t.idf, 0);
+  return { h: 1, pun: total ? rest.reduce((a, t, i) => a + (has[i] ? 0 : t.idf), 0) / total : 0 };
+}
+
 export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Promise<Result> {
   const { since, until } = dateRange(o.since, o.until); // first: bad input fails before the embedder or the DB is asked
   const limit = Math.min(Math.max(o.limit ?? 6, 1), 20); // MCP schema caps callers at 8; eval uses up to 20
@@ -185,6 +265,7 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   let kq = tw.rest, terms = queryTerms(kq);
   if (!terms.length) terms = queryTerms((kq = query)); // only a time phrase ('เมื่อวานทำอะไร'): keep its words, as before
   const vec = o.semantic === false ? null : embedQuery(query, EMBED_TIMEOUT_MS).then((e) => e && toVec(e));
+  const cat = vec && o.tier !== 0 ? projectCatalogue(db) : null; // Signal.h/pun are read with a vector signal only; dream's lookup (tier 0) reads neither. Overlaps the stats query below
   // One round trip: corpus size, document frequencies, and English stems (redaction → redact:* also finds redacted).
   // Corpus stats leave PRIVATE_TOOLS out (here and in term_df): Claude-only data never shifts another app's ranking.
   const latin = terms.filter((t) => LATIN.test(t.key)).map((t) => t.key);
@@ -193,8 +274,15 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
      SELECT greatest((SELECT reltuples FROM pg_class WHERE oid = 'chunks'::regclass)
               - (SELECT count(*) FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($3::text[]))), 1)::float8 n,
             coalesce((SELECT json_object_agg(word, ndoc) FROM term_df WHERE word = ANY($1::text[] || ARRAY(SELECT s FROM st))), '{}') df,
-            coalesce((SELECT json_object_agg(w, s) FROM st WHERE s IS NOT NULL AND s <> w AND length(s) >= 3), '{}') stems`,
-    [terms.map((t) => t.key), latin, [...PRIVATE_TOOLS]],
+            coalesce((SELECT json_object_agg(w, s) FROM st WHERE s IS NOT NULL AND s <> w AND length(s) >= 3), '{}') stems,
+            -- familiarity: a Latin word (names live there; Thai segmentation fragments do not count) no chunk has ever held, not even
+            -- as a word starting with its stem (delegating → deleg:*). term_df lags an hour, so the index decides; only words term_df lacks
+            coalesce((SELECT json_agg(w) FROM st WHERE NOT EXISTS (SELECT 1 FROM term_df WHERE word IN (st.w, st.s))
+              AND length(coalesce(st.s, st.w)) >= 3
+              AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.words @@ to_tsquery('simple', quote_literal(coalesce(st.s, st.w)) || ':*')
+                AND c.source_id NOT IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($4::text[])))), '[]') unseen`,
+    // $4: what this caller may see (a word only Claude-only data holds is still "seen" for Claude)
+    [terms.map((t) => t.key), latin, [...PRIVATE_TOOLS], o.showPrivate ? [] : [...PRIVATE_TOOLS]],
   )).rows[0];
   const n: number = st.n;
   // Unknown to term_df = newer than the last refresh → treat as rare.
@@ -211,18 +299,27 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   const project = o.project?.toLowerCase() || null, before = o.before ?? null;
   const hide = o.showPrivate ? [] : [...PRIVATE_TOOLS];
   const own = [o.own?.since ?? null, o.own?.project ?? null, o.own?.tool ?? null];
-  const [legs, v] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(kq), project, since, before,
-    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until, ...own]), vec]);
+  const [legs, v, pj] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(kq), project, since, before,
+    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until, ...own]), vec, projectPun(db, cat, query, scored, hide, before)]);
   const w = legs.rows.filter((r) => r.leg === 'w'), b = legs.rows.filter((r) => r.leg === 'b');
   const rows = (await db.query(SQL, [
     w.map((r) => r.id), w.map((r) => r.r), project, since, o.currentProject ?? '', Math.max(limit, 8) * 3, // ≥ 24 rows: same curated slot at every limit
     before, b.map((r) => r.id), b.map((r) => r.r), v,
     RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide, tw.from ?? null, tw.to ?? null, tw.from ? T_WIN : 0, tw.recent ? T_REC : 0, RANK.daily, until, ...own,
   ])).rows;
+  // Familiarity, apart from rank (RRF is rank-only: an off-topic query scores like a real match): how close the nearest
+  // chunks are, and the share of the query's IDF the best keyword chunk carries. Ranking never reads it.
+  const vs = rows[0]?.vsig, idf = scored.reduce((a, t) => a + t.idf, 0);
+  const signal: Signal = { cos1: vs?.n ? 1 - vs.d1 : null, cos10: vs?.n >= 10 ? 1 - vs.d10 : null, cosMean: vs?.n ? 1 - vs.dm : null,
+    kw: idf ? Math.max(0, ...w.map((r) => Number(r.s))) / idf : 0,
+    // each term votes "never seen" with its IDF, normalized by the query's total (FlyWire: weight = share of the target's input)
+    unseen: idf ? scored.filter((t) => st.unseen.includes(t.key)).reduce((a, t) => a + t.idf, 0) / idf : 0, agree: vs?.ag ?? 0, ...pj };
+  for (const r of rows) delete r.vsig;
   const ci = rows.slice(0, 24).findIndex((r) => r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active');
   if (ci >= RANK.slot && Number(rows[ci].score) >= RANK.slotRatio * Number(rows[0].score)) rows.splice(RANK.slot - 1, 0, ...rows.splice(ci, 1));
   const perSession = new Map<string, number>();
   const hits: Hit[] = [];
+  const why = o.explain ? new Map<string, string>() : null; // explain: why a scored row got no slot
   for (const r of rows) {
     // dedupe: a fact ranks at or above its own source chats (tier ≥ 1 > chat tiers) → attach them to it instead of a slot,
     // except a chat that would get a slot anyway and mostly says something else (judge-03: folding cut half the answer)
@@ -230,13 +327,18 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     const n = perSession.get(r.session_id) ?? 0;
     const room = hits.length < limit && n < (o.perSession ?? PER_SESSION);
     if (fact && !(room && overlap(snippet(r.text, query), fact.text) < RANK.foldDup)) {
-      (fact.evidence ??= []).push({ ...r, score: Number(r.score) }); perSession.set(r.session_id, n + 1); continue; // still counts toward the cap
+      (fact.evidence ??= []).push({ ...r, score: Number(r.score) }); perSession.set(r.session_id, n + 1); why?.set(r.id, `fold:${fact.fid ?? fact.id}`); continue; // still counts toward the cap
     }
-    if (!room) continue; // full: keep scanning only to attach source chats
+    if (!room) { why?.set(r.id, hits.length < limit ? 'cap' : 'full'); continue; } // full: keep scanning only to attach source chats
     perSession.set(r.session_id, n + 1);
     hits.push({ ...r, score: Number(r.score) });
   }
-  return { hits, semantic: v !== null, qvec: v };
+  const explain: Explain | undefined = o.explain ? { corpus: n, unseen: st.unseen, fused: rows.length,
+    rows: rows.map((r) => ({ id: r.id, score: Number(r.score), why: why!.get(r.id) ?? 'hit' })),
+    time: tw.from || tw.recent ? { from: tw.from?.toISOString() ?? null, to: tw.to?.toISOString() ?? null, recent: tw.recent } : null,
+    terms: scored.map((t) => ({ key: t.key, df: t.df, used: cand.includes(t) })),
+    kw: w.map((r) => [r.id, Number(r.r)]), bi: b.map((r) => [r.id, Number(r.r)]) } : undefined;
+  return { hits, semantic: v !== null, qvec: v, signal, explain };
 }
 
 // Relative time → a soft boost on the fused rows (never a filter): ts in the window ×(1 + T_WIN); recency words ×(1 + T_REC·(1 −
@@ -311,6 +413,7 @@ export async function refreshTermDf(db: pg.Pool) {
     INSERT INTO term_df SELECT word, ndoc FROM ts_stat('SELECT words FROM chunks WHERE source_id NOT IN
       (SELECT id FROM sources WHERE coalesce(hide_as, tool) IN (${[...PRIVATE_TOOLS].map((t) => `''${t}''`).join(', ')}))');
     COMMIT; ANALYZE chunks; ANALYZE term_df;`);
+  CATALOGUE.delete(db);
 }
 
 /** ≤ max chars around the first query term, whitespace collapsed. */

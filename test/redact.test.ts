@@ -22,6 +22,7 @@ const SECRETS: [string, string][] = [
   ['digitalocean', 'dop_v1_' + '4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318'],
   ['ark', 'ark-' + '5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b-12345'],
   ['ollama', '67117a0b1c2d3e4f5a6b7c8d9e0f1a2b.' + 'Zx9_Qw-ErTyUiOpAsDfGhJkLI'],
+  ['syn', 'syn_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f0'], // pragma: allowlist secret
 ];
 
 for (const [kind, secret] of SECRETS) {

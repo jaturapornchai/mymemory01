@@ -123,7 +123,7 @@ const WARN = /THREE|WebGL|GL_|shader/;
  * One page: fixture routing, console + network capture (checks 2 and 3 for every case). `theme` = the saved visitor choice.
  * ?intro=0 unless `intro`: the page-load replay would otherwise own the first ~8 s (the intro case tests it).
  */
-async function open(name, view, query, fixture, { reduced = false, allowWarn = null, theme = null, intro = false } = {}) {
+async function open(name, view, query, fixture, { reduced = false, allowWarn = null, theme = null, intro = false, routes = [] } = {}) {
   const ctx = await browser.newContext({ ...VIEWS[view], reducedMotion: reduced ? 'reduce' : 'no-preference' });
   if (theme) await ctx.addInitScript((t) => localStorage.setItem('mh-theme', t), theme);
   const page = await ctx.newPage();
@@ -143,6 +143,7 @@ async function open(name, view, query, fixture, { reduced = false, allowWarn = n
   page.on('response', (r) => r.status() >= 400 && bad.push(`${r.status()} ${r.url()}`));
   await page.route('**/graph.json', (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify(fixture) }));
   await page.route('**/feed.json*', (r) => r.fulfill({ contentType: 'application/json', body: empty(fixture) }));
+  for (const [glob, handler] of routes) await page.route(glob, handler);
   await page.goto(`${ORIGIN}/?debug=1&${intro ? '' : 'intro=0&'}${query}`);
   await page.waitForFunction(() => window.__brain?.firstFrameMs != null, null, { timeout: 30000 });
   const done = async () => {
@@ -241,7 +242,7 @@ const CASES = {
     const ins = await B(page, () => window.__brain.insets);
     record(7.4, 'HUD insets measured (BrainScene reads .strip / .timeline from the DOM): top and bottom > 0', ins[0] > 0 && ins[1] > 0, ins);
     const hs = await B(page, () => window.__brain.hueStats());
-    record(7, 'hues x1 default view: ≥97% of saturated px on palette', hs.onPalette >= 0.97, { onPalette: +hs.onPalette.toFixed(4), saturated: hs.saturated, off: hs.off });
+    record(7, 'hues x1 default view: ≥97% of saturated px on palette', hs.onPalette >= 0.97, { onPalette: +hs.onPalette.toFixed(4), saturated: hs.saturated, blend: hs.blend, off: hs.off });
     record(5, 'hub not a white blob x1 (px ≥250 all channels < 0.5%)', hs.white250 < 0.005, `${(hs.white250 * 100).toFixed(3)}%`);
     await shot(page, '1-desktop-overview');
     // step 6: scene draw calls
@@ -253,7 +254,7 @@ const CASES = {
     await sleep(350);
     await shot(page, '3-firing-burst');
     const hb = await B(page, () => window.__brain.hueStats());
-    record(7, 'hues during burst (64 events): ≥97% on palette', hb.onPalette >= 0.97, { onPalette: +hb.onPalette.toFixed(4), saturated: hb.saturated, white250: +(hb.white250 * 100).toFixed(3), off: hb.off });
+    record(7, 'hues during burst (64 events): ≥97% on palette', hb.onPalette >= 0.97, { onPalette: +hb.onPalette.toFixed(4), saturated: hb.saturated, blend: hb.blend, white250: +(hb.white250 * 100).toFixed(3), off: hb.off });
     // camera: focus settles within FLY_MS + 200
     await sleep(2500);
     // timed in-page (rAF polling): CDP round trips would add ~100-250 ms of harness latency
@@ -299,7 +300,7 @@ const CASES = {
     await sleep(3500);
     perf.desktop = { ...(await perfWindows(page)), firstFrameMs: first };
     const hs = await B(page, () => window.__brain.hueStats());
-    record(7, 'hues x4 default view: ≥97% on palette', hs.onPalette >= 0.97, { onPalette: +hs.onPalette.toFixed(4), saturated: hs.saturated, off: hs.off });
+    record(7, 'hues x4 default view: ≥97% on palette', hs.onPalette >= 0.97, { onPalette: +hs.onPalette.toFixed(4), saturated: hs.saturated, blend: hs.blend, off: hs.off });
     record(5, 'hub not a white blob x4', hs.white250 < 0.005, `${(hs.white250 * 100).toFixed(3)}%`);
     await shot(page, '2-desktop-x4');
     await done();
@@ -1034,6 +1035,36 @@ const CASES = {
       await shot(page, `sem-${view}-how`);
       await done();
     }
+  },
+  /** ทดสอบถาม (local viewer: /live.json + /search stubbed): the traced search plays as 8 steps, then every candidate grouped; nothing crashes */
+  async ask() {
+    const leg = (type, label, r, cos = null) => ({ type, node: null, label, r, cos });
+    const row = (why, type, label, kw, vec, score) => ({ type, node: null, label, kw, bi: null, vec, cos: vec === null ? null : 0.6, score, id: label, why, ev: 0, status: null });
+    const trace = {
+      q: 'sort', ms: 41, semantic: true, unfamiliar: false, stages: { embed: 2, keyword: 15, vector: 24, synapse: 5 },
+      hits: [{ type: 'rule', node: null, label: 'r1' }],
+      explain: {
+        corpus: 48000, time: null, terms: [{ key: 'sort', df: 120, used: true }], unseen: [], fused: 4,
+        signal: { cos1: 0.57, cos10: 0.54, cosMean: 0.5, kw: 1, unseen: 0 },
+        kw: { n: 3, top: [leg('chat', 'k1', 1)] }, bi: { n: 0, top: [] }, vec: { n: 60, top: [leg('github', 'v1', 1, 0.57)] },
+        rows: [row('ai', 'rule', 'r1', 1, 2, 0.03), row('ai', 'chat', 'r2', 2, null, 0.02), row('full', 'chat', 'r3', null, 1, 0.016), row('cap', 'chat', 'r4', 3, null, 0.015)],
+        linked: [{ type: 'fact', node: null, label: 'l1', via: 1, kind: 'link', act: 0.4, sim: 0.3 }],
+      },
+    };
+    const json = (body) => (r) => r.fulfill({ contentType: 'application/json', body: JSON.stringify(typeof body === 'function' ? body() : body) });
+    const { page, done, errors } = await open('ask (local)', 'desktop', '', { ...real, mode: 'local' }, { routes: [['**/live.json*', json(() => ({ now: Date.now(), calls: [] }))], ['**/search?*', json(trace)]] });
+    await page.getByRole('button', { name: 'ทดสอบถาม' }).locator('visible=true').first().click();
+    const focused = await page.locator('.bv__input').evaluate((el) => el === document.activeElement);
+    await page.locator('.bv__input').fill('sort');
+    await page.locator('.bv__input').press('Enter');
+    await page.getByRole('button', { name: 'เร็ว' }).click();
+    const t0 = Date.now();
+    const end = await page.locator('.al__all').waitFor({ timeout: 25000 }).then(() => Date.now() - t0, () => null);
+    const steps = await page.locator('.al__step').count();
+    const groups = await page.locator('.al__group summary b').allInnerTexts();
+    record('ask', 'test-ask: focus in the box, 8 steps play out (not at once), then every candidate grouped, no errors', focused && steps === 8 && end !== null && end > 3000 && groups.length === 3 && errors.length === 0, { focused, steps, endMs: end, groups, errors });
+    await shot(page, 'ask-desktop');
+    await done();
   },
 };
 

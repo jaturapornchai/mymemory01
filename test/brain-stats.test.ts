@@ -134,6 +134,7 @@ test('buildBrain: synapses from the edges table (prov/next/coaccess, any subset)
   assert.equal(b.nodes.find((n) => n.id === `source:${s1}`)?.u, 1);
   assert.ok(b.events.some((e) => e[1] === `source:${s1}` && e[2] === 'recall'), 'the re-chunked recall still glows');
   assert.equal(b.nodes.find((n) => n.id === `source:${s3}`)?.a, 'claude'); // the hidden session is still a node (counts only)
+  assert.deepEqual([s1, s3].map((i) => b.nodes.find((n) => n.id === `source:${i}`)?.label), ['x', undefined], 'no first prompt of a hidden session, even locally');
   await edge(s1, s2, 'next');
   ({ links } = await syn());
   assert.deepEqual(links, [['next', `source:${s1}`, `source:${s2}`, 1].join(), ['prov', `source:${s1}`, `source:${s2}`, 1].join()]);

@@ -11,7 +11,7 @@ import { z } from 'zod';
 import { ROOT } from './db.ts';
 import { backfill } from './embed.ts';
 import { offsiteBackend } from './guard.ts';
-import { projectName } from './importer.ts';
+import { hideDreamed, projectName } from './importer.ts';
 import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { search } from './search.ts';
@@ -42,17 +42,18 @@ export const filesRunner = (dir: string): Llm => async (req) => {
   throw new Pending(req.id);
 };
 
-const CLAUDE_BIN = process.env.MEMHUB_CLAUDE_BIN
-  ?? join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
+const CLAUDE_BIN = process.env.MEMHUB_CLAUDE_BIN ?? (process.platform === 'win32'
+  ? join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe') : 'claude');
 
 /**
  * Headless `claude -p`. User settings are skipped (--setting-sources project) and ANTHROPIC_BASE_URL/AUTH_TOKEN are
  * dropped, so a settings.json "env" pointing at another vendor can't receive the transcripts; auth = the CLI's
- * Anthropic login. No tools, no MCP, no session persistence (the dream's own run never becomes input).
+ * Anthropic login (or CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token` on a server); ANTHROPIC_API_KEY is dropped too: in -p it
+ * outranks the subscription token and would bill the API. No tools, no MCP, no session persistence (the dream's own run never becomes input).
  */
 export const claudeRunner = (model = process.env.MEMHUB_DREAM_MODEL ?? 'sonnet', log = console.log): Llm => async (req) => {
   const env: NodeJS.ProcessEnv = { ...process.env, MEMORY_HUB_INTERNAL: '1' };
-  for (const k of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_OAUTH_SCOPES',
+  for (const k of ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_OAUTH_SCOPES',
     'CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_HOST_SESSION_ID']) delete env[k];
   const off = offsiteBackend(env);
   if (off) throw new Error(`refusing dream: backend ${off} is not Anthropic`);
@@ -120,6 +121,12 @@ type Row = { uuid: string; role: string; ts: Date; text: string };
 const TOOL_LINE = /^\[[A-Za-z][\w-]*\](?: [^\n]*)?$/gm;
 const FILE_LINE = /^\[\w*(?:write|edit|patch)\w*\] (.+)$/gim;
 const cut = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s);
+// ลุงจืด answering an AI's multiple-choice question: Claude's AskUserQuestion tool row, ZCode's "[Ask result]" line inside the
+// assistant row. It is his decision, so it goes in as a user turn ("Q"="label"; a label with (Recommended)/(แนะนำ) = he took
+// the AI's suggestion). Dismissed (no "="="), boilerplate cut.
+const ASK = /^\[(?:AskUserQuestion|Ask) result\] (?:Your questions have been answered|The user answered|User has answered your questions): ?/;
+const ASK_TAIL = /\.? (?:You can now continue|Read the answers carefully)[\s\S]*$/;
+const choice = (s: string) => ASK.test(s) && s.includes('"="') ? `[ตอบตัวเลือกของ AI] ${s.replace(ASK, '').replace(ASK_TAIL, '').trim()}` : null;
 
 /** Deterministic digests of a session's turns (all its main transcripts, in time order): user turns verbatim (≤2000), the
  *  final assistant reply per user turn (≤1500, ≤600 in long sessions), edited files — split into consecutive windows
@@ -141,7 +148,15 @@ export function buildDigests(sessionId: string, project: string, rows: Row[], co
       turns.push({ uuid: r.uuid, role: 'user', ts: r.ts, i, text: cut(t, 2000) });
     } else if (r.role === 'assistant') {
       for (const m of r.text.matchAll(FILE_LINE)) if (!files.has(m[1].trim())) files.set(m[1].trim(), i);
-      pend = { uuid: r.uuid, role: 'assistant', ts: r.ts, i, text: r.text };
+      // ZCode: [before the question, "[Ask result] …", the reply after it, …]; only the last reply part stays (as with rows)
+      for (const [k, part] of r.text.split(/^(\[Ask result\] .*)$/m).entries()) {
+        const c = k % 2 ? choice(part) : null;
+        if (c) { pend = null; turns.push({ uuid: r.uuid, role: 'user', ts: r.ts, i, text: cut(c, 2000) }); }
+        else if (!(k % 2)) pend = { uuid: r.uuid, role: 'assistant', ts: r.ts, i, text: part };
+      }
+    } else if (r.role === 'tool') { // Claude: the asking reply is replaced by what follows, like any non-final assistant row
+      const c = choice(r.text.trim());
+      if (c) { pend = null; turns.push({ uuid: r.uuid, role: 'user', ts: r.ts, i, text: cut(c, 2000) }); }
     }
   }
   flush();
@@ -486,6 +501,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
 
 /** Approvals, synapse rebuild ('sleep': structural kinds + co-access with downscaling, synapse.ts), hub + review notes. Safe to run every night. */
 export async function consolidate(db: pg.Pool, now = new Date()) {
+  await hideDreamed(db); // catch-all before synapses/hubs: a chat hidden after its facts were dreamed
   await applyApprovals(db, now);
   await rebuildSynapses(db, { structural: true, plastic: true, now });
   await writeHubs(db);
@@ -560,12 +576,14 @@ export async function retireForgotten(db: pg.Pool, facts: { fid: string; path: s
 
 /** hubs/<project> hub.md (pinned, ใช้บ่อย, ใหม่, ถูกแทนที่, recent cards) + hubs/_review.md. SQL only, no LLM. */
 async function writeHubs(db: pg.Pool) {
+  // a fact dreamed from a chat hidden later (importer.hideDreamed) is no hub line, and an arrow to it shows [[?]]
+  const HID = (col: string) => `CASE WHEN EXISTS (SELECT 1 FROM facts t JOIN sources ts ON ts.id = t.source_id WHERE t.fid = ${col} AND ts.hide_as IS NOT NULL) THEN '?' ELSE ${col} END`;
   const rel = (p: string) => basename(p.replace(/\\/g, '/'), '.md');
   const rows = (await db.query(
-    `SELECT f.fid, f.kind, coalesce(f.project, '') project, f.pinned, f.created_at, f.superseded_by, f.review_target, s.status, s.path,
+    `SELECT f.fid, f.kind, coalesce(f.project, '') project, f.pinned, f.created_at, ${HID('f.superseded_by')} superseded_by, ${HID('f.review_target')} review_target, s.status, s.path,
             (SELECT count(DISTINCT a.session) FROM access_log a JOIN chunks c ON c.turn_uuid = a.turn_uuid
              WHERE c.source_id = s.id AND a.kind IN ('get', 'related') AND a.ts > now() - interval '30 days') uses
-     FROM facts f JOIN sources s ON s.id = f.source_id`)).rows;
+     FROM facts f JOIN sources s ON s.id = f.source_id WHERE s.hide_as IS NULL`)).rows; // hubs are read by every app
   const byProject = new Map<string, typeof rows>();
   for (const r of rows) (byProject.get(r.project) ?? byProject.set(r.project, []).get(r.project)!).push(r);
   const fidRel = new Map(rows.map((r) => [r.fid, rel(r.path)]));

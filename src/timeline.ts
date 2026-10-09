@@ -2,7 +2,7 @@
 // memory_get would cost, so the calling model reads a cheap overview first and spends tokens only on what it needs.
 import type pg from 'pg';
 import { projectName } from './importer.ts';
-import { day, snippet } from './search.ts';
+import { day, HIDDEN, snippet } from './search.ts';
 
 /** ≈ tokens of `text` for the calling model — an ESTIMATE (no tokenizer dependency): Thai letters ÷ 0.95 + other chars ÷ 2.2.
  *  Calibrated 2026-10-02 on 651 text-only Claude Code replies in ลุงจืด's local transcripts (real usage.output_tokens minus
@@ -46,7 +46,7 @@ const app = (tool: string, kind: string) => (kind === 'main' || kind === 'note' 
 type Line = { t: string; p: number; ids: string[]; near?: boolean }; // p: drop priority (lowest first), Infinity = always kept
 
 /**
- * memory_timeline: the rounds (user prompt + its answer) before/after an id in its session, the facts/cards distilled from
+ * memory_get view:"timeline": the rounds (user prompt + its answer) before/after an id in its session, the facts/cards distilled from
  * that session (under the round they came from), and the same project in other sessions/apps near then. A fact/card id
  * centres on the chat it was distilled from. ≤ TIMELINE_MAX chars, every line with ≈tokens of memory_get. null = unknown id.
  */
@@ -80,8 +80,8 @@ export async function timeline(db: pg.Pool, id: string, o: { before?: number; af
               (SELECT min(t.seq) FROM turns t WHERE t.uuid = ANY(f.source_uuids) AND t.source_id = $2) seq
        FROM facts f JOIN sources s ON s.id = f.source_id
        CROSS JOIN LATERAL (SELECT c.id, c.ctx_header FROM chunks c WHERE c.source_id = f.source_id ORDER BY c.seq_from, c.id LIMIT 1) k
-       WHERE f.session_ids @> ARRAY[$1]::text[] AND s.status IS DISTINCT FROM 'rejected' ORDER BY seq NULLS LAST, f.fid LIMIT 40`,
-    [a.session_id, a.source_id]),
+       WHERE f.session_ids @> ARRAY[$1]::text[] AND s.status IS DISTINCT FROM 'rejected' AND s.id NOT IN (${HIDDEN('$3')}) ORDER BY seq NULLS LAST, f.fid LIMIT 40`,
+    [a.session_id, a.source_id, hide]),
     // other sessions (any app) of the same project: each one's chunk nearest in time
     project && a.ts ? q(`SELECT * FROM (
          SELECT DISTINCT ON (c.session_id) c.id, c.ts, c.ctx_header, s.tool, s.kind, abs(extract(epoch FROM c.ts - $2)) dist
@@ -112,7 +112,7 @@ export async function timeline(db: pg.Pool, id: string, o: { before?: number; af
   near.map((n, i) => ({ n, p: 72 - 10 * i })).sort((x, y) => +x.n.ts - +y.n.ts).forEach(({ n, p }) => lines.push({
     t: ` [${n.id}] ${hm(n.ts)} ${app(n.tool, n.kind)} ${t(n.id)}: ${gist(n.ctx_header, 56)}`, p, ids: [n.id], near: true }));
 
-  const head = `timeline [${id}]${chat ? ' → its source chat' : ''}: ${projectName(project ?? '') || 'global'} · ${app(a.tool, a.kind)} · ${day(a.ts)} ` +
+  const head = `[${id}] timeline${chat ? ' → its source chat' : ''}: ${projectName(project ?? '') || 'global'} · ${app(a.tool, a.kind)} · ${day(a.ts)} ` +
     `(times UTC) · ≈t = est. tokens of memory_get(id)`;
   const render = (ls: Line[]) => {
     const out = [head, ...ls.map((l) => l.t)];

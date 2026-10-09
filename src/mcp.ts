@@ -11,41 +11,42 @@ import { embed, toVec, warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
 import { clean, normProject, projectName } from './importer.ts';
 import { fmStr, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
-import { claimHandoff, DATA_NOTE, doneHandoff, handoffLines, saveHandoff } from './handoff.ts';
-import { day, hitLine, type Origin, origins, originText, place, privateLabel, search, snippet, type Hit } from './search.ts';
+import { day, HIDDEN, hitLine, type Origin, origins, originText, place, privateLabel, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
 
 const db = connect('ro');
 // Desktop apps (LM Studio, Antigravity, ZCode…) may start us in their install dir or home: that is no project → global.
-const NO_PROJECT = /^[a-z]:\/(?:program files[^/]*|windows)(?:\/|$)|^[a-z]:\/users\/[^/]+(?:\/appdata(?:\/.*)?)?$/;
+const NO_PROJECT = /^[a-z]:$|^[a-z]:\/(?:program files[^/]*|windows)(?:\/|$)|^[a-z]:\/users\/[^/]+(?:\/appdata(?:\/.*)?)?$/;
 const toProject = (cwd: string) => ((p) => (NO_PROJECT.test(p) ? '' : p))(normProject(cwd));
 const currentProject = toProject(process.cwd());
 const startedAt = new Date();
 const session = `mcp-${process.pid}-${startedAt.getTime()}`; // one MCP process = one session of the calling AI app
 // Freshness: search / timeline / related hide only the caller's own live session (its app's chunks in this project since server
-// start), so what other apps did meanwhile is found at once. Unknown clients (e.g. a gateway serving many callers) keep the old
-// rule: nothing newer than server start. own.project = the importer's unmapped normProject(cwd) (home/temp too), not currentProject.
+// start), so what other apps did meanwhile is found at once. Gateway clients (GATEWAY below) have no live session in the index:
+// they see everything (their own memory_save is found at once). Other unknown clients (e.g. a gateway serving many callers) keep the old rule: nothing
+// newer than server start. own.project = the importer's unmapped normProject(cwd) (home/temp too), not currentProject.
 const TOOL_OF: Record<string, string> = { 'claude-code': 'claude', 'claude-ai': 'claude', 'codex-mcp-client': 'codex',
   'gemini-cli-mcp-client': 'gemini', 'antigravity-client': 'antigravity', zcode: 'zcode', lmstudio: 'lmstudio' };
 const ownProject = normProject(process.cwd());
-const freshness = (): { before?: Date; own?: { since: Date; tool: string; project: string } } => ((tool?: string) => tool ? { own: { since: startedAt, tool, project: ownProject } } : { before: startedAt })(TOOL_OF[client()]);
+const GATEWAY = new Set(['remote', 'claude-remote', 'chatgpt', 'web-claude-ai']);
+const freshness = (): { before?: Date; own?: { since: Date; tool: string; project: string } } => GATEWAY.has(client()) ? {} : ((tool?: string) => tool ? { own: { since: startedAt, tool, project: ownProject } } : { before: startedAt })(TOOL_OF[client()]);
 const internal = !!process.env.MEMORY_HUB_INTERNAL;           // eval / dream / tests: don't count as real use
 const offsite = offsiteBackend();
 
 /** Usage signal for ranking + brain, plus the call's latency (fire-and-forget: never slows or fails a tool call).
- *  call: tool = MCP tool (memory_timeline logs kind 'related'), t0 = performance.now() at the call's start, semantic = search only. */
+ *  call: tool = MCP tool or memory_get view (timeline/related log kind 'related'), t0 = performance.now() at the call's start, semantic = search only. */
 // ponytail: a call with no rows (0 hits / not found) leaves no latency row; add a separate call log if those matter
 function logAccess(kind: 'search' | 'get' | 'related', rows: { id: string; turn_uuid: string }[],
-  call: { tool: string; t0: number; query?: string; semantic?: boolean }) {
+  call: { tool: string; t0: number; query?: string; semantic?: boolean; chars?: number }) {
   if (!rows.length || internal) return;
-  const { tool, t0, query, semantic = null } = call;
+  const { tool, t0, query, semantic = null, chars = null } = call;
   db.query(
-    `INSERT INTO access_log (kind, chunk_id, turn_uuid, rank, query, session, project, client, tool, ms, semantic)
-     SELECT $1, id, t, ord, $4, $5, $6, $7, $8, $9, $10 FROM unnest($2::text[], $3::text[]) WITH ORDINALITY u(id, t, ord)`,
+    `INSERT INTO access_log (kind, chunk_id, turn_uuid, rank, query, session, project, client, tool, ms, semantic, chars)
+     SELECT $1, id, t, ord, $4, $5, $6, $7, $8, $9, $10, $11 FROM unnest($2::text[], $3::text[]) WITH ORDINALITY u(id, t, ord)`,
     [kind, rows.map((r) => r.id), rows.map((r) => r.turn_uuid), query ? clean(query).slice(0, 300) : null, session, currentProject, client(),
-      tool, Math.round(performance.now() - t0), semantic],
+      tool, Math.round(performance.now() - t0), semantic, chars],
   ).catch(() => {});
 }
 
@@ -84,7 +85,7 @@ async function similar(content: string, kind: string, project: string, hide: str
 
 /** Chunk for a search id (hex prefix) or a fact id (F/S/I + 8 hex); not one of the hidden tools' sources. */
 async function chunkOf(id: string, hide: string[]) {
-  const visible = `c.source_id NOT IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($2::text[]))`;
+  const visible = `c.source_id NOT IN (${HIDDEN('$2')})`;
   return (await db.query(
     /^[FSI]/.test(id)
       ? `SELECT c.* FROM facts f JOIN chunks c ON c.source_id = f.source_id WHERE f.fid = $1 AND ${visible} ORDER BY c.seq_from, c.id LIMIT 1`
@@ -98,11 +99,8 @@ const server = new McpServer({ name: 'memory-hub', version: '0.2.0' }, {
     'facts distilled by Claude. ' +
     'When he refers to earlier work/decisions/rules, or you are unsure of a project fact, call memory_search first (cheap). ' +
     'When he says จำไว้/remember or states a lasting rule, call memory_save. ' +
-    'When he says a memory is wrong: memory_save the corrected text with replaces:[its fid]; "อย่าพูดถึงอีก": memory_save mute:[fid]. ' +
-    'He switches AI apps mid-task: starting work in a project, call memory_handoff list; stopping unfinished, memory_handoff save. ' +
-    (currentProject ? '' : 'This server runs outside any project: pass project=<absolute workspace path> to memory_handoff. ') +
-    'Tokens: full memory_search snippets usually answer without memory_get (each get ≈1-3k tokens); detail:"brief" only skims; ' +
-    'memory_timeline(id) = what happened around a hit.',
+    // loaded into every session of every app (tool descriptions may be deferred): the memory_get/brief token tips live in memory_search's description
+    'When he says a memory is wrong: memory_save the corrected text with replaces:[its fid]; "อย่าพูดถึงอีก": memory_save mute:[fid].',
 });
 
 server.registerTool(
@@ -115,8 +113,8 @@ server.registerTool(
       'src = where a hit came from, cite it when you rely on it (app:session#turn, github:repo@sha, note:path; a fact: its source turn + date, ' +
       '×N = sessions behind it, AI-only = no turn of his says it, memory_save = he said remember); ' +
       'memory_get(id) only when a snippet is not enough (each get ≈1-3k tokens; full snippets usually answer). detail:"brief" = one line ' +
-      'per hit (≈1/3 the tokens per hit at the same limit, ≈t = est. tokens of memory_get) to skim; then memory_timeline / memory_get only what matters. ' +
-      'A "⇢ linked" line is a memory tied to a hit (link, provenance, next session), not a match.',
+      'per hit (≈0.4× the tokens per hit at the same limit, ≈t = est. tokens of memory_get) to skim; then memory_get (view:"timeline" = what happened around it) only what matters. ' +
+      (process.env.MEMHUB_ASSOC === '1' ? 'A "⇢ linked" line is a memory tied to a hit (link, provenance, next session), not a match.' : ''), // only when :151 can print one
     inputSchema: {
       query: z.string().min(1).max(300).describe('keywords or a short question, Thai or English'),
       project: z.string().max(200).optional().describe('filter: substring of project path, e.g. "proj-a"'),
@@ -143,13 +141,20 @@ server.registerTool(
         .catch(() => ({ props: [], sims: new Map<string, number>() })), { n, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), bonus: Number(process.env.MEMHUB_COMPETE_BONUS ?? 0.3) })
       : res.hits;
     const ids = hits.map((h) => h.id); // origins after ranking: a citation never moves a hit; a failed lookup only drops the src parts
-    const [og, cost] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined]);
+    const [og, cost, mask] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined,
+      hiddenNameMask(db, hidden())]);
+    // mask before passage(): its window may start inside a hidden note's [[id title]], after the id the output mask needs
+    for (const h of hits) for (const x of [h, ...(h.evidence ?? [])]) x.text = mask(x.text);
     const parts = [brief ? briefText(hits, query, semantic, cost!, og) : searchText(hits, query, semantic, og)];
+    // metamemory "ไม่รู้": measured unfiltered and with a project filter (holdout: 0.6 % wrong); a date range never was
+    if (hits.length && !since && !until && unfamiliar(res.signal)) parts.unshift(UNFAMILIAR_HEAD);
     const linked = process.env.MEMHUB_ASSOC === '1' && hits.length ? await associate(db, hits.slice(0, 3).map((h) => ({ chunkId: h.id, a: h.score / hits[0].score })),
       { hide: hidden(), exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters }).catch(() => []) : [];
+    for (const r of linked) r.chunk.text = mask(r.chunk.text);
     if (linked.length) parts.push(assocText(linked, query));
-    logAccess('search', hits, { tool: 'search', t0, query, semantic });
-    return text(parts.join(brief ? '\n' : '\n\n'));
+    const out = mask(parts.join(brief ? '\n' : '\n\n'));
+    logAccess('search', hits, { tool: 'search', t0, query, semantic, chars: out.length });
+    return text(out);
   },
 );
 
@@ -161,7 +166,7 @@ const whatOf = (h: Pick<Hit, 'kind' | 'tool' | 'project' | 'session_id' | 'src_k
 
 // '⇢ linked' = a memory tied to the hits through the synapse graph (wiki link, fact provenance, subagent, next session, co-use),
 // not a search hit: `⇢ linked [id] 2026-09-12 proj-a codex · via [hit id] prov→next: passage`, ≤ 220 chars.
-// memory_related lists them without the prefix and the via (always the id asked about).
+// memory_get view:"related" lists them without the prefix and the via (always the id asked about).
 const ASSOC_LINE = 220;
 function assocLine(r: Assoc, query: string, inSearch = true): string {
   const c = r.chunk, fact = c.fid && c.kind !== 'card';
@@ -182,7 +187,11 @@ const ghUrl = (uuid: string) => {
   return m ? `\nhttps://github.com/${m[1]}${m[2] ? `/commit/${m[2]}` : m[3] ? `/issues/${m[3]}${m[4] ? `#issuecomment-${m[4]}` : ''}` : ''}` : '';
 };
 // Fact note chunk = 'D: # F<id> <title>' (title = the body's first words) + body + wiki links '- from:: [[…]]' → body only.
-const factBody = (t: string) => t.replace(/^D: # [FSI][0-9a-f]{8}[^\n]*\n?/, '').replace(/^\s*- [a-z_]+:: \[\[.*$/gm, '');
+const factBody = (t: string) => t.replace(/^D: # [FSI][0-9a-f]{8}[^\n]*\n?/, '').replace(/^\s*- [a-z_]+::.*\[\[.*$/gm, ''); // link lines (from::, related::, review:: UPDATE [[…]]) = metadata
+
+/** memory_search's first line when search.ts unfamiliar(): the hits are near misses, not an answer (ลุงจืด: ถ้าไม่รู้ก็บอกไม่รู้ ห้ามเดา). */
+export const UNFAMILIAR_HEAD = 'ไม่รู้ (not in memory): nothing stored matches this query. Tell the user memory has no record of it; do not answer from ' +
+  'the near misses below unless one clearly is the thing asked.';
 
 /** memory_search reply text — exported so scripts/eval.ts measures exactly what the calling model reads. */
 export function searchText(hits: Hit[], query: string, semantic: boolean, og?: Map<string, Origin>): string {
@@ -240,7 +249,7 @@ export function hitText(h: Hit, query: string, max = 400, o?: Origin): string {
 
 // brief = progressive disclosure: same hits and order as full, one line each, gist last so the line cap only shortens the gist
 export const BRIEF_LINE = 200;
-const BRIEF_HEAD = 'brief: ≈t = est. tokens of memory_get(id); memory_timeline(id) = what happened around it';
+const BRIEF_HEAD = 'brief: ≈t = est. tokens of memory_get(id); memory_get view:"timeline" = what happened around it';
 
 /** memory_search detail:"brief" text. cost = getTokens() of the hits' chunk ids. */
 export function briefText(hits: Hit[], query: string, semantic: boolean, cost: Map<string, number>, og?: Map<string, Origin>): string {
@@ -263,48 +272,40 @@ export function briefLine(h: Hit, query: string, cost: Map<string, number>, o?: 
 }
 
 server.registerTool(
-  'memory_timeline',
-  {
-    description:
-      'What happened around a memory id (from memory_search, brief or full): the rounds before/after it in its session ' +
-      '(time, role, gist), facts/cards distilled from that session, and the same project in other sessions/apps near then. ' +
-      'One line each with ≈t = est. tokens of memory_get; ≤1500 chars. A fact/card id centres on the chat it came from.',
-    inputSchema: {
-      id: ID.describe('id from memory_search / memory_timeline / memory_related'),
-      before: z.number().int().min(0).max(10).optional().describe('rounds before (default 3)'),
-      after: z.number().int().min(0).max(10).optional().describe('rounds after (default 3)'),
-    },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ id, before, after }) => {
-    const t0 = performance.now();
-    const no = off(); if (no) return text(no);
-    const fr = freshness();
-    const t = await timeline(db, id, { before, after, until: fr.before, own: fr.own, hide: hidden() }); // a hidden id = null = not found
-    if (!t) return text(`not found: ${id}`);
-    logAccess('related', [t.hit], { tool: 'timeline', t0 }); // exploring around it = a recall, like memory_related
-    return text(t.text);
-  },
-);
-
-server.registerTool(
   'memory_get',
   {
-    description: 'Full text of a memory_search hit (or fact id like F3fa2c1d0) plus surrounding turns / fact provenance (its source turns ' +
-      'with src ids, his first) and GitHub permalinks.',
+    description: 'A memory_search hit (or fact id like F3fa2c1d0). view "text" (default): full text plus surrounding turns / fact provenance ' +
+      '(its source turns with src ids, his first) and GitHub permalinks. "timeline": what happened around it — rounds before/after in its ' +
+      'session, facts/cards from that session, the same project in other sessions/apps near then; one line each, ≈t = est. tokens of a ' +
+      'text get, ≤1500 chars; a fact id centres on the chat it came from. "related": [[links]], backlinks, facts from the same session, ' +
+      'memories used together, synapse-linked (≤2 hops) and most similar — to follow a thread.',
     inputSchema: {
-      id: ID.describe('id from memory_search'),
-      around: z.number().int().min(0).max(5).optional().describe('extra turns before/after (default 1)'),
-      max_chars: z.number().int().min(500).max(20000).optional().describe('default 6000'),
+      id: ID.describe('id from memory_search / memory_get'),
+      view: z.enum(['text', 'timeline', 'related']).optional().describe('default text'),
+      around: z.number().int().min(0).max(10).optional().describe('turns (text, default 1) / rounds (timeline, default 3) before+after'),
+      max_chars: z.number().int().min(500).max(20000).optional().describe('text: default 6000'),
+      limit: z.number().int().min(1).max(8).optional().describe('related: similar items (default 5)'),
     },
     annotations: { readOnlyHint: true },
   },
-  async ({ id, around = 1, max_chars = 6000 }) => {
+  async ({ id, view = 'text', around, max_chars = 6000, limit = 5 }) => {
     const t0 = performance.now();
     const no = off(); if (no) return text(no);
     const hide = hidden();
     const c = await chunkOf(id, hide);
     if (!c) return text(`not found: ${id}`);
+    const mask = await hiddenNameMask(db, hide); // names of notes hidden from this caller inside visible text
+    if (view === 'related') return text(mask(await related(c, hide, limit, t0)));
+    if (view === 'timeline') {
+      const fr = freshness();
+      // the resolved full id (a fact id stays: timeline centres on its chat), so timeline() never re-resolves a short prefix
+      const t = await timeline(db, /^[FSI]/.test(id) ? id : c.id, { before: around, after: around, until: fr.before, own: fr.own, hide });
+      if (!t) return text(`not found: ${id}`);
+      const out = mask(t.text);
+      logAccess('related', [t.hit], { tool: 'timeline', t0, chars: out.length }); // exploring around it = a recall, like view related
+      return text(out);
+    }
+    around ??= 1;
     const [turns, og] = await Promise.all([db.query(
       `SELECT uuid, seq, role, ts, text_redacted FROM turns WHERE source_id = $1 AND seq BETWEEN $2 AND $3 ORDER BY seq`,
       [c.source_id, c.seq_from - around, c.seq_to + around],
@@ -329,73 +330,56 @@ server.registerTool(
     }
     const o = og.get(c.id);
     const out = `${c.ctx_header} | session ${c.session_id} | ${c.project}${o ? ` | ${originText(o)}` : ''}\n\n${body || c.text}`;
-    logAccess('get', [c], { tool: 'get', t0 });
-    return text(out.length > max_chars ? out.slice(0, max_chars) + `\n…[cut at ${max_chars}; raise max_chars or around=0]` : out);
+    const reply = mask(out.length > max_chars ? out.slice(0, max_chars) + `\n…[cut at ${max_chars}; raise max_chars or around=0]` : out);
+    logAccess('get', [c], { tool: 'get', t0, chars: reply.length });
+    return text(reply);
   },
 );
 
-server.registerTool(
-  'memory_related',
-  {
-    description:
-      'Brain-style links for a memory id: [[links]] out, backlinks, facts/cards from the same session, memories used ' +
-      'together before, memories linked through the synapse graph (≤2 hops), and the most similar memories. Use to follow a ' +
-      'thread from a memory_search hit.',
-    inputSchema: {
-      id: ID.describe('id from memory_search / memory_related'),
-      limit: z.number().int().min(1).max(8).optional().describe('similar items (default 5)'),
-    },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ id, limit = 5 }) => {
-    const t0 = performance.now();
-    const no = off(); if (no) return text(no);
-    const hide = hidden();
-    const c = await chunkOf(id, hide);
-    if (!c) return text(`not found: ${id}`);
-    const first = '(SELECT min(id) FROM chunks WHERE source_id = s.id)';
-    // fan-normalised order (ACT-R S − ln fan, HippoRAG 1/|P|): a link to a specific note before one into a hub
-    const fan = `greatest(1, (SELECT count(*) FROM links x WHERE x.src_id = s.id OR x.dst_id = s.id) + (SELECT count(*) FROM edges x WHERE x.a = s.id OR x.b = s.id))`;
-    const q = async (sql: string, p: unknown[]) => (await db.query(sql, p)).rows;
-    const fresh = freshness(), own = fresh.own;
-    const [out, back, prov, together, similar] = await Promise.all([
-      q(`SELECT l.dst_name name, ${first} cid FROM links l LEFT JOIN sources s ON s.id = l.dst_id WHERE l.src_id = $1 AND coalesce(s.hide_as, s.tool, '') <> ALL($2::text[])
-         ORDER BY s.id IS NULL, ${fan}, 1`, [c.source_id, hide]),
-      q(`SELECT s.session_id name, ${first} cid FROM links l JOIN sources s ON s.id = l.src_id WHERE l.dst_id = $1 AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
-         ORDER BY ${fan}, 1`, [c.source_id, hide]),
-      // provenance both ways: facts/cards distilled from this chat session, or the chat sessions a fact came from
-      q(`SELECT f.fid || ' ' || f.kind || ' ' || coalesce(s.status, 'active') || ': ' || regexp_replace(s.session_id, '^.*/|[.]md$', '', 'g') name, ${first} cid
-         FROM facts f JOIN sources s ON s.id = f.source_id WHERE $1 = ANY(f.session_ids) AND f.source_id <> $2 AND coalesce(s.hide_as, s.tool) <> ALL($3::text[])
-         UNION ALL
-         SELECT 'session ' || s.session_id || ' (' || s.project || ')', ${first}
-         FROM facts f JOIN sources s ON s.kind = 'main' AND s.session_id = ANY(f.session_ids) WHERE f.source_id = $2 AND coalesce(s.hide_as, s.tool) <> ALL($3::text[])
-         LIMIT 8`, [c.session_id, c.source_id, hide]),
-      q(`SELECT coalesce(s.session_id, '') || ' (' || coalesce(s.project, '') || ') w=' || round(e.w::numeric, 2) name, ${first} cid
-         FROM edges e JOIN sources s ON s.id = CASE WHEN e.a = $1 THEN e.b ELSE e.a END
-         WHERE e.kind = 'coaccess' AND (e.a = $1 OR e.b = $1) AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) ORDER BY e.w / ${fan} DESC, 1`, [c.source_id, hide]),
-      q(`SELECT c2.id, c2.ts, c2.project, c2.text FROM chunks c2
-         WHERE c2.source_id <> $1 AND c2.embedding IS NOT NULL AND c2.source_id NOT IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($5::text[]))
-           AND ($3::timestamptz IS NULL OR c2.ts < $3) -- freshness as memory_search: hide the own live session (search.ts OWN) or all after start
-           AND ($6::timestamptz IS NULL OR c2.ts < $6 OR c2.project IS DISTINCT FROM $7::text OR c2.source_id NOT IN (SELECT id FROM sources WHERE tool = $8::text))
-         ORDER BY c2.embedding <=> (SELECT embedding FROM chunks WHERE id = $2) LIMIT $4`,
-        [c.source_id, c.id, fresh.before ?? null, limit, hide, own?.since ?? null, own?.project ?? null, own?.tool ?? null]),
-    ]);
-    const listed = [c.id, ...[out, back, prov, together].flat().map((r) => r.cid), ...similar.map((h) => h.id)].filter(Boolean);
-    const linked = await associate(db, [{ chunkId: c.id, sourceId: Number(c.source_id), a: 1 }],
-      { hide, exclude: listed, filters: fresh, limit: 5, theta: 0.05 }).catch(() => []);
-    const fmt = (r: { name: string; cid: string | null }) => (r.cid ? `[${r.cid}] ${r.name}` : `${r.name} (no note yet)`);
-    const cap = (rows: string[]) => rows.slice(0, 8).join('\n') + (rows.length > 8 ? `\n+${rows.length - 8} more` : '');
-    const parts: string[] = [];
-    if (out.length) parts.push('links →\n' + cap(out.map(fmt)));
-    if (back.length) parts.push('backlinks ←\n' + cap(back.map(fmt)));
-    if (prov.length) parts.push('same session ⇢\n' + prov.map(fmt).join('\n'));
-    if (together.length) parts.push('used together ⇄\n' + cap(together.map(fmt)));
-    if (linked.length) parts.push('linked ⇢\n' + linked.map((r) => assocLine(r, '', false)).join('\n'));
-    logAccess('related', [c], { tool: 'related', t0 });
-    if (similar.length) parts.push('similar ≈\n' + similar.map((h) => `[${h.id}] ${day(h.ts)} ${projectName(h.project ?? '')}: ${snippet(h.text, '', 160)}`).join('\n'));
-    return text(parts.join('\n\n') || 'no related memories');
-  },
-);
+/** memory_get view:"related": brain-style links of a visible chunk (from chunkOf). */
+async function related(c: Record<string, any>, hide: string[], limit: number, t0: number): Promise<string> {
+  const first = '(SELECT min(id) FROM chunks WHERE source_id = s.id)';
+  // fan-normalised order (ACT-R S − ln fan, HippoRAG 1/|P|): a link to a specific note before one into a hub
+  const fan = `greatest(1, (SELECT count(*) FROM links x WHERE x.src_id = s.id OR x.dst_id = s.id) + (SELECT count(*) FROM edges x WHERE x.a = s.id OR x.b = s.id))`;
+  const q = async (sql: string, p: unknown[]) => (await db.query(sql, p)).rows;
+  const fresh = freshness(), own = fresh.own;
+  const [out, back, prov, together, similar] = await Promise.all([
+    q(`SELECT l.dst_name name, ${first} cid FROM links l LEFT JOIN sources s ON s.id = l.dst_id WHERE l.src_id = $1 AND coalesce(s.hide_as, s.tool, '') <> ALL($2::text[])
+       ORDER BY s.id IS NULL, ${fan}, 1`, [c.source_id, hide]),
+    q(`SELECT s.session_id name, ${first} cid FROM links l JOIN sources s ON s.id = l.src_id WHERE l.dst_id = $1 AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
+       ORDER BY ${fan}, 1`, [c.source_id, hide]),
+    // provenance both ways: facts/cards distilled from this chat session, or the chat sessions a fact came from
+    q(`SELECT f.fid || ' ' || f.kind || ' ' || coalesce(s.status, 'active') || ': ' || regexp_replace(s.session_id, '^.*/|[.]md$', '', 'g') name, ${first} cid
+       FROM facts f JOIN sources s ON s.id = f.source_id WHERE $1 = ANY(f.session_ids) AND f.source_id <> $2 AND ${factVisible('$3')}
+       UNION ALL
+       SELECT 'session ' || s.session_id || ' (' || s.project || ')', ${first}
+       FROM facts f JOIN sources s ON s.kind = 'main' AND s.session_id = ANY(f.session_ids) WHERE f.source_id = $2 AND coalesce(s.hide_as, s.tool) <> ALL($3::text[])
+       LIMIT 8`, [c.session_id, c.source_id, hide]),
+    q(`SELECT coalesce(s.session_id, '') || ' (' || coalesce(s.project, '') || ') w=' || round(e.w::numeric, 2) name, ${first} cid
+       FROM edges e JOIN sources s ON s.id = CASE WHEN e.a = $1 THEN e.b ELSE e.a END
+       WHERE e.kind = 'coaccess' AND (e.a = $1 OR e.b = $1) AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) ORDER BY e.w / ${fan} DESC, 1`, [c.source_id, hide]),
+    q(`SELECT c2.id, c2.ts, c2.project, c2.text FROM chunks c2
+       WHERE c2.source_id <> $1 AND c2.embedding IS NOT NULL AND c2.source_id NOT IN (${HIDDEN('$5')})
+         AND ($3::timestamptz IS NULL OR c2.ts < $3) -- freshness as memory_search: hide the own live session (search.ts OWN) or all after start
+         AND ($6::timestamptz IS NULL OR c2.ts < $6 OR c2.project IS DISTINCT FROM $7::text OR c2.source_id NOT IN (SELECT id FROM sources WHERE tool = $8::text))
+       ORDER BY c2.embedding <=> (SELECT embedding FROM chunks WHERE id = $2) LIMIT $4`,
+      [c.source_id, c.id, fresh.before ?? null, limit, hide, own?.since ?? null, own?.project ?? null, own?.tool ?? null]),
+  ]);
+  const listed = [c.id, ...[out, back, prov, together].flat().map((r) => r.cid), ...similar.map((h) => h.id)].filter(Boolean);
+  const linked = await associate(db, [{ chunkId: c.id, sourceId: Number(c.source_id), a: 1 }],
+    { hide, exclude: listed, filters: fresh, limit: 5, theta: 0.05 }).catch(() => []);
+  const fmt = (r: { name: string; cid: string | null }) => (r.cid ? `[${r.cid}] ${r.name}` : `${r.name} (no note yet)`);
+  const cap = (rows: string[]) => rows.slice(0, 8).join('\n') + (rows.length > 8 ? `\n+${rows.length - 8} more` : '');
+  const parts: string[] = [];
+  if (out.length) parts.push('links →\n' + cap(out.map(fmt)));
+  if (back.length) parts.push('backlinks ←\n' + cap(back.map(fmt)));
+  if (prov.length) parts.push('same session ⇢\n' + prov.map(fmt).join('\n'));
+  if (together.length) parts.push('used together ⇄\n' + cap(together.map(fmt)));
+  if (linked.length) parts.push('linked ⇢\n' + linked.map((r) => assocLine(r, '', false)).join('\n'));
+  logAccess('related', [c], { tool: 'related', t0 });
+  if (similar.length) parts.push('similar ≈\n' + similar.map((h) => `[${h.id}] ${day(h.ts)} ${projectName(h.project ?? '')}: ${snippet(factBody(h.text), '', 160)}`).join('\n'));
+  return parts.join('\n\n') || 'no related memories';
+}
 
 server.registerTool(
   'memory_save',
@@ -459,44 +443,6 @@ server.registerTool(
     if (mutes.length) out.push((await run(process.execPath, [join(import.meta.dirname, 'cli.ts'), 'mute', ...mutes],
       { env: { ...process.env, MEMORY_HUB_INTERNAL: '1' }, windowsHide: true, timeout: 20_000 })).stdout.trim()); // rw child: we hold ro only
     return text(out.join('\n'));
-  },
-);
-
-server.registerTool(
-  'memory_handoff',
-  {
-    description:
-      'Hand unfinished work between ลุงจืด\'s AI apps for this project. list: open handoffs + which app worked here last; ' +
-      'claim id: take one (only one app can) and get its text; save: when stopping mid-task (title + done/stopped/next/files); done id: finished.',
-    inputSchema: {
-      action: z.enum(['list', 'save', 'claim', 'done']),
-      id: z.number().int().positive().optional().describe('claim / done'),
-      title: z.string().max(300).optional().describe('save: the task in a few words'),
-      done: z.string().max(4000).optional().describe('save: what is finished'),
-      stopped: z.string().max(4000).optional().describe('save: where it stopped / what failed'),
-      next: z.string().max(4000).optional().describe('save: next steps'),
-      files: z.string().max(1000).optional().describe('save: key files'),
-      to_app: z.enum(['claude', 'codex', 'gemini', 'antigravity', 'zcode', 'lmstudio']).optional().describe('save: only this app may take it'),
-      project: z.string().max(300).regex(/^(?:[a-zA-Z]:)?[\\/]/, 'absolute path').optional()
-        .describe('list / save: absolute workspace path, when this server does not run in your project (Antigravity, LM Studio); default its cwd'),
-    },
-  },
-  async ({ action, id, title, done, stopped, next, files, to_app, project }) => {
-    const no = off(); if (no) return text(no);
-    const proj = project ? toProject(project) : currentProject;
-    const where = proj || 'global';
-    if (action === 'save') {
-      if (!title?.trim() || !(done || stopped || next)) return text('save needs title + done/stopped/next');
-      const n = await saveHandoff(db, proj, client(), { title, done, stopped, next, files, to: to_app });
-      return text(`saved handoff #${n} (${where}): the next AI app sees it at session start / memory_handoff list`);
-    }
-    if (action === 'list') {
-      const lines = await handoffLines(db, proj, client());
-      if (!lines.length) return text(`no open handoffs (${where})`);
-      return text(`${DATA_NOTE}:\n${lines.join('\n')}` + (lines.some((l) => l.startsWith('#')) ? '\ntake one: memory_handoff action=claim id=N' : ''));
-    }
-    if (!id) return text(`${action} needs id`);
-    return text(await (action === 'claim' ? claimHandoff : doneHandoff)(db, id, client()));
   },
 );
 

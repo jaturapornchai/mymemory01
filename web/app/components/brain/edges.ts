@@ -23,8 +23,11 @@ import type { Vec3 } from './style';
 export const COMET_MIN_S = 0.5;
 export const COMET_MAX_S = 1.6;
 
+// A request's comet (strong: `aTime.w` is ±2, not ±1) trails longer, is wider and burns brighter than a chat turn's: one
+// request in a 4,000-node cloud must still be seen. The sign of aTime.w is the direction, |w| - 1 the strength.
 const COMMON = /* glsl */ `
-float comet(float d) { return (d > 0.0 && d < 0.25) ? (1.0 - d / 0.25) * (1.0 - d / 0.25) : 0.0; }
+float comet(float d, float L) { return (d > 0.0 && d < L) ? (1.0 - d / L) * (1.0 - d / L) : 0.0; }
+float comet(float d) { return comet(d, 0.25); }
 float travel(float since, float len) { return since / clamp(len / uSpeed, ${COMET_MIN_S.toFixed(2)}, ${COMET_MAX_S.toFixed(2)}); }
 `;
 
@@ -38,7 +41,7 @@ uniform vec3 uCentroid;
 uniform vec2 uRes;     // CSS px, so widths don't depend on DPR
 varying float vU;
 flat varying vec3 vColA, vColB;
-flat varying float vLen, vGain, vDash, vGrow, vFade, vAmb, vSince, vDir;
+flat varying float vLen, vGain, vDash, vGrow, vFade, vAmb, vSince, vDir, vStr;
 ${COMMON}
 float hash(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
 vec3 eA, eB;
@@ -59,8 +62,9 @@ void main() {
   vec2 nrm = vec2(-d.y, d.x) / max(length(d), 1e-6);
   float since = uTime - aTime.z;
   float up = aTime.w < 0.0 ? 1.0 - t : t;
-  float c = (uReduced > 0.5 || since < 0.0) ? 0.0 : comet(travel(since, len) - up);
-  c0.xy += nrm * position.y * aStyle.y * (1.0 + 1.5 * c * uWiden) * 2.0 / uRes * c0.w;
+  float str = abs(aTime.w) - 1.0;
+  float c = (uReduced > 0.5 || since < 0.0) ? 0.0 : comet(travel(since, len) - up, 0.25 + 0.2 * str);
+  c0.xy += nrm * position.y * aStyle.y * (1.0 + 1.5 * c * uWiden * (1.0 + 1.4 * str)) * 2.0 / uRes * c0.w;
   float fade = (1.0 - clamp((uTime - aTime.y) / 0.25, 0.0, 1.0)) * (1.0 - uMorph * (1.0 - aSA.w * aSB.w * aStyle.w));
   gl_Position = fade > 0.0 ? c0 : vec4(2.0, 2.0, 2.0, 1.0);
   vU = t;
@@ -76,6 +80,7 @@ void main() {
   vAmb = hash(id) < uAmbient ? hash(id + 17.0) : -1.0;
   vSince = since;
   vDir = aTime.w;
+  vStr = str;
 }`;
 
 const FRAG = /* glsl */ `
@@ -83,7 +88,7 @@ uniform float uTime, uSpeed, uReduced, uAmbI, uLight, uSpot;
 uniform vec3 uBg;
 varying float vU;
 flat varying vec3 vColA, vColB;
-flat varying float vLen, vGain, vDash, vGrow, vFade, vAmb, vSince, vDir;
+flat varying float vLen, vGain, vDash, vGrow, vFade, vAmb, vSince, vDir, vStr;
 ${COMMON}
 vec3 hue(vec3 c) { return c / max(max(c.r, c.g), max(c.b, 1e-4)); }
 void main() {
@@ -98,8 +103,8 @@ void main() {
   float head = 0.0;
   if (vSince >= 0.0) {
     if (uReduced > 0.5) head = 0.5 * step(vSince, 1.5); // static 1.5 s brightening, no movement
-    else head = comet(travel(vSince, vLen) - (vDir < 0.0 ? 1.0 - vU : vU));
-    col += src * (1.0 + 3.0 * head * (1.0 - uReduced)) * head; // head goes past 1 and blooms
+    else head = comet(travel(vSince, vLen) - (vDir < 0.0 ? 1.0 - vU : vU), 0.25 + 0.2 * vStr);
+    col += src * (1.0 + 3.0 * head * (1.0 - uReduced) * (1.0 + vStr)) * head * (1.0 + 0.6 * vStr); // head goes past 1 and blooms
   }
   if (vAmb >= 0.0 && uReduced < 0.5) col += uAmbI * comet(fract(uTime * 0.15 + vAmb) - vU);
   col *= vFade;
@@ -191,13 +196,13 @@ export class Edges {
     mark(t, slot);
   }
 
-  /** Comet from the source (dir +1) or the target end (dir -1). Returns its travel time, for on-demand rendering. */
-  fire(slot: number, now: number, dir: number, speed: number): number {
+  /** Comet from the source (dir +1) or the target end (dir -1); `strong` (a search / recall) = longer, wider, brighter. Returns its travel time, for on-demand rendering. */
+  fire(slot: number, now: number, dir: number, speed: number, strong = false): number {
     const t = this.attr('aTime');
     t.array[slot * 4 + 2] = now;
-    t.array[slot * 4 + 3] = dir;
+    t.array[slot * 4 + 3] = strong ? 2 * dir : dir;
     mark(t, slot);
-    return 1.25 * Math.min(COMET_MAX_S, Math.max(COMET_MIN_S, this.lens[slot] / speed));
+    return (strong ? 1.45 : 1.25) * Math.min(COMET_MAX_S, Math.max(COMET_MIN_S, this.lens[slot] / speed));
   }
 
   setCount(n: number): void {

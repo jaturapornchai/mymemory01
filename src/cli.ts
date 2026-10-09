@@ -1,5 +1,5 @@
-// node src/cli.ts <init|migrate [--force]|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
-import { createHash, randomBytes } from 'node:crypto';
+// node src/cli.ts <init|migrate [--force]|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -279,20 +279,86 @@ try {
   } else if (cmd === 'brain-serve') {
     // Local viewer with real labels: web/out + /graph.json + /feed.json on 127.0.0.1 only (never exposed).
     const { createServer } = await import('node:http');
-    const { buildBrain, feedOf } = await import('./brain.ts');
+    const { buildBrain, feedOf, forShare } = await import('./brain.ts');
     const { extname, normalize } = await import('node:path');
     const out = join(ROOT, 'web', 'out');
-    const port = Number(args[args.indexOf('--port') + 1]) || 5442;
-    let cache: { at: number; b: Awaited<ReturnType<typeof buildBrain>> } | null = null;
-    const brain = async () => (cache && Date.now() - cache.at < 5000 ? cache.b : (cache = { at: Date.now(), b: await buildBrain(db, 'local') }).b);
+    // --share [--hours n] [--no-tunnel] (ลุงจืด 2026-10-07: friends ask and see full content): this view through a Cloudflare
+    // quick tunnel behind a random link token (a cookie after the first visit) for n hours. ลุงจืด's own AI calls stay out
+    // (/live.json is empty), Claude-only sources stay out (as in local), one search at a time, 30 a minute.
+    // --open (ลุงจืด 2026-10-08, https://memory.bcaicloud.com behind Caddy): share for anyone, no link token, no time limit, no tunnel
+    const open = args.includes('--open');
+    const share = open || args.includes('--share');
+    const hours = Math.min(24, Number(args[args.indexOf('--hours') + 1]) || 3);
+    const token = share ? randomBytes(18).toString('base64url') : '';
+    const isToken = (t: string | null | undefined) => { const a = Buffer.from(t ?? ''), b = Buffer.from(token); return a.length === b.length && timingSafeEqual(a, b); }; // bytes: a non-ASCII k of the same length must not throw
+    let busy = false;
+    const asked: number[] = [];
+    const port = Number(args[args.indexOf('--port') + 1]) || (share ? 5443 : 5442);
+    // share: every string a friend gets is scrubbed again on the way out (import redacts secrets, but bank/ID/card/OTP only for
+    // Google sources, and older rows by older rules). ponytail: ~200 ms per graph.json; cache the scrubbed graph if friends pile up
+    const { redact, redactPersonal } = await import('./redact.ts');
+    const clean = share ? (_k: string, v: unknown) => (typeof v === 'string' ? redact(redactPersonal(v).text).text : v) : undefined;
+    // ลุงจืด 2026-10-07: a question after passwords / keys / codes gets no search (the scrub is the real guard; this is the polite no)
+    const SECRET_ASK = /รหัส|พาสเวิร์ด|ความลับ|ซีเคร็ต|โทเค็น|โทเคน|คีย์|ล็อ[กค]อิน|บัตร|บัญชีธนาคาร|เลขบัญชี|พร้อมเพย์|\.env|sk-|aiza|ghp_|:\/\/\S*@|\b(?:pass(?:word|wd|code|phrase)?s?|pwd|pin|otp|cvv|secrets?|tokens?|api[ _-]?keys?|keys?|credentials?|creds?|env|bearer|ssh|logins?|uri|dsn|connection[ _-]?strings?)\b/i;
+    // single-flight: requests on a stale cache share one rebuild (it also writes the layout state); a failed one is retried
+    let cache: { at: number; b: ReturnType<typeof buildBrain> } | null = null;
+    const sent = new WeakMap<object, Record<string, string>>(); // the scrubbed JSON, once per build (~200 ms), not per visitor
+    let refreshing = false; // share: a build takes 8-20 s on the server, so visitors keep the old graph while one rebuilds
+    const brain = () => {
+      if (cache && Date.now() - cache.at < (share ? 60_000 : 5000)) return cache.b;
+      if (cache && share) {
+        if (!refreshing) {
+          refreshing = true;
+          buildBrain(db, 'local').then((b) => { cache = { at: Date.now(), b: Promise.resolve(b) }; }, () => {}).finally(() => { refreshing = false; });
+        }
+        return cache.b;
+      }
+      return (cache = { at: Date.now(), b: buildBrain(db, 'local').catch((e) => { cache = null; throw e; }) }).b;
+    };
+    // brain view: /live.json = each MCP call since ?after (ms), /search?q= = one traced search; both local only
+    const { liveCalls, tracer } = await import('./brain-live.ts');
+    const trace = tracer(connect('ro'));
+    const nodeOf = async () => { const m = new Map<string, string>(); for (const n of (await brain()).nodes) { const s = /^source:(\d+)/.exec(n.id)?.[1]; if (s) m.set(s, n.id); } return (sid: string) => m.get(sid) ?? null; };
     const TYPES: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.txt': 'text/plain' };
     createServer(async (req, res) => {
       try {
-        const url = new URL(req.url ?? '/', 'http://x');
+        // DNS rebinding: a page whose name resolves to 127.0.0.1 is same-origin to it and could read every route
+        if (!/^(127\.0\.0\.1|localhost):\d+$/.test(req.headers.host ?? '')) { res.writeHead(403); return res.end(); }
+        const url = URL.parse(req.url ?? '/', 'http://x');
+        if (!url) { res.writeHead(400); return res.end(); }
+        if (share && !open) {
+          if (isToken(url.searchParams.get('k'))) { // Lax: the link is opened from a chat app (a cross-site navigation)
+            res.writeHead(302, { location: '/', 'set-cookie': `mh=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${hours * 3600}` });
+            return res.end();
+          }
+          if (!isToken(/(?:^|;\s*)mh=([^;]+)/.exec(req.headers.cookie ?? '')?.[1])) {
+            res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+            return res.end('ลิงก์ไม่ถูกต้องหรือหมดเวลาแล้ว');
+          }
+        }
         if (url.pathname === '/graph.json' || url.pathname === '/feed.json') {
-          const b = await brain();
+          const raw = await brain();
+          let s = sent.get(raw);
+          if (!s) { const b = share ? forShare(raw) : raw; s = { '/graph.json': JSON.stringify(b, clean), '/feed.json': JSON.stringify(feedOf(b, b.at - 7200), clean) }; sent.set(raw, s); }
           res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-          return res.end(JSON.stringify(url.pathname === '/graph.json' ? b : feedOf(b, b.at - 7200)));
+          return res.end(s[url.pathname]);
+        }
+        if (url.pathname === '/live.json' || url.pathname === '/search') {
+          const q = (url.searchParams.get('q') ?? '').trim().slice(0, 300);
+          if (url.pathname === '/search' && !q) { res.writeHead(400); return res.end('q?'); }
+          if (share && url.pathname === '/search') {
+            const now = Date.now();
+            while (asked.length && now - asked[0] > 60_000) asked.shift();
+            if (busy || asked.length >= 30) { res.writeHead(429); return res.end('busy'); }
+            asked.push(now);
+            if (SECRET_ASK.test(q)) { console.log(`${new Date().toLocaleTimeString('th-TH')} ไม่ตอบ (ถามหารหัส): ${JSON.stringify(q)}`); res.writeHead(422); return res.end('secret'); }
+            busy = true;
+            console.log(`${new Date().toLocaleTimeString('th-TH')} ถาม: ${JSON.stringify(q)}`); // quoted: no terminal escape from a friend
+          }
+          const body = url.pathname === '/search' ? await (async () => trace(q, await nodeOf()))().finally(() => { busy = false; })
+            : { now: Date.now(), calls: share ? [] : await liveCalls(db, new Date(Number(url.searchParams.get('after')) || Date.now() - 120_000), await nodeOf()) };
+          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          return res.end(JSON.stringify(body, clean));
         }
         let p = normalize(join(out, decodeURIComponent(url.pathname)));
         if (!p.startsWith(out)) { res.writeHead(403); return res.end(); }
@@ -300,8 +366,33 @@ try {
         if (!existsSync(p)) p = existsSync(`${p}.html`) ? `${p}.html` : join(out, '404.html');
         res.writeHead(existsSync(p) ? 200 : 404, { 'content-type': TYPES[extname(p)] ?? 'application/octet-stream' });
         res.end(existsSync(p) ? readFileSync(p) : 'not found');
-      } catch (e) { res.writeHead(500); res.end((e as Error).message); }
-    }).listen(port, '127.0.0.1', () => console.log(`brain (local, real labels): http://127.0.0.1:${port}`));
+      } catch (e) { res.writeHead(500); res.end(share ? 'error' : (e as Error).message); }
+    }).listen(port, '127.0.0.1', async () => {
+      console.log(`brain (local, real labels): http://127.0.0.1:${port}`);
+      if (!share || open) return;
+      const link = (base: string) => console.log(`share ${hours} ชม. (Ctrl+C ปิดก่อนได้): ${base}/?k=${token}`);
+      const { spawn } = await import('node:child_process');
+      const { tmpdir } = await import('node:os');
+      let tunnel: import('node:child_process').ChildProcess | null = null;
+      const stop = (why: string) => { console.log(`share: ${why}`); tunnel?.kill(); process.exit(0); };
+      setTimeout(() => stop('หมดเวลา ปิดแล้ว'), hours * 3600_000);
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, () => stop('ปิดแล้ว')); // SIGHUP: the terminal window closed
+      process.on('exit', () => tunnel?.kill()); // never leave the tunnel up without this server
+      if (args.includes('--no-tunnel')) return link(`http://127.0.0.1:${port}`);
+      // an empty config: a quick tunnel, never the named tunnel of ~/.cloudflared/config.yml (another service's)
+      const cfg = join(tmpdir(), 'memhub-share-cloudflared.yml');
+      writeFileSync(cfg, '');
+      tunnel = spawn('cloudflared', ['tunnel', '--config', cfg, '--no-autoupdate', '--url', `http://127.0.0.1:${port}`, '--http-host-header', `127.0.0.1:${port}`],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+      let err = '', shown = false;
+      tunnel.stderr!.on('data', (d) => {
+        if (shown) return;
+        err += d;
+        const u = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(err)?.[0];
+        if (u) { shown = true; link(u); }
+      });
+      tunnel.on('exit', (c) => { console.error(`share: cloudflared exited ${c}${shown ? '' : `\n${err.slice(-600)}`}`); process.exit(1); });
+    });
     await new Promise(() => {}); // serve until killed
   } else if (cmd === 'publish') {
     // Public mirror on Vercel: static web/out + anonymized graph.json/feed.json; redeploys only when the graph changed.
@@ -343,23 +434,8 @@ try {
       const url = (r.stdout ?? '').match(/https:\/\/\S+/g)?.at(-1);
       if (r.status || !url) throw new Error(`vercel deploy failed: ${(r.stderr ?? '').slice(-400)}`);
       await db.query(`INSERT INTO state (k, v) VALUES ('publish', $1) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [{ rev, url, at: new Date().toISOString() }]);
-      console.log(`published rev ${rev}: ${url} (public: https://memory-hub-brain.vercel.app; per-deployment URLs need a Vercel login)`);
+      console.log(`published rev ${rev}: ${url} (per-deployment URLs need a Vercel login)`);
     }
-  } else if (cmd === 'handoff') {
-    // handoff [list] | show <id> | done <id>: cross-AI handoffs (memory_handoff) for ลุงจืด, all projects
-    const h = await import('./handoff.ts');
-    const [sub = 'list', id] = args;
-    if (sub === 'list') {
-      await h.expireHandoffs(db);
-      const rows = (await db.query(`SELECT * FROM handoffs WHERE status IN ('open', 'claimed') ORDER BY created_at DESC LIMIT 30`)).rows;
-      for (const r of rows) console.log(`${h.handoffLine(r)}  [${r.status}${r.claimed_by ? ` by ${r.claimed_by}` : ''}] ${r.project || 'global'}`);
-      console.log(rows.length ? `${rows.length} open/claimed — show <id> | done <id>` : 'no open handoffs');
-    } else if (sub === 'show' && Number(id)) {
-      const r = (await db.query(`SELECT * FROM handoffs WHERE id = $1`, [Number(id)])).rows[0];
-      console.log(r ? `${h.handoffLine(r)}\nstatus: ${r.status}${r.claimed_by ? ` by ${r.claimed_by} ${h.ago(r.claimed_at)}` : ''} · ${r.project || 'global'}` +
-        `${r.to_app ? ` · for ${r.to_app}` : ''}\n${r.title}\n${r.body}` : `not found: #${id}`);
-    } else if (sub === 'done' && Number(id)) console.log(await h.doneHandoff(db, Number(id), 'cli'));
-    else console.log('usage: node src/cli.ts handoff [list|show <id>|done <id>]');
   } else if (cmd === 'stats' && args[0] === '--latency') {
     // real MCP calls (access_log rank 1 = one row per call): p50/p95 ms per tool, overall and per AI app, + keyword-only rate
     for (const days of [1, 7]) {
@@ -375,8 +451,8 @@ try {
   } else if (cmd === 'stats' && args[0] === '--injected') {
     // stats --injected [n]: what the last n SessionStart hooks gave each new chat (ids only; memory_get <id> shows one)
     const { projectName } = await import('./importer.ts');
-    const rows = (await db.query(`SELECT ts, client, project, ids, chars FROM injections ORDER BY id DESC LIMIT $1`, [Math.max(1, Number(args[1]) || 10)])).rows;
-    for (const r of rows) console.log(`${r.ts.toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }).slice(0, 16)}  ${r.client.padEnd(11)} ` +
+    const rows = (await db.query(`SELECT ts, client, project, ids, chars, source FROM injections ORDER BY id DESC LIMIT $1`, [Math.max(1, Number(args[1]) || 10)])).rows;
+    for (const r of rows) console.log(`${r.ts.toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }).slice(0, 16)}  ${r.client.padEnd(11)} ${(r.source ?? '-').padEnd(7)} ` +
       `${(projectName(r.project ?? '') || '-').padEnd(14)} ${String(r.chars).padStart(4)} chars  ${r.ids.join(' ') || '(no ids)'}`);
     console.log(rows.length ? `${rows.length} injections, newest first` : 'no injections recorded yet');
   } else if (cmd === 'stats') {
@@ -393,7 +469,7 @@ try {
     if (un.length) await db.query(`DELETE FROM state WHERE k = ANY($1::text[])`, [un.map((f) => `mute:${f}`)]);
     console.log(`muted: ${on.join(' ') || '-'} · unmuted: ${un.join(' ') || '-'}`);
   } else {
-    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|handoff [list|show <id>|done <id>]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|brain [--public] [--out file]|brain-serve [--port n]|publish [--build] [--force]|mute [-]<fid>...>');
+    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|brain [--public] [--out file]|brain-serve [--port n] [--share [--hours n] [--no-tunnel] | --open]|publish [--build] [--force]|mute [-]<fid>...>');
   }
   if (!skipped) await health(db, JOB, jobErr);
 } catch (e) {

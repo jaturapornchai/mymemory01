@@ -18,6 +18,7 @@ const { connect, ROOT } = await import('../src/db.ts');
 const { normProject, store, syncFailed } = await import('../src/importer.ts');
 const { saveNote, MEMORY_VAULT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
+const { bkkDay } = await import('../src/daily.ts');
 
 const db = connect('rw');
 const PROJECT = normProject(ROOT); // the hook runs with cwd = ROOT
@@ -62,7 +63,7 @@ after(async () => {
 test('all jobs ok and fresh → no line', async () => {
   for (const job of ['sync', 'dream', 'consolidate', 'lint', 'daily', 'embed']) await setHealth(job, { ok: true, at: ago(1) });
   const ctx = await sessionStart();
-  assert.ok(ctx.includes('healthrule0'), ctx);
+  assert.match(ctx, /healthrule\d.*\n[^]*…อีก \d+ ข้อ/, ctx); // 8 long rules: the newest that fit, the rest counted
   assert.doesNotMatch(ctx, LINE);
   assert.ok(ctx.length <= 2000);
 });
@@ -137,7 +138,7 @@ test('job locks are per schema: a peer scratch schema (another test file) holdin
 test('a job error naming a local path is stored as <path>: no Windows user name in the line every app sees', async () => {
   await allOk();
   writeFileSync(join(tmp, 'afile'), 'x'); // --out under a file → mkdir fails with the full path
-  spawnSync(process.execPath, [CLI, 'daily', new Date().toISOString().slice(0, 10), '--out', join(tmp, 'afile', 'sub')], { encoding: 'utf8', env: ENV });
+  spawnSync(process.execPath, [CLI, 'daily', bkkDay(new Date()), '--out', join(tmp, 'afile', 'sub')], { encoding: 'utf8', env: ENV });
   const v = (await db.query(`SELECT v FROM state WHERE k = 'health:daily'`)).rows[0].v;
   assert.equal(v.ok, false);
   assert.match(v.err, /<path>/);

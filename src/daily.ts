@@ -1,6 +1,6 @@
 // Daily activity note (no LLM): daily/YYYY-MM-DD.md in the memory-hub vault, the habit second-brain users keep longest.
 // Per project: which AI apps ran how many sessions and when, each session's topic (its dream card, else its first prompt),
-// GitHub commits / issues, facts created or superseded that day, handoffs. SQL over what is already indexed.
+// GitHub commits / issues, facts created or superseded that day. SQL over what is already indexed.
 // Every app reads the vault, so Claude-only data never gets in: no PRIVATE_TOOLS source and no chat that was shown one
 // (hide_as), hence no places. The nightly writes yesterday; a note ลุงจืด edited is his (notes.writeNote keeps it).
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -62,7 +62,7 @@ export async function placeGuard(db: pg.Pool): Promise<(s: string) => boolean> {
 }
 
 type Items = (string | null)[];
-type Project = { t0?: Date; t1?: Date; apps: Map<string, number>; sessions: string[]; commits: Items; issues: Items; facts: Items; old: Items; handoffs: string[] };
+type Project = { t0?: Date; t1?: Date; apps: Map<string, number>; sessions: string[]; commits: Items; issues: Items; facts: Items; old: Items };
 
 /** The note for one local day, or null when nothing happened. */
 export async function dailyNote(db: pg.Pool, day: string): Promise<{ rel: string; fm: Fm; body: string } | null> {
@@ -78,7 +78,7 @@ export async function dailyNote(db: pg.Pool, day: string): Promise<{ rel: string
        AND NOT EXISTS (SELECT 1 FROM sources h WHERE h.session_id = s.session_id AND coalesce(h.hide_as, h.tool) = ANY($4::text[]))
      GROUP BY 1, 2, 3, 4 ORDER BY t0`, [from, to, NOT_APPS, PRIVATE]);
   const ids = sessions.filter((s) => s.kind === 'main').map((s) => s.session_id);
-  const [cards, prompts, github, facts, handoffs] = await Promise.all([
+  const [cards, prompts, github, facts] = await Promise.all([
     q(`SELECT DISTINCT ON (sid) sid, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) txt
        FROM facts f JOIN sources s ON s.id = f.source_id CROSS JOIN unnest(f.session_ids) sid
        WHERE f.kind = 'card' AND f.session_ids && $1::text[] AND sid = ANY($1::text[]) ORDER BY sid, f.valid_at DESC`, [ids]),
@@ -96,12 +96,11 @@ export async function dailyNote(db: pg.Pool, day: string): Promise<{ rel: string
        WHERE f.kind <> 'card' AND ((f.created_at >= $1 AND f.created_at < $2) OR (f.expired_at >= $1 AND f.expired_at < $2))
          AND NOT EXISTS (SELECT 1 FROM sources h WHERE h.session_id = ANY(f.session_ids) AND coalesce(h.hide_as, h.tool) = ANY($3::text[]))
        ORDER BY f.importance DESC NULLS LAST, f.created_at, f.fid`, [from, to, PRIVATE]), // a chat hidden after it was dreamt
-    q(`SELECT id, project, from_app, to_app, title, status, created_at FROM handoffs WHERE created_at >= $1 AND created_at < $2 ORDER BY id`, [from, to]),
   ]);
 
   const projects = new Map<string, Project>();
   // keyed by folder name, like the hub notes (hubs/<name> hub.md): two paths ending in one name share a section
-  const at = (path: string, p = projectName(path)) => projects.get(p) ?? projects.set(p, { apps: new Map(), sessions: [], commits: [], issues: [], facts: [], old: [], handoffs: [] }).get(p)!;
+  const at = (path: string, p = projectName(path)) => projects.get(p) ?? projects.set(p, { apps: new Map(), sessions: [], commits: [], issues: [], facts: [], old: [] }).get(p)!;
   const seen = (p: Project, t: Date) => { if (!p.t0 || t < p.t0) p.t0 = t; if (!p.t1 || t > p.t1) p.t1 = t; };
   const ok = await placeGuard(db);
   const say = (s: string, n: number) => { const t = line(s, n); return ok(t) ? t : null; };
@@ -130,13 +129,10 @@ export async function dailyNote(db: pg.Pool, day: string): Promise<{ rel: string
     if (f.created) at(f.project).facts.push(l);
     if (f.superseded) at(f.project).old.push(l);
   }
-  // sent to one app (to_app): only that app may read the title (handoff.openHandoffs), and every app reads this note
-  for (const h of handoffs) at(h.project).handoffs.push(`#${h.id} ${h.from_app}${h.to_app ? ` → ${h.to_app}` : ''}: ${h.to_app ? '(ส่งถึงแอปเดียว)' : say(h.title, 70) ?? HIDDEN} (${h.status})`);
   if (!projects.size) return null;
 
-  const last = [...sessions.map((s) => s.t1), ...github.map((g) => g.ts), ...facts.map((f) => (f.created ? f.created_at : f.expired_at)),
-    ...handoffs.map((h) => h.created_at)].reduce((a: Date, b: Date) => (b > a ? b : a), from);
-  // projects in order of their first activity; facts/handoffs without one (global) last
+  const last = [...sessions.map((s) => s.t1), ...github.map((g) => g.ts), ...facts.map((f) => (f.created ? f.created_at : f.expired_at))].reduce((a: Date, b: Date) => (b > a ? b : a), from);
+  // projects in order of their first activity; facts without one (global) last
   const order = [...projects].sort(([a, x], [b, y]) => Number(!a) - Number(!b) || (x.t0?.getTime() ?? Infinity) - (y.t0?.getTime() ?? Infinity) || a.localeCompare(b));
   let body = `# ${day} ${TD[new Date(`${day}T12:00:00Z`).getUTCDay()]}\n\n` +
     `สรุปอัตโนมัติจากแชต AI, GitHub และความจำของวันนี้ (ไม่รวมข้อมูล Google) — แก้ไฟล์นี้ได้ เครื่องจะไม่เขียนทับ\n`;
@@ -148,8 +144,7 @@ export async function dailyNote(db: pg.Pool, day: string): Promise<{ rel: string
       p.commits.length && `commits ${p.commits.length}: ${more(p.commits, CAP.commits)}`,
       p.issues.length && `issue/PR: ${more(p.issues, CAP.issues)}`,
       p.facts.length && `ความจำใหม่ ${p.facts.length}: ${more(p.facts, CAP.facts, hub)}`,
-      p.old.length && `ถูกแทนที่ ${p.old.length}: ${more(p.old, CAP.superseded, hub)}`,
-      ...p.handoffs.map((h) => `ส่งต่องาน ${h}`)].filter(Boolean);
+      p.old.length && `ถูกแทนที่ ${p.old.length}: ${more(p.old, CAP.superseded, hub)}`].filter(Boolean);
     body += `\n## ${head.filter(Boolean).join(' · ')}\n${rows.map((r) => `- ${r}\n`).join('')}`;
   }
   return {

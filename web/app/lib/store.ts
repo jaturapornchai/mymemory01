@@ -7,7 +7,7 @@ import {
   type BrainLink,
   type BrainNode,
   type LogEntry,
-} from './brain';
+} from './brain.ts'; // .ts: node --test loads this file (store.test.ts)
 
 /** 150 days at 16× = 9.4 s: the intro and ▶ stay ≤ 10 s even with no quiet stretch to warp past */
 const REPLAY_DAYS = 150;
@@ -32,6 +32,14 @@ export class BrainStore {
   events: BrainEvent[] = [];
   /** unseen events from live feed merges, fired by the driver in LIVE (a replay playhead passing one fires it from `events` and drops it here) */
   pending: BrainEvent[] = [];
+  /**
+   * Light for one MCP call each (lib/live.ts: /live.json, local only): one event per node it hit. Fired by the driver at
+   * the moment of the request, only while LIVE (a replay playhead never plays them), and never part of `events`: the
+   * feed brings the same requests later as minute buckets.
+   */
+  flash: BrainEvent[] = [];
+  /** /live.json answers: it fires search/recall at the request itself, so the feed's copies of those only join the history */
+  liveOwns = false;
   /** system log, newest first (graph and feed both carry the whole log) */
   log: LogEntry[] = [];
   /** per-app counts, daily activity, last dream run: latest export wins (graph and feed both carry them) */
@@ -42,7 +50,8 @@ export class BrainStore {
   /** bumped whenever nodes/links membership or any node field changes */
   rev = 0;
 
-  private seenEvents = new Set<string>();
+  /** eventKey → the count already seen: events are per-minute buckets that grow as requests arrive */
+  private seenEvents = new Map<string, number>();
   private seenLinks = new Set<string>();
 
   /** `graph` = full snapshot (replaces stats/events); `feed` = recent delta (appends unseen events). Returns true if nodes/links changed. */
@@ -68,16 +77,19 @@ export class BrainStore {
 
     if (kind === 'graph') {
       this.events = b.events.filter((e) => this.nodes.has(e[1])).sort((a, c) => a[0] - c[0]);
-      this.seenEvents = new Set(this.events.map(eventKey));
+      this.seenEvents = new Map(this.events.map((e) => [eventKey(e), e[3]]));
     } else {
       let sorted = true;
       for (const e of b.events) {
         const key = eventKey(e);
-        if (this.seenEvents.has(key) || !this.nodes.has(e[1])) continue;
-        this.seenEvents.add(key);
-        if (this.events.length && e[0] < this.events[this.events.length - 1][0]) sorted = false;
-        this.events.push(e);
-        this.pending.push(e);
+        const seen = this.seenEvents.get(key) ?? 0;
+        if (e[3] <= seen || !this.nodes.has(e[1])) continue; // unknown node: retry on a later merge
+        this.seenEvents.set(key, e[3]);
+        // a bucket that grew (2nd, 3rd … request in the same minute on one source) fires only what is new
+        const fresh: BrainEvent = seen ? [e[0], e[1], e[2], e[3] - seen] : e;
+        if (this.events.length && fresh[0] < this.events[this.events.length - 1][0]) sorted = false;
+        this.events.push(fresh);
+        if (!(this.liveOwns && fresh[2] !== 'turn')) this.pending.push(fresh);
       }
       if (!sorted) this.events.sort((a, c) => a[0] - c[0]);
     }

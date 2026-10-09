@@ -100,6 +100,28 @@ test('digest: user turns kept, tool lines + bracket turns dropped, files listed'
   assert.deepEqual(buildDigests('s', 'p', [{ uuid: 'x', role: 'user', ts: new Date(), text: 'ok' }]), []); // nothing worth a card
 });
 
+test('digest: his pick from an AI multiple-choice question is a user turn (Claude tool row, ZCode line); dismissed = nothing', () => {
+  const ts = new Date();
+  const [d] = buildDigests('s', 'd:/demo', [
+    { uuid: 'a', role: 'user', ts, text: 'ช่วยวางแผนให้หน่อยครับ' },
+    { uuid: 'b', role: 'assistant', ts, text: 'มี 2 ทาง\n[Ask] จะเอาแบบไหน?' },
+    { uuid: 'c', role: 'tool', ts, text: '[AskUserQuestion result] Your questions have been answered: "จะเอาแบบไหน?"="B ช้าแต่ชัวร์". You can now continue with these answers in mind.' },
+    { uuid: 'd', role: 'assistant', ts, text: 'ทำแบบ B แล้วครับ' },
+    { uuid: 'e', role: 'tool', ts, text: '[AskUserQuestion result] [User dismissed — do not proceed]' },
+    { uuid: 'f', role: 'tool', ts, text: '[Agent result] done' },
+    { uuid: 'g', role: 'user', ts, text: 'ต่อเลย' },
+    { uuid: 'h', role: 'assistant', ts, text: 'ถามก่อน\n[Ask result] User has answered your questions: "พอร์ต?"="5441 (แนะนำ)". You can now continue with the user\'s answers in mind.\nใช้ 5441 แล้ว' },
+  ]);
+  assert.deepEqual(d.turns.map((t) => [t.uuid, t.role, t.text]), [
+    ['a', 'user', 'ช่วยวางแผนให้หน่อยครับ'],
+    ['c', 'user', '[ตอบตัวเลือกของ AI] "จะเอาแบบไหน?"="B ช้าแต่ชัวร์"'],
+    ['d', 'assistant', 'ทำแบบ B แล้วครับ'],
+    ['g', 'user', 'ต่อเลย'],
+    ['h', 'user', '[ตอบตัวเลือกของ AI] "พอร์ต?"="5441 (แนะนำ)"'],
+    ['h', 'assistant', 'ใช้ 5441 แล้ว'],
+  ]);
+});
+
 test('note file names never carry path or control characters (a JSON "D:\\books" decodes to a backspace)', () => {
   assert.equal(fileName('`D:\books-model` = เอกสาร\tmodel'), 'D ooks-model = เอกสาร model');
   assert.equal(fileName(String.raw`C:\Program Files\x`), 'C Program Files x');

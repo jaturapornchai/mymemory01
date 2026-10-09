@@ -21,6 +21,7 @@ const RULES: Rule[] = [
   { kind: 'digitalocean', re: /\bdo[opr]_v1_[0-9a-f]{64}\b/g },
   { kind: 'ark', re: /\bark-(?=(?:[\w-]*\d){4})[0-9a-z-]{30,}/gi }, // BytePlus/Volcengine Ark keys (hex+dash: entropy rule skips them)
   { kind: 'ollama', re: /\b[0-9a-f]{32}\.[A-Za-z0-9_-]{20,}/g }, // Ollama cloud keys
+  { kind: 'syn', re: /\bsyn_[0-9a-f]{32}\b/gi }, // syn_ + 32 hex: pure hex, so the entropy rule skips it (one reached the index)
   // natural language: password `x` / รหัสผ่าน "x" (quoted value, no = or :)
   { kind: 'kv', re: /(\b(?:password|passwd|pwd)\s+(?:is\s+)?|(?:รหัสผ่าน|พาสเวิร์ด)\s*(?:คือ\s*)?)[`'"]([^`'"\s]{3,})[`'"]/gi, group: 2 },
   // scheme://user:PASSWORD@host  → only the password part

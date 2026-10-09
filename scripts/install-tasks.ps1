@@ -7,6 +7,7 @@ $root = Split-Path -Parent $PSScriptRoot # the repo folder, wherever it is clone
 if ($Remove) {
   Unregister-ScheduledTask -TaskPath $folder -TaskName hourly -Confirm:$false -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskPath $folder -TaskName nightly -Confirm:$false -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskPath $folder -TaskName serve -Confirm:$false -ErrorAction SilentlyContinue
   'removed'; exit
 }
 $vbs = Join-Path $root 'scripts\hidden.vbs'
@@ -18,5 +19,13 @@ foreach ($t in @(@{ n = 'hourly'; tr = $hourly }, @{ n = 'nightly'; tr = $nightl
   $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$root\scripts\$($t.n).cmd`"" -WorkingDirectory $root
   Register-ScheduledTask -TaskPath $folder -TaskName $t.n -Action $action -Trigger $t.tr -Settings $settings `
     -Description "memory-hub $($t.n) job ($root\scripts\$($t.n).cmd)" -Force | Out-Null
+}
+# optional, machine-specific: scripts\serve.cmd (web monitor + MCP online), runs from logon until logoff, no time limit
+if (Test-Path "$root\scripts\serve.cmd") {
+  $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`" `"$root\scripts\serve.cmd`"" -WorkingDirectory $root
+  $serve = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  Register-ScheduledTask -TaskPath $folder -TaskName serve -Action $action -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME) `
+    -Settings $serve -Description "memory-hub online ($root\scripts\serve.cmd)" -Force | Out-Null
 }
 Get-ScheduledTask -TaskPath $folder | Select-Object TaskName, State, @{ n = 'Next'; e = { ($_ | Get-ScheduledTaskInfo).NextRunTime } }

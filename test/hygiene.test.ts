@@ -110,7 +110,7 @@ test('forget --session: single-source fact + card retired, multi-source trimmed,
   assert.equal(git('status', '--porcelain'), '');
 });
 
-test('lint: expired, duplicate pair, orphan, broken link, stale handoff — private sources never listed', async () => {
+test('lint: expired, duplicate pair, orphan, broken link — private sources never listed', async () => {
   note('facts/demo/F0000eee old.md', 'F0000eee', ['bbbb-u0'], { invalid_at: '2026-09-01T00:00:00.000Z' });
   note('facts/demo/F0000f01 twin one.md', 'F0000f01', ['bbbb-u0'], {}, 'twin one');
   note('facts/demo/F0000f02 twin two.md', 'F0000f02', ['bbbb-u0'], {}, 'twin two');
@@ -126,25 +126,18 @@ test('lint: expired, duplicate pair, orphan, broken link, stale handoff — priv
   // a note that only Claude may see (hide_as): its expiry must not reach the vault / other apps
   await db.query(`UPDATE sources s SET hide_as = 'google' FROM facts f WHERE f.source_id = s.id AND f.fid = 'F0000f05'`);
   const NOW = new Date('2026-10-03T20:00:00Z'); // 2026-10-04 in Bangkok
-  await db.query(`INSERT INTO handoffs (project, from_app, title, body, created_at) VALUES
-    ('d:/demo', 'codex-mcp-client', 'ทำ migration ค้าง', 'next: x', $1::timestamptz - interval '3 days'),
-    ('d:/demo', 'claude-code', 'เพิ่งฝากไว้', 'next: y', $1::timestamptz - interval '1 hour'),
-    ('', 'claude-code', 'ส่งเฉพาะ codex', 'next: z', $1::timestamptz - interval '4 days')`, [NOW]);
-  await db.query(`UPDATE handoffs SET to_app = 'codex' WHERE title = 'ส่งเฉพาะ codex'`);
 
   const r = await lintReport(db, NOW);
   assert.deepEqual(r.expired.map((x) => x.fid), ['F0000eee']);
   assert.deepEqual(r.dups.map((x) => [x.a, x.b]), [['F0000f01', 'F0000f02']]);
   assert.deepEqual(r.orphans.map((x) => x.fid), ['F0000ccc']); // the edited note whose chat was forgotten
   assert.deepEqual(r.broken.map((x) => x.dst_name), ['no such note']);
-  assert.deepEqual(r.handoffs.map((x) => x.title), ['ส่งเฉพาะ codex', 'ทำ migration ค้าง']);
 
   const dry = await runLint(db, { dry: true, now: NOW });
-  assert.match(dry, /^## 2026-10-04\nเลยวันหมดอายุ 1 · อาจซ้ำ 1 คู่ · แชตต้นทางหายหมด 1 · ลิงก์เสีย 1 · งานส่งต่อค้าง 2 · หลักฐานไม่ตรง \d+ · อาจขัดกัน \d+\n/);
+  assert.match(dry, /^## 2026-10-04\nเลยวันหมดอายุ 1 · อาจซ้ำ 1 คู่ · แชตต้นทางหายหมด 1 · ลิงก์เสีย 1 · หลักฐานไม่ตรง \d+ · อาจขัดกัน \d+ · บอกว่าแทนแล้วแต่ของเก่ายัง active 0\n/);
   assert.match(dry, /\[\[F0000f01 twin one\]\] ≈ \[\[F0000f02 twin two\]\] · 1\.000/);
   assert.match(dry, /\[\[F0000f04 links\]\] → `no such note`/);
-  assert.match(dry, /\(ส่งถึง codex\)/);
-  assert.doesNotMatch(dry, /F0000f05|secret|from a mail|ส่งเฉพาะ codex/);
+  assert.doesNotMatch(dry, /F0000f05|secret|from a mail/);
   assert.ok(!existsSync(file(LINT_REL)), 'dry writes nothing');
 
   assert.match(await runLint(db, { now: NOW }), /hubs\/_lint\.md written: เลยวันหมดอายุ 1/);

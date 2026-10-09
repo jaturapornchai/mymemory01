@@ -22,7 +22,7 @@ export const fileName = (s: string, max = 80) =>
   cutAtWord(s.replace(/[\\/:*?"<>|#^[\]\x00-\x1f`]+/g, ' ').replace(/\s+/g, ' ').trim(), max).trim() || 'untitled';
 
 /** Truncate on a word boundary (Thai-aware) so names/IPs/numbers are never cut into a different-looking value. */
-function cutAtWord(s: string, max: number) {
+export function cutAtWord(s: string, max: number) {
   if (s.length <= max) return s;
   let end = 0;
   for (const { index } of new Intl.Segmenter('th', { granularity: 'word' }).segment(s)) { if (index > max) break; end = index; }
@@ -108,7 +108,8 @@ export function saveNote(content: string, opts: { title?: string; project?: stri
   const text = clean(content).trim();
   const fid = noteFid(content);
   const scope = opts.global || !opts.project ? 'global' : 'project';
-  const rel = `facts/${scope === 'global' ? '_global' : projectSlug(opts.project)}/${fid} ${fileName(opts.title || text.split('\n')[0], 40)}.md`;
+  // the title is redacted like the text: it becomes the file name, the vault commit message and every search citation
+  const rel = `facts/${scope === 'global' ? '_global' : projectSlug(opts.project)}/${fid} ${fileName(opts.title ? clean(opts.title) : text.split('\n')[0], 40)}.md`;
   const path = join(MEMORY_VAULT, rel);
   // the same text again keeps what the note already has: its status (a pending note stays pending until he approves it),
   // kind, importance and dates (a rule re-saved without kind stays a rule)

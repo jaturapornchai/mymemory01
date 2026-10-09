@@ -7,7 +7,7 @@
     "build": "next build",
     "data": "node ../src/cli.ts brain --public --out public/graph.json",
     "typecheck": "tsc --noEmit",
-    "test": "node --test app/components/brain/brain.test.ts app/lib/insight.test.ts app/lib/numbers.test.ts",
+    "test": "node --test app/components/brain/brain.test.ts app/lib/insight.test.ts app/lib/numbers.test.ts app/lib/store.test.ts app/lib/live.test.ts app/components/brainview/routes.test.ts app/components/brainview/steps.test.ts",
     "check": "node scripts/scene-check.mjs"
   },
   "dependencies": {

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "brain-serve",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["src/cli.ts", "brain-serve"],
+      "port": 5442
+    }
+  ]
+}

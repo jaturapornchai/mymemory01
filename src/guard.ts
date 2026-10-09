@@ -13,7 +13,7 @@ export function offsiteBackend(env: NodeJS.ProcessEnv = process.env): string | n
 }
 
 // Claude-only sources (ลุงจืด 2026-10-03): Gmail/Docs/Sheets and the Maps timeline. Never shown to other apps, never dreamed,
-// public brain = counts only. Gate = MCP (search/get/related/timeline) + SessionStart; a shell on this PC still reads the DB.
+// public brain = counts only. Gate = MCP (search/get incl. its timeline/related views) + SessionStart; a shell on this PC still reads the DB.
 export const PRIVATE_TOOLS = new Set(['google', 'google-timeline']);
 
 /** May this MCP client see PRIVATE_TOOLS? A Claude app (clientInfo claude-code / claude-ai) whose model runs on Anthropic's own

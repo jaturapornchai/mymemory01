@@ -45,7 +45,7 @@ before(async () => {
   await src('sub', 'claude', 'subagent', S1, 'a/S1/agent-a452e1a5cf23e915d.jsonl', [['user', 0, 'x0']]);
   await src('commit', 'github', 'doc', 'github:o/r:commits', 'g/commits.jsonl', [['note', 5, 'github:o/r@4f3a9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b']], 5);
   await src('issue', 'github', 'doc', 'github:o/r#12', 'g/12.json', [['note', 0, 'github:o/r#12']]);
-  await src('note', 'obsidian', 'note', 'bc-dev/decisions/2026-09-01-ledger.md', 'v/x.md', [['note', 0, 'obs:n1']]);
+  await src('note', 'obsidian', 'note', 'vault-a/decisions/2026-09-01-ledger.md', 'v/x.md', [['note', 0, 'obs:n1']]);
   await src('gmail', 'google', 'doc', 'gmail:t1', 'g/t1', [['note', 0, 'gm0']]);
   await src('hid', 'claude', 'main', 'hidden-session-0000', 'a/h.jsonl', [['user', 1, 'h1']], 1, { hide_as: 'google' });
   // facts: f1 cites an AI turn of S2 and his + an AI turn of S1 → his earliest words (m3), ×2; f2 only AI turns; f3 = memory_save (own note);
@@ -65,7 +65,7 @@ test('origins: one tag per hit, from the chunk or (a fact) its cited turns', asy
   assert.equal(tag('sub'), 'claude/sub:f23e915d#0', 'a subagent shares the main session id: its own file names it');
   assert.equal(tag('commit'), 'github:o/r@4f3a9c1');
   assert.equal(tag('issue'), 'github:o/r#12');
-  assert.equal(tag('note'), 'note:bc-dev/decisions/2026-09-01-ledger.md');
+  assert.equal(tag('note'), 'note:vault-a/decisions/2026-09-01-ledger.md');
   assert.equal(tag('gmail'), undefined, 'Claude-only: the private label is all a hit shows');
   assert.deepEqual(o.get(C.f1), { tag: 'claude:aaaabbbb#3', ts: new Date(T + 3 * 60e3), n: 2, ai: false }, 'his earliest words, 2 sessions');
   assert.equal(o.get(C.f2)?.ai, true, 'no turn of his among the cited ones');
@@ -106,8 +106,14 @@ test('lint: fact text vs the turns it cites (hard anchors) and close same-projec
   await note('bad', 'F0000a002', 'deploy ด้วย vercel_cli 3.2 บนเครื่อง box77', ['l0'], vec(0, 1));
   await note('old', 'F0000a003', 'ฐานข้อมูล memhub-pg ใช้พอร์ต 5434', ['l0'], vec(0.9, Math.sqrt(1 - 0.81)));
   await note('same', 'F0000a004', 'deploy ผ่าน vercel_cli 3.2 บน box77 เสมอ', ['l0'], vec(0.1, 0.995));
+  // says it replaces "old" (and only mentions "ok"): far from every other note, so no dup/conflict pair
+  await note('new', 'F0000a005', 'memhub-pg ใช้พอร์ต 5441 แทน F0000a003 (ยกเลิกแล้ว)', ['l0'], `[${[0, 0, 1, ...Array(1021).fill(0)].join(',')}]`);
+  await note('mention', 'F0000a006', 'memhub-pg เดิมจด F0000a001 ไว้', ['l0'], `[${[0, 0, 0, 1, ...Array(1020).fill(0)].join(',')}]`);
   const r = await lintReport(db, new Date(T));
   assert.deepEqual(r.support.map((x) => [x.fid, x.have, x.of]), [['F0000a002', 0, 3], ['F0000a004', 0, 3]], 'ok/old cite a turn holding their anchors');
   assert.deepEqual(r.conflicts.map((x) => [x.a, x.b, x.why]), [['F0000a001', 'F0000a003', 'ตัวเลขต่างกัน']], 'bad↔same: close, same numbers, no negation');
-  assert.match(renderLint(r, new Date(T)), /อาจขัดกัน 1\n[\s\S]*\[\[ok\]\] ↔ \[\[old\]\] · ตัวเลขต่างกัน · 0\.900/);
+  assert.deepEqual(r.replaced.map((x) => [x.npath, x.opath]), [['v/new.md', 'v/old.md']], 'a bare mention is not a replacement');
+  const md = renderLint(r, new Date(T));
+  assert.match(md, /อาจขัดกัน 1 · บอกว่าแทนแล้วแต่ของเก่ายัง active 1\n[\s\S]*\[\[ok\]\] ↔ \[\[old\]\] · ตัวเลขต่างกัน · 0\.900/);
+  assert.match(md, /\n- \[\[new\]\] → \[\[old\]\]\n/);
 });

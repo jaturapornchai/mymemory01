@@ -155,25 +155,10 @@ CREATE INDEX IF NOT EXISTS access_log_node ON access_log (turn_uuid, ts);
 ALTER TABLE access_log ADD COLUMN IF NOT EXISTS tool text;      -- search | get | related | timeline (timeline logs kind 'related')
 ALTER TABLE access_log ADD COLUMN IF NOT EXISTS ms int;         -- call start → reply text ready
 ALTER TABLE access_log ADD COLUMN IF NOT EXISTS semantic boolean; -- search: false = keyword-only fallback (embedder busy/down)
+ALTER TABLE access_log ADD COLUMN IF NOT EXISTS chars int;      -- reply text length the calling AI got (its token cost); null on related
 GRANT SELECT ON facts, review_queue TO memhub_ro;
 
--- Cross-AI handoffs (memory_handoff, src/handoff.ts): an app stops mid-task, the next app claims it exactly once.
--- Written by the MCP server, so memhub_ro may insert/update here (like access_log).
-CREATE TABLE IF NOT EXISTS handoffs (
-  id         serial PRIMARY KEY,
-  project    text NOT NULL,                  -- normalized path of the saver's cwd; '' = global
-  from_app   text NOT NULL,                  -- MCP clientInfo.name of the saver (codex-mcp-client, claude-code, …)
-  to_app     text,                           -- only this app may take it (claude|codex|gemini|antigravity|zcode|lmstudio); NULL = any
-  title      text NOT NULL CHECK (length(title) <= 120),
-  body       text NOT NULL CHECK (length(body) <= 1500), -- redacted: done / stopped at / next / files
-  status     text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'claimed', 'done', 'expired')),
-  created_at timestamptz NOT NULL DEFAULT now(),
-  claimed_by text,                           -- clientInfo.name of the claimer
-  claimed_at timestamptz
-);
-CREATE INDEX IF NOT EXISTS handoffs_open ON handoffs (project, created_at) WHERE status = 'open';
-GRANT SELECT, INSERT, UPDATE ON handoffs TO memhub_ro;
-GRANT USAGE ON SEQUENCE handoffs_id_seq TO memhub_ro;
+-- The handoffs table was dropped from this schema on 2026-10-07 (memory_handoff removed, 0 rows ever); an existing DB may still have it, harmless.
 
 -- What each SessionStart hook injected (session-start.ts): ids only, never the text, so ลุงจืด can see what an AI was given
 -- (cli stats --injected). Written by the hook, so memhub_ro may insert here (like access_log).
@@ -183,9 +168,11 @@ CREATE TABLE IF NOT EXISTS injections (
   client  text NOT NULL,                     -- --app: claude-code | codex | gemini | zcode
   project text,                              -- normalized cwd
   session text,                              -- the new chat's session id
-  ids     text[] NOT NULL,                   -- in shown order: F…/S… rule + card fids, #N handoffs, session:<id> unsummarized chats
+  ids     text[] NOT NULL,                   -- in shown order: F…/S… rule + card fids, session:<id> unsummarized chats
   chars   int NOT NULL                       -- additionalContext length (budget 2000)
 );
 CREATE INDEX IF NOT EXISTS injections_ts ON injections (ts);
 GRANT INSERT ON injections TO memhub_ro;
 GRANT USAGE ON SEQUENCE injections_id_seq TO memhub_ro;
+ALTER TABLE injections ADD COLUMN IF NOT EXISTS source text; -- Claude Code SessionStart source: startup | resume | clear | compact | fork
+GRANT SELECT ON injections TO memhub_ro;                      -- the hook skips a resume of a chat it already briefed

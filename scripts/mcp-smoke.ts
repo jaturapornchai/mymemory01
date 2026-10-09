@@ -30,7 +30,7 @@ if (/must be an ISO date|is after until/.test(dated)) fail('date range rejected'
 const id = out.match(ID)?.[1];
 if (!id) fail('no result id → get/timeline skipped');
 else {
-  const tl = await call('memory_timeline', { id });
+  const tl = await call('memory_get', { view: 'timeline', id });
   if (tl.length > 1500) fail('timeline > 1500 chars');
   const get = await call('memory_get', { id });
   const est = brief.match(new RegExp(`^\\[${id}\\] .*? ≈(\\d+)t`, 'm'))?.[1]; // brief's estimate for the same hit vs the real get

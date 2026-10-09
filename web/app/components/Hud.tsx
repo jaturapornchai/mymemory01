@@ -29,8 +29,8 @@ export const Glyph = memo(function Glyph({ type, size = 16 }: { type: NodeType; 
   );
 });
 
-/** ติดตาม + ตาราง: in the header on desktop, in the ข้อมูล sheet on phones (CSS shows one of the two copies). */
-export function ViewTools(props: { follow: boolean; followPaused: boolean; onFollow: () => void; table: boolean; onTable: () => void }) {
+/** ติดตาม + ตาราง + สมอง (+ ทดสอบถาม, local viewer only: onAsk): in the header on desktop, in the ข้อมูล sheet on phones (CSS shows one of the two copies). */
+export function ViewTools(props: { follow: boolean; followPaused: boolean; onFollow: () => void; table: boolean; onTable: () => void; brain: boolean; onBrain: () => void; onAsk?: () => void }) {
   return (
     <>
       <button type="button" className="btn" aria-pressed={props.follow} data-paused={props.followPaused} aria-description={props.follow && props.followPaused ? 'พักการติดตามชั่วคราว' : undefined} onClick={props.onFollow} title="กล้องตามกิจกรรมล่าสุด ลากหรือซูมจะพักการติดตาม 20 วินาที">
@@ -40,6 +40,14 @@ export function ViewTools(props: { follow: boolean; followPaused: boolean; onFol
       <button type="button" className="btn" aria-pressed={props.table} onClick={props.onTable}>
         ตาราง
       </button>
+      <button type="button" className="btn btn--brain" aria-pressed={props.brain} aria-haspopup="dialog" onClick={props.onBrain} title="แผนที่สมองจริง: ดูแสงวิ่งตามทุกคำขอที่ AI เรียกความจำ">
+        สมอง
+      </button>
+      {props.onAsk && (
+        <button type="button" className="btn" aria-haspopup="dialog" onClick={props.onAsk} title="ถามความจำจริง แล้วดูทีละขั้นว่าค้นอย่างไร เจออะไร ส่งอะไรให้ AI">
+          ทดสอบถาม
+        </button>
+      )}
     </>
   );
 }

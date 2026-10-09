@@ -278,9 +278,14 @@ ${k.text}`))), b.map((k) => bigramTsvector(bigramRuns(k.text)))],
 async function hideAsOf(db: pg.Pool, hub: string[]): Promise<string | null> {
   // ids and the 8+ hex prefixes memory_get/timeline/related accept. ponytail: a hit re-chunked before this transcript is
   // indexed no longer resolves; match its labels too if that shows up
-  const ids = [...new Set(hub.join('\n').match(/\b[0-9a-f]{8,16}\b/g) ?? [])].map((id) => `${id}%`);
-  return ids.length ? (await db.query(`SELECT s.tool FROM sources s JOIN chunks c ON c.source_id = s.id
-    WHERE s.tool = ANY($2::text[]) AND c.id LIKE ANY($1) LIMIT 1`, [ids, [...PRIVATE_TOOLS]])).rows[0]?.tool ?? null : null;
+  // A chat already hidden like them (hide_as: shown Claude-only data, or a fact dreamed from one) counts too, by chunk id or
+  // fact id: Claude sees it, and its quote of that text would otherwise reach every app.
+  const text = hub.join('\n');
+  const ids = [...new Set(text.match(/\b[0-9a-f]{8,16}\b/g) ?? [])].map((id) => `${id}%`);
+  const fids = [...new Set(text.match(/\b[FSI][0-9a-f]{8}\b/g) ?? [])];
+  return ids.length || fids.length ? (await db.query(`SELECT coalesce(s.hide_as, s.tool) h FROM sources s
+    WHERE coalesce(s.hide_as, s.tool) = ANY($2::text[]) AND (s.id IN (SELECT source_id FROM chunks WHERE id LIKE ANY($1))
+      OR s.id IN (SELECT source_id FROM facts WHERE fid = ANY($3))) LIMIT 1`, [ids, [...PRIVATE_TOOLS], fids])).rows[0]?.h ?? null : null;
 }
 
 /** <dir>/<sid>.jsonl and every journal under <dir>/<sid>/subagents are one session: its key <dir>/<sid>. */
@@ -337,9 +342,23 @@ export async function indexFile(db: pg.Pool, path: string, force = false, shared
     tool: 'claude', path, kind: isSub ? 'subagent' : 'main', sessionId, project,
     size: st.size, mtimeMs: st.mtimeMs, sha256: hash, label: projectName(project), isSub, hideAs,
     replace: !!old && st.size < Number(old.size), // rewritten (not appended): drop rows so seq numbers stay consistent
-  }, turns, (c) => c.query(`UPDATE sources s SET hide_as = x.h FROM (SELECT max(hide_as) h FROM sources WHERE tool = 'claude' AND session_id = $1) x
-    WHERE s.tool = 'claude' AND s.session_id = $1 AND s.hide_as IS NULL AND x.h IS NOT NULL`, [sessionId]).then(() => {}));
+  }, turns, async (c) => {
+    await c.query(`UPDATE sources s SET hide_as = x.h FROM (SELECT max(hide_as) h FROM sources WHERE tool = 'claude' AND session_id = $1) x
+      WHERE s.tool = 'claude' AND s.session_id = $1 AND s.hide_as IS NULL AND x.h IS NOT NULL`, [sessionId]);
+    await hideDreamed(c, sessionId);
+  });
   return msgs.length ? 'indexed' : 'empty';
+}
+
+/** A fact/card note dreamed from a chat that is hidden now (hide_as, also when set after the dream) is hidden the same way, so
+ *  every reader's coalesce(hide_as, tool) filter drops it: hits, links, synapses, hubs, brain, term_df, session start.
+ *  sessionId = just that chat (importer), sourceId = just that note (obsidian indexFact, same transaction); none = all (nightly
+ *  consolidate). Sticky, like a chat's hide_as. */
+export async function hideDreamed(c: pg.ClientBase | pg.Pool, sessionId: string | null = null, sourceId: number | null = null) {
+  await c.query(`UPDATE sources n SET hide_as = x.h FROM (
+      SELECT f.source_id, max(h.hide_as) h FROM sources h JOIN facts f ON f.session_ids @> ARRAY[h.session_id]
+      WHERE h.hide_as IS NOT NULL AND ($1::text IS NULL OR h.session_id = $1) AND ($2::bigint IS NULL OR f.source_id = $2) GROUP BY 1) x
+    WHERE n.id = x.source_id AND n.hide_as IS NULL`, [sessionId, sourceId]);
 }
 
 /** Project of the main session that spawned a subagent/workflow (indexed row, else its transcript's first cwd). */

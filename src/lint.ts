@@ -7,17 +7,16 @@ import { basename, join } from 'node:path';
 import type pg from 'pg';
 import { ORPHAN } from './dream.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
-import { ago } from './handoff.ts';
 import { projectName } from './importer.ts';
 import { MEMORY_PROJECT, MEMORY_VAULT, parseNote, writeNote } from './notes.ts';
 import { indexVault } from './obsidian.ts';
 import { commitBatch } from './vault-git.ts';
 
-const CAP = 20, KEEP = 7, DUP = 0.95, STALE_HOURS = 48; // stale = nobody claimed it in 2 days (it expires after handoff.DAYS)
+const CAP = 20, KEEP = 7, DUP = 0.95;
 const CONFLICT = 0.8; // same project, cosine CONFLICT..DUP: close enough to be about one thing, not a duplicate
 export const LINT_REL = 'hubs/_lint.md';
 const PUBLIC = 'coalesce(s.hide_as, s.tool) <> ALL($1::text[])'; // $1 = PRIVATE_TOOLS in every source query
-// a fact note is an obsidian source (never hide_as): what may be Claude-only is the chat it was dreamed from (= daily.ts)
+// a fact note dreamed from a Claude-only chat gets hide_as too (importer.hideDreamed); this also checks the chats themselves (= daily.ts)
 const PUBLIC_FACT = `${PUBLIC} AND NOT EXISTS (SELECT 1 FROM sources h WHERE h.session_id = ANY(f.session_ids) AND coalesce(h.hide_as, h.tool) = ANY($1::text[]))`;
 const title = (path: string) => basename(String(path).replace(/\\/g, '/'), '.md');
 const day = (d: Date) => new Date(d).toLocaleDateString('sv-SE', { timeZone: 'Asia/Bangkok' }); // YYYY-MM-DD
@@ -45,8 +44,6 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
     broken: await q(`SELECT s.path, l.dst_name, count(*) OVER () total FROM links l JOIN sources s ON s.id = l.src_id
       WHERE ${PUBLIC} AND s.tool = 'obsidian' AND s.project = $2 AND l.dst_id IS NULL AND NOT starts_with(s.session_id, $3)
       ORDER BY s.path, l.dst_name LIMIT ${CAP}`, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`),
-    handoffs: (await db.query(`SELECT id, from_app, to_app, project, title, created_at, count(*) OVER () total FROM handoffs
-      WHERE status = 'open' AND created_at < $1::timestamptz - make_interval(hours => ${STALE_HOURS}) ORDER BY created_at, id LIMIT ${CAP}`, [now])).rows as Row[],
     // a dream fact vs the turns it cites: are its hard anchors (numbers, ids, paths, versions) there? (the citation is only checked to exist)
     support: unsupported(await q(`SELECT f.fid, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
         (SELECT string_agg(t.text_redacted, ' ') FROM turns t WHERE t.uuid = ANY(f.source_uuids) AND t.uuid NOT LIKE 'obs:%') src
@@ -60,6 +57,13 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
       SELECT a.fid a, a.path apath, a.body abody, b.fid b, b.path bpath, b.body bbody, 1 - (a.e <=> b.e) sim
       FROM v a JOIN v b ON b.project = a.project AND a.fid < b.fid
       WHERE a.e <=> b.e <= $2 AND a.e <=> b.e > $3 ORDER BY a.e <=> b.e, a.fid, b.fid LIMIT 500`, 1 - CONFLICT, 1 - DUP)),
+    // a fact whose text says it replaces another ("แทน F…", "ยกเลิก") while that one is still active: the replacement was only
+    // written in the text, nothing retired the old one, and SessionStart kept showing both (3 global rules, 2026-10-09)
+    replaced: await q(`WITH v AS (SELECT f.fid, s.path, split_part((SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1), E'\\n\\n- ', 1) body
+        FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card')
+      SELECT npath, opath, count(*) OVER () total FROM (SELECT DISTINCT n.path npath, o.path opath
+        FROM v n CROSS JOIN LATERAL regexp_matches(n.body, 'F[0-9a-f]{8}', 'g') m JOIN v o ON o.fid = m[1]
+        WHERE o.fid <> n.fid AND n.body ~* '(แทน|ยกเลิก|replac|supersed)') x ORDER BY 1, 2 LIMIT ${CAP}`),
   };
 }
 
@@ -90,8 +94,8 @@ export type LintReport = Awaited<ReturnType<typeof lintReport>>;
 
 const total = (rows: Row[]) => Number(rows[0]?.total ?? 0);
 export const lintSummary = (r: LintReport) =>
-  `เลยวันหมดอายุ ${total(r.expired)} · อาจซ้ำ ${total(r.dups)} คู่ · แชตต้นทางหายหมด ${total(r.orphans)} · ลิงก์เสีย ${total(r.broken)} · งานส่งต่อค้าง ${total(r.handoffs)}` +
-  ` · หลักฐานไม่ตรง ${total(r.support)} · อาจขัดกัน ${total(r.conflicts)}`;
+  `เลยวันหมดอายุ ${total(r.expired)} · อาจซ้ำ ${total(r.dups)} คู่ · แชตต้นทางหายหมด ${total(r.orphans)} · ลิงก์เสีย ${total(r.broken)}` +
+  ` · หลักฐานไม่ตรง ${total(r.support)} · อาจขัดกัน ${total(r.conflicts)} · บอกว่าแทนแล้วแต่ของเก่ายัง active ${total(r.replaced)}`;
 
 /** One dated section (Asia/Bangkok day). Wikilinks to notes; a broken target is plain code (a link would be broken itself). */
 export function renderLint(r: LintReport, now = new Date()): string {
@@ -105,9 +109,8 @@ export function renderLint(r: LintReport, now = new Date()): string {
       (x) => `[[${title(x.path)}]] · พบ ${x.have}/${x.of} · ไม่พบ \`${x.miss.join(' ').replace(/`/g, '')}\``) +
     sec(`อาจขัดกัน (โปรเจกต์เดียวกัน, cosine ${CONFLICT}–${DUP})`, r.conflicts,
       (x) => `[[${title(x.apath)}]] ↔ [[${title(x.bpath)}]] · ${x.why} · ${Number(x.sim).toFixed(3)}`) +
-    sec('ลิงก์เสีย', r.broken, (x) => `[[${title(x.path)}]] → \`${String(x.dst_name).replace(/`/g, '')}\``) +
-    sec(`งานส่งต่อค้าง (เปิดเกิน ${STALE_HOURS} ชม.)`, r.handoffs, (x) => `#${x.id} ${x.from_app} ${ago(x.created_at, +now)} · ` +
-      `${x.project ? projectName(x.project) : 'global'}: ${x.to_app ? `(ส่งถึง ${x.to_app})` : x.title}`); // targeted: only that app may read it
+    sec('บอกว่าแทนอีกข้อแล้ว แต่ข้อเก่ายัง active', r.replaced, (x) => `[[${title(x.npath)}]] → [[${title(x.opath)}]]`) +
+    sec('ลิงก์เสีย', r.broken, (x) => `[[${title(x.path)}]] → \`${String(x.dst_name).replace(/`/g, '')}\``);
 }
 
 /** forget: older sections (KEEP days) still link the notes it just deleted → drop those lines. An edited _lint.md is his. */

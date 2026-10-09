@@ -130,7 +130,7 @@ export async function buildBrain(db: pg.Pool, mode: 'public' | 'local', since?: 
     // GitHub hub ('@github'), local moves non-cloned ones to their owner's hub ('@owner'); public keys are unchanged
     const raw = 'source:' + s.id + (h === homeOf(s) ? '' : pub ? '@github' : '@owner');
     const n: BrainNode = { id: id(raw), type, p: hub.id, n: s.n, t0: sec(s.t0), t1: sec(s.t1), u: uses.get(String(s.id)) ?? 0 };
-    if (!pub && type !== 'subagent') {
+    if (!pub && type !== 'subagent' && !s.hide_as) { // hide_as: Claude-only by what it quoted, counts only (no prompt, no title)
       n.label = type === 'session' ? (s.first ?? s.session_id).replace(/\s+/g, ' ').slice(0, 60) : String(s.session_id).replace(/^.*\/|\.md$/g, '');
     }
     if (s.status === 'superseded') n.u = -1; // ponytail: viewer dims u<0; a real flag when there's a 2nd status
@@ -277,6 +277,9 @@ export function dreamLog(lines: string, since: number): LogEntry[] {
   }
   return out;
 }
+
+/** brain-serve --share: ลุงจืด's own AI searches / recalls (access_log) stay out, as its /live.json does; new chat turns are memory. */
+export const forShare = (b: Brain): Brain => ({ ...b, events: b.events.filter((e) => e[2] === 'turn'), log: b.log.filter((l) => l.k !== 'recall') });
 
 /** The viewer's system log: hourly ingest + recall counts, dream runs, last publish (local only). */
 async function systemLog(db: pg.Pool, pub: boolean): Promise<LogEntry[]> {

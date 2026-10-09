@@ -3,9 +3,10 @@ import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrainNode } from './lib/brain';
 import { fmtDate } from './lib/format';
-import { useNow, useReducedMotion } from './lib/hooks';
+import { shown, useNow, useReducedMotion } from './lib/hooks';
 import { useBrainData } from './lib/useBrainData';
 import { useDriver } from './lib/useDriver';
+import { useLive } from './lib/useLive';
 import { useTheme } from './lib/theme';
 import { Header, StatStrip, ViewTools, type StatValues } from './components/Hud';
 import { DetailsPanel, HoverCard, HubTable, SidePanel, type SideTab } from './components/Panels';
@@ -20,10 +21,14 @@ const BrainScene = dynamic(() => import('./components/BrainScene'), {
   loading: () => <div className="scene scene--loading" aria-hidden="true" />,
 });
 
+// the brain view (2D canvas + one picture) is only fetched when the สมอง button is first pressed
+const BrainView = dynamic(() => import('./components/BrainView'), { ssr: false });
+
 export default function Page() {
   const { store, rev, tick, status } = useBrainData();
   const [sceneReady, setSceneReady] = useState(false);
   const { graph, activeEvents, replay, actions, ready } = useDriver(store, sceneReady);
+  const { feed, available: liveAvailable } = useLive(store, store.mode === 'local'); // re-evaluated per merge (tick re-renders)
   // the boot screen stays until the driver has the data (and starts the intro): the first HUD painted is the intro's
   const booting = status === 'loading' || (status !== 'error' && !ready);
   const reduced = useReducedMotion();
@@ -39,6 +44,8 @@ export default function Page() {
   const [tab, setTab] = useState<SideTab>('feed');
   const [hud, setHud] = useState(false); // phones only: the ข้อมูล sheet (desktop always shows the side panel)
   const [how, setHow] = useState(false); // "ระบบนี้ทำงานยังไง?" panel
+  const [brain, setBrain] = useState(false); // "สมอง": the full-stage brain view
+  const [ask, setAsk] = useState(false); // opened by ทดสอบถาม: focus in its ask box
   const [lens, setLens] = useState(false); // "สีตาม AI"
   const [semantic, setSemantic] = useState(false); // "จัดตามความหมาย"
   const [spot, setSpot] = useState<Spotlight | null>(null); // nodes the how panel points at
@@ -71,6 +78,24 @@ export default function Page() {
     setTable(false);
   }, []);
   const closeHow = useCallback(() => setHow(false), []);
+  const brainOpener = useRef<Element | null>(null); // the page goes inert behind the view: focus is taken from it, so remember it here
+  const openBrain = useCallback((asking: boolean) => {
+    brainOpener.current = document.activeElement;
+    setAsk(asking);
+    setBrain((b) => asking || !b);
+    setHow(false);
+    setHud(false);
+    setTable(false);
+    setHover(null);
+  }, []);
+  const onBrain = useCallback(() => openBrain(false), [openBrain]);
+  const onAsk = useCallback(() => openBrain(true), [openBrain]);
+  const closeBrain = useCallback(() => setBrain(false), []);
+  useEffect(() => {
+    if (brain || !brainOpener.current) return;
+    [brainOpener.current, document.querySelector('.btn--hud')].find(shown)?.focus(); // phones: the สมอง button sits in the ข้อมูล sheet, closed by then
+    brainOpener.current = null;
+  }, [brain]);
   const onLens = useCallback(() => setLens((l) => !l), []);
   const onSemantic = useCallback(() => setSemantic((v) => !v), []);
   const onAutoFollowPause = useCallback((until: number) => {
@@ -139,14 +164,14 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, graph, store, tick]);
   // memoized with SidePanel: the replay re-renders the page ~30×/s, the side panel only needs it for its own inputs
-  const tools = useMemo(() => <ViewTools follow={follow} followPaused={followPaused} onFollow={() => setFollow((f) => !f)} table={table} onTable={() => { setTable((t) => !t); setHow(false); }} />, [follow, followPaused, table]);
+  const tools = useMemo(() => <ViewTools follow={follow} followPaused={followPaused} onFollow={() => setFollow((f) => !f)} table={table} onTable={() => { setTable((t) => !t); setHow(false); }} brain={brain} onBrain={onBrain} onAsk={liveAvailable ? onAsk : undefined} />, [follow, followPaused, table, brain, onBrain, liveAvailable, onAsk]);
   const howRow = useMemo(() => <HowRow apps={store.apps} open={how} onOpen={onHow} lens={lens} onLens={onLens} semantic={semantic} onSemantic={onSemantic} />, [store.apps, how, onHow, lens, onLens, semantic, onSemantic]);
 
   const selected = selectedId ? (store.nodes.get(selectedId) ?? null) : null;
   const tip = hover && hover.id !== selectedId ? hover : null;
 
   return (
-    <main ref={stageRef} className="stage" data-hud={hud ? 'on' : 'off'} data-table={table ? 'on' : 'off'} data-how={how ? 'on' : 'off'} data-selected={selected ? '' : undefined} data-phase={booting ? 'boot' : introRunning ? 'intro' : undefined}>
+    <main ref={stageRef} className="stage" data-hud={hud ? 'on' : 'off'} data-table={table ? 'on' : 'off'} data-how={how ? 'on' : 'off'} data-brain={brain ? 'on' : 'off'} data-selected={selected ? '' : undefined} data-phase={booting ? 'boot' : introRunning ? 'intro' : undefined}>
       <BrainScene
         graph={graph}
         activeEvents={activeEvents}
@@ -166,7 +191,8 @@ export default function Page() {
         onReady={onSceneReady}
       />
 
-      <div className="hud">
+      {/* inert while the brain view covers it: no tab stop or screen-reader stop behind the dialog */}
+      <div className="hud" inert={brain}>
         <Header mode={store.mode} status={booting ? 'loading' : status} replaySpeed={live ? null : replay.speed} playing={replay.playing} ring={landed} tools={tools} hud={hud} onHud={onHud} />
         <StatStrip stats={stats} instant={!live || reduced}>
           {howRow}
@@ -188,6 +214,8 @@ export default function Page() {
         {table && <HubTable store={store} rev={rev} onPick={pick} onClose={() => setTable(false)} />}
         {how && <HowPanel store={store} rev={rev} tick={tick} now={now} lens={lens} onLens={onLens} semantic={semantic} onSemantic={onSemantic} onSpot={setSpot} onClose={closeHow} reduced={reduced} />}
       </div>
+
+      {brain && <BrainView store={store} feed={feed} live={liveAvailable} ask={ask} events={activeEvents} reduced={reduced} onClose={closeBrain} />}
 
       {/* not over the selected node: the details panel already shows the same facts */}
       <HoverCard node={tip} hub={tip ? store.hubOf(tip) : undefined} tipRef={tipRef} />

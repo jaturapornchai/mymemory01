@@ -97,7 +97,7 @@ test('a new session finds it: Thai paraphrase, English, and full text via memory
   } finally { await m.close(); }
 });
 
-test('progressive disclosure over stdio: brief search → memory_timeline → memory_get, estimates match what get returns', async () => {
+test('progressive disclosure over stdio: brief search → memory_get view timeline → text, estimates match what get returns', async () => {
   const { tokens } = await import('../src/timeline.ts');
   const m = await mcp();
   try {
@@ -105,11 +105,11 @@ test('progressive disclosure over stdio: brief search → memory_timeline → me
     const [, id, est] = brief.match(/^\[([0-9a-f]{16})\] .*? ≈(\d+)t/m) ?? [];
     assert.ok(id, brief);
     for (const l of brief.split('\n')) assert.ok(l.length <= 200, l);
-    const tl = await m.call('memory_timeline', { id });
+    const tl = await m.call('memory_get', { view: 'timeline', id });
     assert.ok(tl.length <= 1500 && new RegExp(`^▶ \\[${id}\\] `, 'm').test(tl), tl);
     const got = tokens(await m.call('memory_get', { id }));
     assert.ok(Math.abs(Number(est) - got) <= Math.max(5, got * 0.1), `brief ≈${est}t vs memory_get ≈${got}t`);
-    assert.equal(await m.call('memory_timeline', { id: 'F99999999' }), 'not found: F99999999');
+    assert.equal(await m.call('memory_get', { view: 'timeline', id: 'F99999999' }), 'not found: F99999999');
   } finally { await m.close(); }
 });
 
@@ -117,7 +117,7 @@ test('every read tool logs its latency (search: + keyword-only flag) → cli sta
   const m = await mcp();
   try {
     const id = (await m.call('memory_search', { query: 'รหัสห้องประชุมลับ ชั้น 9' })).match(/^\[([0-9a-f]{16})\]/m)![1];
-    for (const tool of ['memory_get', 'memory_related', 'memory_timeline']) await m.call(tool, { id });
+    for (const view of ['text', 'related', 'timeline']) await m.call('memory_get', { id, view });
   } finally { await m.close(); }
   const timed = async () => (await db.query(`SELECT tool, kind, ms, semantic FROM access_log WHERE rank = 1 AND ms IS NOT NULL ORDER BY id`)).rows;
   await until('latency rows', async () => new Set((await timed()).map((r) => r.tool)).size === 4, 5000);
@@ -197,10 +197,10 @@ test('freshness: what other apps did since server start is found at once (search
       assert.ok(out.includes(`${word} otherapp`), cwd);
       assert.ok(out.includes(`${word} ownelsewhere`), cwd);
       assert.ok(!out.includes(`${word} ownsession`), `${cwd}: ${out}`); // the other cwd's own session is not ours
-      const tl = await m.call('memory_timeline', { id: other });
+      const tl = await m.call('memory_get', { view: 'timeline', id: other });
       assert.match(tl, new RegExp(`^▶ \\[${other}\\] `, 'm'), cwd); // was cut at server start
       assert.ok(!tl.includes(`[${own}]`), `${cwd}: ${tl}`); // 'other sessions near then' leaves out the caller's own live one
-      const related = await m.call('memory_related', { id: elsewhere, limit: 8 });
+      const related = await m.call('memory_get', { view: 'related', id: elsewhere, limit: 8 });
       assert.ok(related.includes(`[${other}]`) && !related.includes(`[${own}]`), `${cwd}: ${related}`);
     } finally { await m.close(); }
   }

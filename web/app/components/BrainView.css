@@ -1,0 +1,608 @@
+/* "สมอง" (components/BrainView.tsx): a full-stage view over the HUD. The anatomy picture with a canvas of pathways exactly
+   on it, the meaning of each region under it, and (local viewer only) the search box and the live ticker beside it.
+   Always dark, whatever the page theme: the picture is a night scene, so the tokens are re-declared here. */
+.bv {
+  --bg: #04060d;
+  --surface: rgba(16, 18, 24, 0.8);
+  --surface-solid: rgba(14, 16, 22, 0.9);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --hilite: rgba(255, 255, 255, 0.05);
+  --fill: rgba(255, 255, 255, 0.06);
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  --text: #f2f3f5;
+  --text-2: #a1a5ae;
+  --text-3: #8b919c;
+  --accent: #a594ff;
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  padding: max(var(--gap), env(safe-area-inset-top)) max(var(--gap), env(safe-area-inset-right)) max(var(--gap), env(safe-area-inset-bottom)) max(var(--gap), env(safe-area-inset-left));
+  color: var(--text);
+  color-scheme: dark;
+  background: var(--bg);
+  animation: fade-in 200ms ease-out backwards;
+}
+/* the 3D scene is not drawn behind it: display:none makes the engine's size 0×0, which pauses its frame loop */
+.stage[data-brain='on'] .scene {
+  display: none;
+}
+.bv__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.bv__title {
+  margin: 0;
+  font: 600 18px/1.3 var(--font);
+}
+.bv__sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ───────── body: picture + legend (+ side) ───────── */
+.bv__body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: var(--gap);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'area'
+    'legend';
+}
+.bv__body[data-live] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
+  grid-template-areas:
+    'area side'
+    'legend side';
+}
+/* a test-ask is open: the log needs the room, the ticker shrinks under it */
+.bv__body[data-ask] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, min(580px, 45vw)); /* 720–959 px: the picture keeps over half */
+}
+.bv__body[data-ask] .bv__result {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+.bv__body[data-ask] .bv__ticker {
+  flex: none;
+  min-height: 0;
+  max-height: 18vh;
+}
+.bv__area {
+  grid-area: area;
+  min-height: 0;
+  container-type: size;
+  display: grid;
+  place-items: center;
+}
+/* contain, in the picture's own aspect ratio (--img-w / --img-h come from IMAGE in brainview/regions.ts): as wide as the area allows without becoming taller than it */
+.bv__box {
+  position: relative;
+  width: min(100cqw, calc(100cqh * var(--img-w) / var(--img-h)));
+  aspect-ratio: var(--img-w) / var(--img-h);
+}
+.bv__img,
+.bv__canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+/* a little darker, so the light has something to shine against; the corners melt into the page (the brain is cropped to within 3 % of the
+   edges, so the ellipse stays opaque to 80 %: it reaches no brain pixel of the picture, tmp/brainview2/mask.mjs) */
+.bv__img {
+  object-fit: contain;
+  filter: brightness(0.5) saturate(0.85);
+  -webkit-mask-image: radial-gradient(ellipse at center, #000 80%, transparent 100%);
+  mask-image: radial-gradient(ellipse at center, #000 80%, transparent 100%);
+}
+.bv__canvas {
+  font-family: var(--font); /* the canvas reads it for the region names */
+  touch-action: pan-y;
+}
+.bv__tip {
+  position: absolute;
+  left: clamp(120px, var(--x), calc(100% - 120px));
+  top: var(--y);
+  z-index: 2;
+  width: max-content;
+  max-width: 230px;
+  padding: 8px 11px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--surface-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  transform: translate(-50%, calc(-100% - 20px));
+  pointer-events: none;
+}
+.bv__tip[data-below] {
+  transform: translate(-50%, 20px);
+}
+.bv__tip span {
+  display: block;
+  color: var(--text-2);
+}
+
+/* ───────── legend ───────── */
+.bv__legend {
+  grid-area: legend;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.bv__reg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 7px 11px;
+  font: 400 12px/1.4 var(--font);
+  text-align: left;
+  color: var(--text-2);
+  background: var(--fill);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms;
+}
+.bv__reg b {
+  font-weight: 600;
+  color: var(--text);
+}
+.bv__reg span {
+  display: block;
+  color: var(--text-3);
+}
+.bv__reg:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.bv__reg[aria-pressed='true'] {
+  border-color: var(--accent);
+}
+
+/* ───────── side: search + ticker ───────── */
+.bv__side {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: inset 0 1px 0 var(--hilite), var(--shadow);
+}
+.bv__search {
+  display: flex;
+  gap: 8px;
+}
+.bv__input {
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  padding: 0 12px;
+  font: 400 13px/1 var(--font);
+  color: var(--text);
+  background: var(--fill);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+.bv__input::placeholder {
+  color: var(--text-3);
+}
+.bv__search .btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+.bv__result {
+  flex: none;
+  max-height: 42%;
+  overflow-y: auto;
+}
+.bv__wait {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+.bv__wait[data-busy] {
+  animation: bv-breathe 1.2s ease-in-out infinite alternate;
+}
+@keyframes bv-breathe {
+  from {
+    opacity: 0.55;
+  }
+}
+/* "ไม่รู้": the memory has nothing on this query (the server's rule); what was found is only near misses */
+.bv__unknown {
+  margin: 0 0 6px;
+  padding: 7px 10px;
+  font: 600 13px/1.4 var(--font);
+  color: #ffd691;
+  background: rgba(255, 196, 107, 0.12);
+  border: 1px solid rgba(255, 196, 107, 0.45);
+  border-radius: 8px;
+}
+.bv__h {
+  margin: 4px 0 0;
+  font: 600 12px/1.4 var(--font);
+  color: var(--text-2);
+}
+.bv__ticker {
+  flex: 1;
+  min-height: 120px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.bv__empty {
+  padding: 10px 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.bv__call {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 7px 0;
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+  animation: rise 240ms var(--ease) backwards;
+}
+.bv__time {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+.bv__app {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+}
+.bv__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 8px var(--c);
+}
+.bv__kind {
+  color: var(--text-2);
+}
+.bv__ms {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+.bv__q,
+.bv__chips {
+  grid-column: 1 / -1;
+}
+.bv__q {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+.bv__q--private {
+  font-style: italic;
+  color: var(--text-3);
+}
+.bv__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.bv__chip {
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--text-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+
+/* ───────── test-ask log (brainview/AskLog.tsx): a timeline of the search's steps, each dot in its route's colour ───────── */
+.al {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.al__sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.al__bar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 6px;
+  background: rgb(14, 16, 22); /* opaque: the side's --surface over --bg; the log scrolls under it */
+}
+.al__bar .btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.al__speed {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+.al__sp {
+  padding: 4px 10px;
+  font: 500 12px/1 var(--font);
+  color: var(--text-3);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.al__sp[aria-pressed='true'] {
+  color: var(--text);
+  background: var(--fill);
+}
+.al__prog {
+  margin-left: auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+.al__steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.al__step {
+  position: relative;
+  padding: 0 0 14px 28px;
+  animation: rise 360ms var(--ease) backwards;
+}
+/* the line down to the next step */
+.al__step::before {
+  content: '';
+  position: absolute;
+  left: 9px;
+  top: 22px;
+  bottom: 2px;
+  width: 2px;
+  background: linear-gradient(var(--c), transparent);
+  opacity: 0.45;
+}
+.al__n {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  font: 700 11px/1 var(--font);
+  color: #04060d;
+  background: var(--c);
+  border-radius: 50%;
+  box-shadow: 0 0 10px var(--c);
+}
+.al__step[data-now] .al__n {
+  animation: al-pulse 0.9s ease-in-out infinite alternate;
+}
+@keyframes al-pulse {
+  to {
+    box-shadow: 0 0 20px 4px var(--c);
+  }
+}
+.al__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-height: 20px;
+}
+.al__title {
+  font: 600 13px/1.5 var(--font);
+}
+.al__step[data-tone='ok'] .al__title::after {
+  content: ' ✓';
+  color: #7be0a8;
+}
+.al__reg {
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-2);
+  border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
+  border-radius: 999px;
+}
+.al__ms {
+  margin-left: auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+.al__text {
+  margin: 2px 0 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.al__step[data-tone='warn'] .al__text {
+  color: #ffd691;
+}
+.al__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+.al__facts li {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-2);
+  background: var(--fill);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.al__facts b {
+  font-weight: 600;
+  color: var(--text);
+}
+.al__facts li[data-tone='ok'] {
+  border-color: rgba(123, 224, 168, 0.45);
+}
+.al__facts li[data-tone='warn'] {
+  border-color: rgba(255, 196, 107, 0.5);
+}
+.al__facts li[data-tone='warn'] b {
+  color: #ffd691;
+}
+.al__facts li[data-tone='dim'] {
+  opacity: 0.6;
+}
+.al__items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.al__items li {
+  display: grid;
+  grid-template-columns: minmax(2.6em, auto) auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 2px 6px;
+  padding: 4px 0;
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+  animation: rise 280ms var(--ease) backwards;
+}
+.al__rank {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text-3);
+}
+.al__label {
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+.al__note {
+  grid-column: 3;
+  font-size: 11px;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.al__all {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: rise 360ms var(--ease) backwards;
+}
+.al__group summary {
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.al__group summary b {
+  color: var(--text);
+}
+.al__group[data-key='ai'] summary b {
+  color: #7be0a8;
+}
+.al__group[data-key='cap'] summary b,
+.al__group[data-key='full'] summary b {
+  color: var(--text-2);
+}
+
+/* ───────── narrower: the legend in two columns, below 720 px one column and the whole view scrolls ───────── */
+@media (max-width: 959px) {
+  .bv__legend {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 719px) {
+  .bv {
+    --gap: 8px;
+    overflow-y: auto;
+  }
+  .bv__body,
+  .bv__body[data-live] {
+    flex: none;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-template-areas:
+      'area'
+      'side'
+      'legend';
+  }
+  .bv__body:not([data-live]) {
+    grid-template-areas:
+      'area'
+      'legend';
+  }
+  /* the picture's height follows its width here: no height to contain it in */
+  .bv__area {
+    container-type: inline-size;
+    display: block;
+  }
+  .bv__box {
+    width: 100cqw;
+  }
+  .bv__ticker {
+    max-height: 42vh;
+  }
+  /* the whole view scrolls here: the log box must not be a scroller of its own, or the player bar never sticks */
+  .bv__result {
+    overflow: visible;
+  }
+  .bv__legend {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (forced-colors: active) {
+  .bv__reg[aria-pressed='true'] {
+    border-color: Highlight;
+  }
+  .bv__dot {
+    forced-color-adjust: none;
+  }
+  .al__n {
+    border: 1px solid CanvasText;
+  }
+  .al__sp[aria-pressed='true'] {
+    outline: 2px solid Highlight;
+  }
+}

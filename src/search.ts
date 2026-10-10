@@ -105,7 +105,8 @@ const RARE_FRACTION = 0.05; // terms in >5% of chunks don't select candidates (t
 // chunks (idf 0.05, PERF 2026-10-04). 1 = the old fallback (A/B: eval).
 const KW_FALLBACK_MAX_DF = Number(process.env.MEMHUB_KW_FALLBACK_MAX_DF ?? 0.5);
 // The words leg reads every chunk holding a candidate (≈ Σ df): candidates join rarest first while their df adds up to ≤ this
-// (the rarest always joins); the rest still add score. 93 of 200 bench queries summed 4,000–15,300. 0 = no budget (A/B: eval).
+// (the rarest always joins); the rest still add score. 93 of 200 bench queries summed 4,000–15,300. 2026-10-10 A/B (MCP, 400
+// searches ×2): p50/p95 55/100 → 45/79 ms, keyword-only 46/94 → 36/69; eval tune vis@3–8 same, direct10 −1/88. 0 = no budget.
 const KW_DF_BUDGET = Number(process.env.MEMHUB_KW_DF_BUDGET ?? 4000);
 
 // Keyword legs, run while Ollama embeds the query: $1 words tsquery, $2 bigram tsquery, $3 project, $4 since, $5 before,

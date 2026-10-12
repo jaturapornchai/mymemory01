@@ -96,6 +96,21 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS edges_b ON edges (b);
 
+-- Pairs the local Gemma judged for an edge of kind sem (src/sem.ts, nightly): every verdict, none too, so a pair is judged once;
+-- a deleted source drops its rows like its edges.
+CREATE TABLE IF NOT EXISTS judged_pairs (
+  a          bigint NOT NULL REFERENCES sources ON DELETE CASCADE,
+  b          bigint NOT NULL REFERENCES sources ON DELETE CASCADE,
+  verdict    text NOT NULL,                  -- rel: same_task | fixes | explains | uses | updates | none
+  strength   smallint NOT NULL,              -- 0..3 (0 with none); verdict <> none AND strength 3 → edge kind sem
+  model      text NOT NULL,                  -- llama-server model id
+  judged_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (a, b),
+  CHECK (a < b)
+);
+CREATE INDEX IF NOT EXISTS judged_pairs_b ON judged_pairs (b);
+GRANT SELECT ON judged_pairs TO memhub_ro;
+
 -- Forgotten sessions/projects: deleted from the index and never re-imported (the raw archive is untouched).
 CREATE TABLE IF NOT EXISTS forgotten (
   key        text PRIMARY KEY,               -- 'session:<id>' | 'project:<normalized path prefix>'

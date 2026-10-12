@@ -9,3 +9,5 @@ echo === %date% %time% >> logs\nightly.log
 rem lint = report-only checks written to hubs\_lint.md in the memory vault; a failure is logged and the job goes on
 "C:\Program Files\nodejs\node.exe" src\cli.ts lint >> logs\nightly.log 2>&1 || echo lint failed >> logs\nightly.log
 "C:\Program Files\nodejs\node.exe" src\cli.ts publish >> logs\nightly.log 2>&1
+rem sem = the local Gemma (llama-server :8080) judges new top-cosine pairs into synapses of kind sem; skipped when it is not up
+"C:\Program Files\nodejs\node.exe" src\cli.ts sem >> logs\nightly.log 2>&1

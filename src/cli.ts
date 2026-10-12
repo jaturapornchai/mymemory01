@@ -102,6 +102,18 @@ if (cmd === 'lint') {
   process.exit();
 }
 
+if (cmd === 'sem') {
+  // sem [--dry] [--limit n]: nightly, last: the local Gemma judges new top-cosine pairs → edges kind sem (src/sem.ts).
+  // --dry = counts on the read-only role, no Gemma call; llama-server down or not serving Gemma → skipped, exit 0
+  const { connect } = await import('./db.ts');
+  const dry = args.includes('--dry'), lim = args.includes('--limit') ? args[args.indexOf('--limit') + 1] : undefined;
+  if (lim !== undefined && !/^\d+$/.test(lim)) throw new Error(`sem: --limit needs a whole number, got ${lim}`);
+  const db = connect(dry ? 'ro' : 'rw');
+  try { console.log('sem', JSON.stringify(await (await import('./sem.ts')).runSem(db, { dry, limit: lim === undefined ? undefined : Number(lim) }))); }
+  finally { await db.end(); }
+  process.exit();
+}
+
 const { connect } = await import('./db.ts');
 const db = connect('rw');
 try {
@@ -471,7 +483,7 @@ try {
     if (un.length) await db.query(`DELETE FROM state WHERE k = ANY($1::text[])`, [un.map((f) => `mute:${f}`)]);
     console.log(`muted: ${on.join(' ') || '-'} · unmuted: ${un.join(' ') || '-'}`);
   } else {
-    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|brain [--public] [--out file]|brain-serve [--port n] [--share [--hours n] [--no-tunnel] | --open]|publish [--build] [--force]|mute [-]<fid>...>');
+    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|sem [--dry] [--limit n]|brain [--public] [--out file]|brain-serve [--port n] [--share [--hours n] [--no-tunnel] | --open]|publish [--build] [--force]|mute [-]<fid>...>');
   }
   if (!skipped) await health(db, JOB, jobErr);
 } catch (e) {

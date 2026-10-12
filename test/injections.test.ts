@@ -87,6 +87,20 @@ test('nothing for a subagent or for a resumed chat already briefed; a resume nev
   assert.deepEqual(rows.map((r) => `${r.session}:${r.source}`), ['s-new:startup', 's-old:resume', 's-new:compact']);
 });
 
+test('a sub-folder start gets the folders above it, nearest first: whole path segments only, never a drive root or c:/tmp', async () => {
+  const [child, parent, sibling, drive, ctmp] = [['q:/chaintest/app/sub', 'chainchild'], ['q:/chaintest/app', 'chainparent'],
+    ['q:/chaintest/ap', 'chainsibling'], ['q:', 'chaindrive'], ['c:/tmp', 'chaintmp']]
+    .map(([project, word]) => saveNote(`กฎ: ${word} ใช้กับโฟลเดอร์นี้`, { project, kind: 'rule' }).match(/(F\w{8})/)![1]);
+  await indexVault(db, MEMORY_VAULT);
+  const ctx = await sessionStart('s-child', { cwd: 'Q:\\chaintest\\app\\sub' }); // no .git anywhere up: normProject keeps the sub-folder
+  assert.ok(ctx.includes(child) && ctx.includes(parent), ctx);
+  assert.ok(ctx.indexOf(child) < ctx.indexOf(parent), 'its own folder first');
+  assert.ok(!ctx.includes(sibling), 'q:/chaintest/ap is a string prefix of q:/chaintest/app, not a folder above it');
+  assert.ok(!ctx.includes(drive), 'the drive root is a catch-all, not this project');
+  assert.ok((await sessionStart('s-drive', { cwd: 'q:\\' })).includes(drive), 'a start at the drive root still gets its own');
+  assert.ok(!(await sessionStart('s-ctmp', { cwd: 'c:\\tmp\\chaintest' })).includes(ctmp), 'c:/tmp: scratch folders, not one project');
+});
+
 test('the log write fails (no table before migrate, no grant): the chat still gets its context', async () => {
   await guard();
   // REVOKE, not DROP: with the scratch table gone the hook's search_path (scratch, public) would log into the live table

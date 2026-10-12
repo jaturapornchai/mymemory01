@@ -196,6 +196,17 @@ export function normProject(cwd: string): string {
   }
   return root;
 }
+/** A normProject() result and the folders above it, nearest first, on whole path segments (d:/app is not above d:/apple/x).
+ *  Stops below a drive root and c:/tmp: catch-alls (d: has its own facts) whose facts are not about the folders under them. */
+export function projectChain(project: string): string[] {
+  const chain = [project];
+  for (let d = project; d.lastIndexOf('/') > 0;) {
+    d = d.slice(0, d.lastIndexOf('/'));
+    if (/^[a-z]:$/.test(d) || d === 'c:/tmp') break;
+    chain.push(d);
+  }
+  return chain;
+}
 export const projectName = (p: string) => p.split('/').filter(Boolean).at(-1) ?? p;
 /** Text as the index may hold it: no <private>, no secrets; personal = redactPersonal first (Claude-only Google sources). */
 export const clean = (t: string, personal = false) => { // PG text can't hold NUL

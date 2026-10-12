@@ -142,7 +142,9 @@ try {
         }
         const file = args.find((a) => !a.startsWith('--'));
         const force = args.includes('--force');
-        console.log('index', file ? await imp.indexFile(db, file, force) : await imp.indexArchive(db, force), `${Date.now() - t0} ms`);
+        const tool = file && imp.toolFor(file);
+        console.log('index', file ? await (tool ? imp.indexToolFile(db, tool, file, force) : imp.indexFile(db, file, force))
+          : await imp.indexArchive(db, force), `${Date.now() - t0} ms`);
         if (!file) console.log('vaults', await (await import('./obsidian.ts')).indexVaults(db));
         // a deleted / moved note or re-imported file leaves its brain-map pins behind: one sweep per hour
         if (!file) console.log('pins pruned', await (await import('./layout.ts')).prunePins(db));

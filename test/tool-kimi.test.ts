@@ -155,6 +155,26 @@ test('junk files: nothing worth remembering, missing state.json', async () => {
   assert.equal(p.msgs[0].text, 'hello');
 });
 
+test('state.json version 2 (sessions moved from ~/.kimi) names the folder cwd, not workDir', async () => {
+  const st = JSON.stringify({ id: 'x', version: 2, cwd: 'd:/proj2', createdAt: '2026-08-01T09:59:00.000Z', agents: { main: { type: 'main' } } });
+  const p = await kimi.parse(session('session_v2state', [msg('user', [txt('hello from a moved session')], 'user')], st));
+  assert.equal(p?.cwd, 'd:/proj2');
+});
+
+test('state.json without a folder: workspaces.json names it by the wd_ folder', async () => {
+  write(HOME, 'workspaces.json', JSON.stringify({ version: 1, workspaces: { wd_proj_0123456789ab: { root: 'd:\\proj3', name: 'proj3' } } }));
+  const st = JSON.stringify({ createdAt: '2026-08-01T09:59:00.000Z', title: 't', agents: { main: { type: 'main' } } });
+  const p = await kimi.parse(session('ses_nofolder', [msg('user', [txt('hello from an old session')], 'user')], st));
+  assert.equal(p?.cwd, 'd:\\proj3');
+});
+
+test('import <file>: an archived Kimi log goes to the Kimi parser, a Claude transcript to none', async () => {
+  const { ARCHIVE_ROOT, toolFor } = await import('../src/importer.ts');
+  assert.equal(toolFor(join(ARCHIVE_ROOT, 'kimi', 'wd_proj_0123456789ab', MAIN, 'agents', 'main', 'wire.jsonl'))?.tool, 'kimi');
+  assert.equal(toolFor(join(ARCHIVE_ROOT, 'claude', 'projects', 'd--proj', 'x.jsonl')), undefined);
+  assert.equal(toolFor(join(root, 'elsewhere', 'agents', 'main', 'wire.jsonl')), undefined); // outside the archive
+});
+
 test('isTranscript: agents/<id>/wire.jsonl only, not .bak copies or metadata', () => {
   const s = join(ARCHIVE, 'wd_proj_0123456789ab', MAIN);
   assert.ok(kimi.isTranscript(join(s, 'agents', 'main', 'wire.jsonl')));

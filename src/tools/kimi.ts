@@ -41,6 +41,10 @@ const tidy = (t: string, n = MAX) => {
 
 type Entry = { n: number; ms: number; role: Role; text: string; tool?: boolean };
 
+function workspaceRoot(wd: string): unknown {
+  try { return JSON.parse(readFileSync(join(dirname(SESSIONS), 'workspaces.json'), 'utf8')).workspaces?.[wd]?.root; } catch { return undefined; }
+}
+
 export async function parse(path: string): Promise<Parsed | null> {
   const agent = basename(dirname(path)), sessionDir = dirname(dirname(dirname(path))), sessionId = basename(sessionDir);
   let state: any = {};
@@ -95,7 +99,8 @@ export async function parse(path: string): Promise<Parsed | null> {
       ...(result ? [{ ...result, role: 'tool' as Role, text: `[subagent result] ${tidy(result.text, MAX_RESULT)}` }] : []),
     ];
   }
-  const cwd = typeof state.workDir === 'string' ? state.workDir : '';
+  // version 2 (moved from ~/.kimi) says cwd; some older ones say neither: Kimi's workspaces.json names the wd_ folder
+  const cwd = [state.workDir, state.cwd, workspaceRoot(basename(dirname(sessionDir)))].find((d) => typeof d === 'string') ?? '';
   const msgs: Msg[] = [];
   for (const e of es) {
     const last = msgs.at(-1);

@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, utimesSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type pg from 'pg';
 import { parseClaude, parseSubagent, type Msg } from './claude.ts';
 import { chunkTurns, CHUNKER_VER, type Turn } from './chunk.ts';
@@ -157,6 +157,13 @@ function fileSha(path: string) {
   try { for (let k; (k = readSync(fd, buf, 0, BLOCK, null)) > 0;) h.update(buf.subarray(0, k)); } finally { closeSync(fd); }
   return h.digest('hex');
 }
+
+/** import <file>: the app whose parser owns an archived file (undefined = a Claude transcript). parseClaude on another app's
+ *  log finds no turns, and store() then drops that source's chunks. */
+export const toolFor = (path: string) => TOOLS.find((t) => {
+  const r = relative(join(ARCHIVE_ROOT, t.tool), resolve(path));
+  return !!r && !r.startsWith('..') && !isAbsolute(r) && t.isTranscript(path);
+});
 
 export async function indexToolFile(db: pg.Pool, t: ToolModule, path: string, force = false): Promise<'skip' | 'excluded' | 'indexed' | 'empty'> {
   const st = statSync(path);

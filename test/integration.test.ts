@@ -118,3 +118,26 @@ test('project = repo root: worktrees and subdirs map to the main repo; cwd-less 
   const r = (await db.query('SELECT session_id, project FROM sources WHERE path = $1', [wf])).rows[0];
   assert.deepEqual(r, { session_id: 'sess-1', project: 'd:/demo' });
 });
+
+test('a transcript that repeats a line (same uuid) imports: the first copy is the turn', async () => {
+  const f = join(dir, 'proj', 'sess-dupuuid.jsonl');
+  const a = say('dup answer uuidtwice');
+  writeFileSync(f, line('user', 'dup question uuidtwice') + a + line('user', 'next question uuidtwice') + a);
+  assert.equal(await indexFile(db, f), 'indexed');
+  const rows = (await db.query(`SELECT t.seq FROM turns t JOIN sources s ON s.id = t.source_id WHERE s.path = $1 ORDER BY t.seq`, [f])).rows;
+  assert.deepEqual(rows.map((r) => r.seq), [0, 1, 2]);
+});
+
+test('a changed parser that drops a turn mid-file keeps turns numbered like the chunks on the next append', async () => {
+  const f = join(dir, 'proj', 'sess-renum.jsonl');
+  const ls = [line('user', 'alpha question renum'), say('alpha answer renum'), line('user', 'beta question renum'), say('beta answer renum')];
+  writeFileSync(f, ls.join(''));
+  await indexFile(db, f);
+  // line 3 now parses to nothing (as the interrupt marker does after the fix) and the file grew: no replace
+  writeFileSync(f, ls[0] + ls[1] + ls[2].replace('{"type":"user"', '{"isMeta":true,"type":"user"') + ls[3] + say('gamma answer renum'));
+  assert.equal(await indexFile(db, f), 'indexed');
+  const rows = (await db.query(`SELECT t.seq, t.text_redacted FROM turns t JOIN sources s ON s.id = t.source_id
+    WHERE s.path = $1 ORDER BY t.seq`, [f])).rows;
+  assert.deepEqual(rows.map((r) => [r.seq, r.text_redacted]),
+    [[0, 'alpha question renum'], [1, 'alpha answer renum'], [2, 'beta answer renum'], [3, 'gamma answer renum']]);
+});

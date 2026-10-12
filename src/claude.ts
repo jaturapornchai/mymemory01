@@ -50,10 +50,15 @@ const HUB_TOOL = /__memory_(?:search|get|related|timeline)$/;
  *  hub: collects memory-hub tool inputs and replies (ids it was given / shown), for importer.indexFile. */
 export function parseClaude(raw: string, toolNames = new Map<string, string>(), hub?: string[]): Msg[] {
   const out: Msg[] = [];
+  const userSeen = new Set<string>(); // a queued prompt also sent as an earlier user line is indexed once
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     let o: any;
     try { o = JSON.parse(line); } catch { continue; }
+    // typed while Claude was busy and injected mid-turn: this attachment is the only copy (peer/coordinator/notice origins are not his)
+    const a = o?.type === 'attachment' ? o.attachment : undefined;
+    const queued = a?.type === 'queued_command' && a.commandMode === 'prompt' && (a.origin?.kind ?? 'human') === 'human'; // no origin: older Claude Code
+    if (queued) o = { ...o, type: 'user', message: { content: a.prompt } };
     if (!o || typeof o.uuid !== 'string' || (o.type !== 'user' && o.type !== 'assistant')) continue;
     if (o.isMeta) continue;
     const base = {
@@ -63,7 +68,16 @@ export function parseClaude(raw: string, toolNames = new Map<string, string>(), 
       ts: String(o.timestamp ?? ''),
       cwd: String(o.cwd ?? ''),
     };
-    const push = (role: Role, text: string) => { text = text.trim(); if (text) out.push({ ...base, role, text }); };
+    const push = (role: Role, text: string) => {
+      text = text.trim();
+      if (!text) return;
+      if (role === 'user') {
+        if (text.startsWith('[Request interrupted')) return; // the harness's Esc marker, not his words
+        if (queued && userSeen.has(text)) return;
+        userSeen.add(text);
+      }
+      out.push({ ...base, role, text });
+    };
     const content = o.message?.content;
 
     if (o.type === 'assistant') {

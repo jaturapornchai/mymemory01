@@ -249,13 +249,19 @@ export async function store(db: pg.Pool, m: SourceMeta, turns: StoredTurn[], inT
     );
     const sourceId = src.rows[0].id;
     if (m.replace) await c.query('DELETE FROM turns WHERE source_id = $1', [sourceId]);
+    // appended file re-parsed by a changed parser (a turn dropped or added mid-file): rows whose seq moved are re-inserted,
+    // so turns keep the numbering the chunks use
+    else await c.query(`DELETE FROM turns t WHERE t.source_id = $1
+      AND NOT EXISTS (SELECT 1 FROM unnest($2::text[], $3::int[]) v(u, s) WHERE v.u = t.uuid AND v.s = t.seq)`,
+      [sourceId, turns.map((t) => t.uuid), turns.map((t) => t.seq)]);
 
     for (let i = 0; i < turns.length; i += 1000) {
       const b = turns.slice(i, i + 1000);
       await c.query(
         `INSERT INTO turns (uuid, source_id, seq, session_id, parent_uuid, role, ts, project, text_redacted, is_subagent)
-         SELECT u, $1, s, $2, p, r, NULLIF(t, '')::timestamptz, $3, x, $4
+         SELECT DISTINCT ON (u) u, $1, s, $2, p, r, NULLIF(t, '')::timestamptz, $3, x, $4
          FROM unnest($5::text[], $6::int[], $7::text[], $8::text[], $9::text[], $10::text[]) AS v(u, s, p, r, t, x)
+         ORDER BY u, s -- a transcript can repeat a line: one command may not upsert a uuid twice, the first copy wins
          ON CONFLICT (uuid) DO UPDATE SET text_redacted = EXCLUDED.text_redacted, project = EXCLUDED.project, session_id = EXCLUDED.session_id
            WHERE turns.source_id = EXCLUDED.source_id AND (turns.text_redacted, turns.project, turns.session_id)
              IS DISTINCT FROM (EXCLUDED.text_redacted, EXCLUDED.project, EXCLUDED.session_id)`, // import --force re-applies redaction/project rules

@@ -11,7 +11,7 @@ import { ARCHIVE_ROOT } from './importer.ts';
 import { MEMORY_PROJECT } from './notes.ts';
 
 // the AI chat apps (sources.tool): only their times may set firstChat. A new app counts once added here (fail closed)
-const CHAT_TOOLS = ['claude', 'codex', 'gemini', 'antigravity', 'zcode', 'lmstudio'];
+const CHAT_TOOLS = ['claude', 'codex', 'gemini', 'antigravity', 'zcode', 'lmstudio', 'kimi'];
 const ARCHIVE_TTL = 10 * 60_000;
 let archive: { root: string; at: number; bytes: number; files: number } | undefined;
 

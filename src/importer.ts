@@ -18,6 +18,7 @@ import * as google from './tools/google.ts';
 import * as googleTimeline from './tools/google-timeline.ts';
 import * as lmstudio from './tools/lmstudio.ts';
 import * as zcode from './tools/zcode.ts';
+import * as kimi from './tools/kimi.ts';
 
 const HOME = homedir();
 export const LIVE_DIR = process.env.MEMHUB_LIVE_DIR ?? join(HOME, '.claude', 'projects');
@@ -148,7 +149,7 @@ export type ToolModule = {
   isTranscript(path: string): boolean;               // which archived files to index
   parse(path: string): Promise<Parsed | null>;       // null = junk / nothing worth remembering
 };
-export const TOOLS: ToolModule[] = [codex, gemini, antigravity, zcode, lmstudio, github, google, googleTimeline];
+export const TOOLS: ToolModule[] = [codex, gemini, antigravity, zcode, lmstudio, kimi, github, google, googleTimeline];
 
 /** sha256 of a file in blocks (archived sessions can be 1 GB). */
 function fileSha(path: string) {

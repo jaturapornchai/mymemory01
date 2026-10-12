@@ -16,7 +16,7 @@ const MAX_RESULT = 4000; // subagent results / notices can be huge
 const SKIP_TAG = /^<(?:system-reminder|local-command-stdout|local-command-caveat|bash-stdout|bash-stderr)>/;
 
 // tool_use → one compact line; only tools whose input says something worth recalling.
-function toolLine(name: string, input: any): string | null {
+export function toolLine(name: string, input: any): string | null {
   const s = (v: unknown, n = 300) => (typeof v === 'string' ? v.slice(0, n) : '');
   switch (name) {
     case 'Bash': return `[Bash] ${s(input?.description, 120)} $ ${s(input?.command)}`;

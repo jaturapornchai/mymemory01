@@ -66,6 +66,7 @@ flowchart LR
 | Antigravity | `~/.gemini/antigravity*/brain/*/…/transcript*.jsonl` | อ่านเฉพาะไฟล์ข้อความธรรมดา (`*.pb` เข้ารหัสอยู่) |
 | ZCode | `~/.zcode/cli/db/db.sqlite` (เปิดแบบอ่านอย่างเดียว) | export เป็น JSONL ทีละ session |
 | LM Studio | `~/.lmstudio/conversations/` | ไฟล์ถูกเขียนใหม่ทั้งไฟล์ → เก็บเวอร์ชันเก่าเป็น `.bak` |
+| Kimi Code | `~/.kimi-code/sessions/*/*/agents/*/wire.jsonl` + `state.json` | อ่านแค่ `sessions/` (ไม่แตะ credentials/config); รวม subagent และ session ที่ Kimi ย้ายมาจาก `~/.kimi` (`ses_*`); `~/.kimi` แบบเก่าไม่อ่าน |
 | GitHub | `gh api` (อ่านอย่างเดียว token อยู่ใน `gh`) | การ์ด repo + README, commit ที่เราเขียน, issue/PR ที่เกี่ยวกับเรา — ค้นได้ ไม่เอาไปฝัน |
 | Obsidian | vault ที่ตั้งใน `MEMHUB_VAULTS` | อ่านอย่างเดียว เก็บ `[[wikilink]]` เป็นเส้นเชื่อม |
 | Gmail · Google Docs · Google Sheets | Google API สิทธิ์ `gmail.readonly` + `drive.readonly` เท่านั้น | **เห็นได้เฉพาะ Claude** ดู [Google](#google-gmail-docs-sheets--maps-timeline-ไม่บังคับ) |
@@ -398,7 +399,7 @@ node src/cli.ts vault undo <rev>     # ย้อน แล้วทำดัช�
 | `MEMHUB_LIVE_DIR` | `~/.claude/projects` | แชต Claude Code ตัวจริง (อ่านอย่างเดียว) |
 | `MEMHUB_ARCHIVE_DIR` | `~/ai-archive/raw/claude/projects` | สำเนาถาวรของแชต Claude |
 | `MEMHUB_ARCHIVE_ROOT` | `~/ai-archive/raw` | สำเนาของแอปอื่น (`<root>/<แอป>`) |
-| `MEMHUB_CODEX_HOME` / `MEMHUB_GEMINI_HOME` / `MEMHUB_ANTIGRAVITY_HOME` / `MEMHUB_ZCODE_HOME` / `MEMHUB_LMSTUDIO_HOME` | `~/.codex` / `~/.gemini` / `~/.gemini` / `~/.zcode` / `~/.lmstudio` | โฟลเดอร์ข้อมูลของแต่ละแอป |
+| `MEMHUB_CODEX_HOME` / `MEMHUB_GEMINI_HOME` / `MEMHUB_ANTIGRAVITY_HOME` / `MEMHUB_ZCODE_HOME` / `MEMHUB_LMSTUDIO_HOME` / `KIMI_CODE_HOME` | `~/.codex` / `~/.gemini` / `~/.gemini` / `~/.zcode` / `~/.lmstudio` / `~/.kimi-code` | โฟลเดอร์ข้อมูลของแต่ละแอป |
 | `MEMHUB_EXCLUDE_PROJECTS` | — | path โปรเจกต์ที่ห้ามเข้าดัชนี คั่นด้วย `,` เช่น `d:/clientx` |
 | `MEMHUB_VAULTS` | — | vault Obsidian ที่ให้อ่าน คั่นด้วย `,` |
 | `MEMHUB_MEMORY_VAULT` | `D:/obsidian-vault/memory-hub` | vault ที่ฝัน/`memory_save` เขียนลง |
@@ -458,7 +459,7 @@ src/
   hook.ts           hook Stop/SessionEnd ของ Claude Code: สั่งนำเข้าเบื้องหลัง
   importer.ts       เก็บสำเนา + ทำดัชนี + forget
   claude.ts         อ่านไฟล์แชต Claude Code
-  tools/            ตัวนำเข้าแต่ละแหล่ง: codex, gemini, antigravity, zcode, lmstudio, github, google, google-timeline
+  tools/            ตัวนำเข้าแต่ละแหล่ง: codex, gemini, antigravity, zcode, lmstudio, kimi, github, google, google-timeline
   redact.ts         ตัดความลับ / ข้อมูลส่วนตัว / <private>
   chunk.ts          หั่นแชตเป็นชิ้น ≤1,200 ตัวอักษร
   thai.ts           ตัดคำไทย/อังกฤษ/โค้ด

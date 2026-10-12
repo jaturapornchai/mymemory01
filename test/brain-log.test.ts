@@ -37,6 +37,13 @@ test('assertAnonymous: public log rows are counts only', async () => {
   ]) await assert.rejects(assertAnonymous(db, brain([bad])), /public brain leaks/, JSON.stringify(bad));
 });
 
+test('assertAnonymous: a Kimi archive path leaks its project folder, not the generic agents/ folder', async () => {
+  const db = { query: async () => ({ rows: [{ v: 'C:/Users/u/ai-archive/raw/kimi/wd_acme-secret_0123456789ab/session_x1/agents/main/wire.jsonl' }] }) } as unknown as pg.Pool;
+  const brain = (stats: object) => JSON.stringify({ v: 1, mode: 'public', at: 0, stats, nodes: [], links: [], events: [], log: [] });
+  await assertAnonymous(db, brain({ sessions: 1, subagents: 2 })); // "subagents" holds "agents"
+  await assert.rejects(assertAnonymous(db, brain({ 'wd_acme-secret_0123456789ab': 1 })), /public brain leaks/);
+});
+
 test('assertAnonymous: the log vocabulary is not a leak (notes named update.md / review)', async () => {
   const db = { query: async () => ({ rows: [{ v: 'obsidian/vault/update.md' }, { v: 'D:/work/review/x.md' }] }) } as unknown as pg.Pool;
   const log = [{ t: 1, k: 'dream', c: { UPDATE: 0, pending_review: 0 } }, { t: 2, k: 'recall', c: { searches: 1 } }];

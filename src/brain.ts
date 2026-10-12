@@ -348,7 +348,7 @@ export async function assertAnonymous(db: pg.Pool, json: string) {
     // nor are the app names (approved public; also archive folder names raw/codex, github/<owner>/<repo>, and files like CLAUDE.md)
     for (const part of s.split(/[\\/]/)) {
       const name = part.replace(/\.(md|jsonl)$/, '');
-      if (part.length >= 6 && !isApp(name) && !/^(users|claude|projects|sessions|subagents|workflows|obsidian-vault|ai-archive)$/.test(part)) needles.add(name);
+      if (part.length >= 6 && !isApp(name) && !/^(users|claude|projects|sessions|subagents|agents|workflows|obsidian-vault|ai-archive)$/.test(part)) needles.add(name);
     }
   }
   // the log and dream are checked field by field instead: their own words (update, review...) would hit needles like notes/update.md

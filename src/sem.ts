@@ -12,7 +12,7 @@ import { ROOT } from './db.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
 import { MEMORY_PROJECT, MEMORY_VAULT } from './notes.ts';
 
-const K = 8, MIN_COS = 0.45;
+const K = 8, MIN_COS = 0.45, CROSS_COS = 0.55;
 const LIMIT = 1500; // pairs per night ≈ 35 min at the measured 1.4 s/pair on 2 slots (cli sem --limit n)
 const REL = ['same_task', 'fixes', 'explains', 'uses', 'updates', 'none'];
 
@@ -65,8 +65,8 @@ async function nodes(db: pg.Pool) {
   return live;
 }
 
-/** Per node its top K pairs with cosine ≥ MIN_COS that no edge (other than sem itself: its pairs stay in the set, so the set
- *  stays the measured one) or resolved link joins; never two sessions described by one card. a < b. */
+/** Per node its top K pairs with cosine ≥ MIN_COS (same project) or CROSS_COS (cross-project) that no edge (other than sem)
+ *  or resolved link joins; never two sessions described by one card. a < b. */
 async function candidates(db: pg.Pool, live: Awaited<ReturnType<typeof nodes>>) {
   const key = (a: number, b: number) => (a < b ? `${a}-${b}` : `${b}-${a}`);
   const conn = new Set((await db.query(`SELECT a::int a, b::int b FROM edges WHERE kind <> 'sem'
@@ -79,7 +79,8 @@ async function candidates(db: pg.Pool, live: Awaited<ReturnType<typeof nodes>>) 
       if (x === y || (x.card && x.card === y.card)) continue;
       let s = 0;
       for (let d = 0; d < x.v.length; d++) s += x.v[d] * y.v[d];
-      if (s >= MIN_COS && !conn.has(key(x.id, y.id))) best.push([y, s]);
+      const same = x.proj && x.proj === y.proj;
+      if (s >= (same ? MIN_COS : CROSS_COS) && !conn.has(key(x.id, y.id))) best.push([y, s]);
     }
     best.sort((p, q) => q[1] - p[1]);
     for (const [y, s] of best.slice(0, K))

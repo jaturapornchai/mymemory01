@@ -26,7 +26,7 @@ const BKK = (d: Date) => d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Bangkok
 const SESSION_CAP = 20_000, BATCH_CHARS = 60_000, BATCH_SESSIONS = 12;
 // Sessions per run without --limit: other apps brought ~1000 never-dreamed sessions; the nightly drains them newest first.
 // ponytail: caps sessions, not windows — one huge session still goes whole; a window budget if a night runs too long
-export const DREAM_LIMIT = 25;
+export const DREAM_LIMIT = Number(process.env.MEMHUB_DREAM_LIMIT) || 40;
 const KIND_ASSERTIVE = new Set(['rule', 'feedback', 'decision', 'preference']); // "newer is not truer" for assistant output
 
 // ---------------- LLM runners ----------------

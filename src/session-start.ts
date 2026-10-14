@@ -2,6 +2,9 @@
 // last session cards, and prompts of sessions not dreamt yet. Not logged as a use (access_log); the ids it injected go to
 // injections (cli stats --injected). Any failure → inject nothing.
 // Claude Code runs it as is; Codex / Gemini CLI / ZCode with `--app <name>` (same stdin JSON, same hookSpecificOutput reply).
+import { closeSync, existsSync, openSync, readdirSync, readSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { connect } from './db.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { lastOtherApp } from './handoff.ts';
@@ -18,6 +21,26 @@ const STALE: Record<string, number> = { sync: 3, dream: 36 };
 const HINTS: [RegExp, string][] = [[/oauth|authenticat|credential|\/login/i, ' (แก้: claude /login)'], [/ollama|^embed: .*(?:fetch failed|ECONNREFUSED)/i, ' (เปิด Ollama)']];
 const app = process.argv.includes('--app') ? process.argv[process.argv.indexOf('--app') + 1] ?? '' : 'claude-code';
 
+/** Codex exec (`codex exec`, e.g. gpt-image-2 / gpt-ask.py) and Codex subagents write session_meta before SessionStart runs. */
+function isCodexSubOrExec(session: string, ev: Record<string, any>): boolean {
+  if (ev.originator === 'codex_exec' || ev.source === 'exec' || ev.parent_thread_id) return true;
+  if (!/^[0-9a-f-]{36}$/i.test(session)) return false;
+  const home = process.env.MEMHUB_CODEX_HOME ?? join(homedir(), '.codex');
+  for (const d of [new Date(), new Date(Date.now() - 86400e3)]) {
+    const dir = join(home, 'sessions', String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'));
+    if (!existsSync(dir)) continue;
+    const f = readdirSync(dir).find((n) => n.endsWith(`-${session}.jsonl`));
+    if (!f) continue;
+    const fd = openSync(join(dir, f), 'r'), b = Buffer.allocUnsafe(16384);
+    try {
+      const n = readSync(fd, b, 0, b.length, 0), nl = b.subarray(0, n).indexOf(10);
+      const p = nl > 0 ? JSON.parse(b.toString('utf8', 0, nl)).payload : null;
+      return !!(p && (p.originator === 'codex_exec' || p.source === 'exec' || p.parent_thread_id || p.source?.subagent));
+    } catch { return false; } finally { closeSync(fd); }
+  }
+  return false;
+}
+
 try {
   // memory never goes to a non-Anthropic backend / a non-Claude app when MEMHUB_ANTHROPIC_ONLY=1 (same rule as mcp.ts)
   if (process.env.MEMORY_HUB_INTERNAL || offsiteBackend() || (process.env.MEMHUB_ANTHROPIC_ONLY === '1' && !/^claude/i.test(app))) process.exit(0);
@@ -28,7 +51,7 @@ try {
   const chain = projectChain(project); // a sub-folder start (no .git of its own) also gets the project above it
   const session = String(ev.session_id ?? '');
   const source = String(ev.source ?? ''); // Claude Code: startup | resume | clear | compact | fork
-  if (ev.agent_id) process.exit(0); // inside a subagent (Claude Code docs): its parent briefs it, it can memory_search — 106 blocks/week went there
+  if (ev.agent_id || (app === 'codex' && isCodexSubOrExec(session, ev))) process.exit(0); // subagent or headless codex exec
   const db = connect('ro');
   // resume: Claude Code keeps the earlier block in the transcript it reloads; compact: first compact re-briefs, repeated compacts within 10m skip
   if (session && (source === 'resume' || source === 'compact') && (await db.query(

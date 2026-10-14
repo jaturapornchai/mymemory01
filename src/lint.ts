@@ -44,9 +44,9 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
     broken: await q(`SELECT s.path, l.dst_name, count(*) OVER () total FROM links l JOIN sources s ON s.id = l.src_id
       WHERE ${PUBLIC} AND s.tool = 'obsidian' AND s.project = $2 AND l.dst_id IS NULL AND NOT starts_with(s.session_id, $3)
       ORDER BY s.path, l.dst_name LIMIT ${CAP}`, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`),
-    // a dream fact vs the turns it cites (+ its batch project header): are its hard anchors (numbers, ids, paths, versions) there?
+    // a dream fact vs the turns of the session it came from (+ its batch project header): are its hard anchors there?
     support: unsupported(await q(`SELECT f.fid, f.project, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
-        (SELECT string_agg(t.text_redacted, ' ') FROM turns t WHERE t.uuid = ANY(f.source_uuids) AND t.uuid NOT LIKE 'obs:%') src
+        (SELECT string_agg(t.text_redacted, ' ') FROM turns t WHERE (t.uuid = ANY(f.source_uuids) OR t.session_id = ANY(f.session_ids)) AND t.uuid NOT LIKE 'obs:%') src
       FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card' AND f.run IS NOT NULL ORDER BY s.path`)),
     // close same-project pairs (not duplicates, and not already linked by Pass B) whose numbers or negation differ
     conflicts: conflicting(await q(`WITH v AS (SELECT f.fid, s.id sid, coalesce(f.project, '') project, s.path,

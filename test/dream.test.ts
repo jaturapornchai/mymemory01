@@ -16,6 +16,7 @@ process.env.MEMHUB_DREAM_RUNS = join(tmp, 'runs');
 process.env.MEMHUB_VAULTS = '';
 process.env.MEMHUB_NO_REINDEX = '1';
 process.env.MEMORY_HUB_INTERNAL = '1';
+process.env.MEMHUB_DREAM_LIMIT = '25';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
 const { dream, deepseekRunner, filesRunner, buildDigests, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');

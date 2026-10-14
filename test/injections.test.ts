@@ -78,8 +78,31 @@ test('stats --injected [n] prints the last injections with their ids', () => {
   assert.match(spawnSync(process.execPath, [join(ROOT, 'src', 'cli.ts'), 'stats', '--injected', '1'], { encoding: 'utf8', env: ENV }).stdout, /^\S+ \S+  claude-code clear   /);
 });
 
-test('nothing for a subagent or for a resumed chat already briefed; a resume never briefed and the first compact get it, repeated compact skips', async () => {
+import { mkdirSync, writeFileSync } from 'node:fs';
+
+function codexStart(session: string, ev: Record<string, unknown> = {}, extraEnv: Record<string, string> = {}): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [join(ROOT, 'src', 'session-start.ts'), '--app', 'codex'], { env: { ...ENV, ...extraEnv }, cwd: ROOT });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.on('error', reject);
+    p.on('close', () => resolve(out ? JSON.parse(out).hookSpecificOutput.additionalContext : ''));
+    p.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: session, cwd: ROOT, ...ev }));
+  });
+}
+
+test('nothing for a subagent, headless codex exec, or resumed chat already briefed; interactive codex and first compact get it', async () => {
   assert.equal(await sessionStart('s-sub', { source: 'startup', agent_id: 'a1', agent_type: 'Explore' }), '', 'subagent');
+  const codexHome = join(tmp, 'codex-home'), now = new Date();
+  const dayDir = join(codexHome, 'sessions', String(now.getFullYear()), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0'));
+  mkdirSync(dayDir, { recursive: true });
+  const execSid = '019d8bd0-0000-7000-8000-000000000001', subSid = '019d8bd0-0000-7000-8000-000000000002', cliSid = '019d8bd0-0000-7000-8000-000000000003';
+  writeFileSync(join(dayDir, `rollout-2026-${execSid}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: execSid, originator: 'codex_exec', source: 'exec' } }) + '\n');
+  writeFileSync(join(dayDir, `rollout-2026-${subSid}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: subSid, originator: 'codex_cli_rs', source: { subagent: 'review' } } }) + '\n');
+  writeFileSync(join(dayDir, `rollout-2026-${cliSid}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: cliSid, originator: 'codex_cli_rs', source: 'cli' } }) + '\n');
+  assert.equal(await codexStart(execSid, { source: 'startup' }, { MEMHUB_CODEX_HOME: codexHome }), '', 'headless codex exec skipped');
+  assert.equal(await codexStart(subSid, { source: 'startup' }, { MEMHUB_CODEX_HOME: codexHome }), '', 'codex subagent skipped');
+  assert.ok((await codexStart(cliSid, { source: 'startup' }, { MEMHUB_CODEX_HOME: codexHome })).includes('injectrule'), 'interactive codex_cli_rs gets context');
   assert.equal(await sessionStart('s-new', { source: 'resume' }), '', 's-new was briefed at startup: its transcript still has it');
   assert.ok((await sessionStart('s-old', { source: 'resume' })).includes('injectrule'), 'no row for s-old (from before the log)');
   assert.ok((await sessionStart('s-new', { source: 'compact' })).includes('injectrule'), 'compact drops the old block: brief again');

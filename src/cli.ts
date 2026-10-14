@@ -89,14 +89,15 @@ if (cmd === 'google') {
 }
 
 if (cmd === 'lint') {
-  // lint [--dry]: nightly report-only checks → hubs/_lint.md (--dry prints instead). Reads the DB with the read-only role.
+  // lint [--dry] [--fix]: nightly checks → hubs/_lint.md (--dry prints instead; --fix retires machine dups/expired/replaced).
   const { connect } = await import('./db.ts');
-  const db = connect('ro');
+  const fix = args.includes('--fix');
+  const db = connect(fix ? 'rw' : 'ro');
   let err: unknown;
-  try { console.log(await (await import('./lint.ts')).runLint(db, { dry: args.includes('--dry') })); }
+  try { console.log(await (await import('./lint.ts')).runLint(db, { dry: args.includes('--dry'), fix })); }
   catch (e) { err = e; console.error(`lint: ${(e as Error).message}`); process.exitCode = 1; }
   finally { await db.end(); }
-  const rw = connect('rw'); // lint itself stays read-only; only its health row is written
+  const rw = connect('rw'); // lint itself stays read-only unless --fix; only its health row is written
   await health(rw, JOB, err);
   await rw.end();
   process.exit();
@@ -243,21 +244,27 @@ try {
     for (const [k, xs] of [['retired (note deleted)', r.retired], ['kept, provenance trimmed', r.trimmed], ['kept: edited by you, see hubs/_review.md', r.review], ['daily notes you edited (may still quote it)', r.daily]] as const)
       if (xs.length) console.log(`${k}: ${xs.length}\n${xs.map((x) => `  ${x}`).join('\n')}`);
   } else if (cmd === 'dream') {
-    // dream [--runner claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, synapses, hubs)
+    // dream [--runner deepseek|claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, synapses, hubs)
     const d = await import('./dream.ts');
     const opt = (k: string) => (args.includes(k) ? args[args.indexOf(k) + 1] : undefined);
+    const runner = opt('--runner') ?? process.env.MEMHUB_DREAM_RUNNER ?? (process.env.MEMHUB_CLAUDE_BIN ? 'claude' : 'deepseek');
     if (args.includes('--consolidate')) {
       await d.consolidate(db);
       const { MEMORY_VAULT } = await import('./notes.ts');
       (await import('./vault-git.ts')).commitBatch(MEMORY_VAULT, `consolidate ${new Date().toISOString().slice(0, 10)}: approvals + hubs`);
       console.log('consolidated');
     }
+    else if (runner === 'deepseek' && !args.includes('--force') && d.deepseekPeak(new Date())) {
+      skipped = true; // ลุงจืด 2026-10-10: DeepSeek only at its off-peak (half) price
+      console.log('dream: DeepSeek peak hours (01-04 and 06-10 UTC, Mon-Fri) bill double, skipped');
+    }
     else {
-      const runner = opt('--runner') ?? 'claude';
       const run = opt('--run') ?? `${new Date().toISOString().slice(0, 10)}-${runner}`;
       const dir = join(ROOT, 'tmp', 'dream', run);
-      const r = await d.dream(db, { run, force: args.includes('--force'), limit: Number(opt('--limit')) || undefined,
-        llm: runner === 'files' ? d.filesRunner(dir) : d.claudeRunner() });
+      const lim = opt('--limit'); // --limit 0 = no sessions (it once meant the default 25 and dreamed for real)
+      if (lim !== undefined && !/^\d+$/.test(lim)) throw new Error(`dream: --limit needs a whole number, got ${lim}`);
+      const r = await d.dream(db, { run, force: args.includes('--force'), limit: lim === undefined ? undefined : Number(lim),
+        llm: runner === 'files' ? d.filesRunner(dir) : runner === 'deepseek' ? d.deepseekRunner() : d.claudeRunner() });
       if (r.status === 'locked') skipped = true;
       console.log(JSON.stringify({ run, status: r.status, stats: r.stats }));
       if (r.pending) console.log(`pending requests (answer each <id>.request.json with <id>.result.json, then rerun):\n${r.pending.map((p) => join(dir, `${p}.request.json`)).join('\n')}`);

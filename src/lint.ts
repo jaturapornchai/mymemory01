@@ -8,8 +8,8 @@ import type pg from 'pg';
 import { ORPHAN } from './dream.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
 import { projectName } from './importer.ts';
-import { MEMORY_PROJECT, MEMORY_VAULT, parseNote, writeNote } from './notes.ts';
-import { indexVault } from './obsidian.ts';
+import { fmList, fmStr, isHis, MEMORY_PROJECT, MEMORY_VAULT, parseNote, writeNote } from './notes.ts';
+import { indexVault, resolveLinks } from './obsidian.ts';
 import { commitBatch } from './vault-git.ts';
 
 const CAP = 20, KEEP = 7, DUP = 0.95;
@@ -44,26 +44,27 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
     broken: await q(`SELECT s.path, l.dst_name, count(*) OVER () total FROM links l JOIN sources s ON s.id = l.src_id
       WHERE ${PUBLIC} AND s.tool = 'obsidian' AND s.project = $2 AND l.dst_id IS NULL AND NOT starts_with(s.session_id, $3)
       ORDER BY s.path, l.dst_name LIMIT ${CAP}`, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`),
-    // a dream fact vs the turns it cites: are its hard anchors (numbers, ids, paths, versions) there? (the citation is only checked to exist)
-    support: unsupported(await q(`SELECT f.fid, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
+    // a dream fact vs the turns it cites (+ its batch project header): are its hard anchors (numbers, ids, paths, versions) there?
+    support: unsupported(await q(`SELECT f.fid, f.project, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
         (SELECT string_agg(t.text_redacted, ' ') FROM turns t WHERE t.uuid = ANY(f.source_uuids) AND t.uuid NOT LIKE 'obs:%') src
       FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card' AND f.run IS NOT NULL ORDER BY s.path`)),
-    // close same-project pairs (not duplicates) whose numbers or negation differ: one may have replaced the other unnoticed
-    // (the dream only compares a NEW fact with ≤ 5 neighbours). Same shape as dups, all kinds.
-    conflicts: conflicting(await q(`WITH v AS (SELECT f.fid, coalesce(f.project, '') project, s.path,
+    // close same-project pairs (not duplicates, and not already linked by Pass B) whose numbers or negation differ
+    conflicts: conflicting(await q(`WITH v AS (SELECT f.fid, s.id sid, coalesce(f.project, '') project, s.path,
         (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
         (SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) e
         FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card')
       SELECT a.fid a, a.path apath, a.body abody, b.fid b, b.path bpath, b.body bbody, 1 - (a.e <=> b.e) sim
       FROM v a JOIN v b ON b.project = a.project AND a.fid < b.fid
-      WHERE a.e <=> b.e <= $2 AND a.e <=> b.e > $3 ORDER BY a.e <=> b.e, a.fid, b.fid LIMIT 500`, 1 - CONFLICT, 1 - DUP)),
+      WHERE a.e <=> b.e <= $2 AND a.e <=> b.e > $3
+        AND NOT EXISTS (SELECT 1 FROM links l WHERE (l.src_id = a.sid AND l.dst_id = b.sid) OR (l.src_id = b.sid AND l.dst_id = a.sid))
+      ORDER BY a.e <=> b.e, a.fid, b.fid LIMIT 500`, 1 - CONFLICT, 1 - DUP)),
     // a fact whose text says it replaces another ("แทน F…", "ยกเลิก") while that one is still active: the replacement was only
     // written in the text, nothing retired the old one, and SessionStart kept showing both (3 global rules, 2026-10-09)
     replaced: await q(`WITH v AS (SELECT f.fid, s.path, split_part((SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1), E'\\n\\n- ', 1) body
         FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card')
-      SELECT npath, opath, count(*) OVER () total FROM (SELECT DISTINCT n.path npath, o.path opath
+      SELECT nfid, npath, ofid, opath, count(*) OVER () total FROM (SELECT DISTINCT n.fid nfid, n.path npath, o.fid ofid, o.path opath
         FROM v n CROSS JOIN LATERAL regexp_matches(n.body, 'F[0-9a-f]{8}', 'g') m JOIN v o ON o.fid = m[1]
-        WHERE o.fid <> n.fid AND n.body ~* '(แทน|ยกเลิก|replac|supersed)') x ORDER BY 1, 2 LIMIT ${CAP}`),
+        WHERE o.fid <> n.fid AND n.body ~* '(แทน|ยกเลิก|replac|supersed)') x ORDER BY 2, 4 LIMIT ${CAP}`),
   };
 }
 
@@ -72,15 +73,18 @@ const factText = (t: string) => String(t ?? '').replace(/^# [^\n]*\n/, '').repla
 /** Hard anchors a paraphrase keeps verbatim: Latin/digit tokens with a digit, _ . / : or an inner '-' (dates, fids: the note's own). */
 const anchors = (s: string) => [...new Set((s.match(/[A-Za-z0-9_./:-]+/g) ?? []).map((w) => w.replace(/^[.:/-]+|[.:/-]+$/g, '').toLowerCase())
   .filter((w) => w.length >= 3 && /[0-9_./:]|[a-z0-9]-[a-z0-9]/.test(w) && !/^\d{4}-\d\d-\d\d/.test(w) && !/^[fsi][0-9a-f]{8}$/.test(w)))];
+const hasAnchor = (src: string, srcFlat: string, w: string) => src.includes(w) || srcFlat.includes(w.replace(/[-_]/g, ''))
+  || (w.includes('/') && (src.includes(basename(w)) || w.split('/').filter((p) => p.length >= 2).every((p) => src.includes(p))));
 const withTotal = (rows: Row[]) => rows.slice(0, CAP).map((r) => ({ ...r, total: rows.length }));
 /** Facts with ≥ 2 anchors, more than half of them absent from every cited turn. ponytail: substring match on redacted text, Latin only. */
 function unsupported(rows: Row[]) {
   return withTotal(rows.flatMap((r) => {
-    const a = anchors(factText(r.body)), src = String(r.src ?? '').toLowerCase(), miss = a.filter((w) => !src.includes(w));
+    const a = anchors(factText(r.body)), src = `${r.project ?? ''} ${projectName(r.project ?? '')} ${r.src ?? ''}`.toLowerCase(), srcFlat = src.replace(/[-_]/g, '');
+    const miss = a.filter((w) => !hasAnchor(src, srcFlat, w));
     return a.length >= 2 && miss.length * 2 > a.length ? [{ fid: r.fid, path: r.path, have: a.length - miss.length, of: a.length, miss: miss.slice(0, 3) }] : [];
   }));
 }
-const NUMS = (s: string) => new Set(s.match(/\d[\d.,:]*\d/g) ?? []);
+const NUMS = (s: string) => new Set(s.replace(/\b\d{4}-\d{2}-\d{2}\b|\b[0-9a-f]{7,}\b|\b[A-Za-z_]\w*\b/g, ' ').match(/\d[\d.,:]*\d/g) ?? []);
 const NEG = /ไม่|ห้าม|อย่า|ยกเลิก|เลิก|\b(?:not|no|never|don't|doesn't|removed?|stop(?:ped)?|instead)\b/i;
 /** Pairs where each side has a number the other lacks, or only one side negates/cancels. */
 function conflicting(rows: Row[]) {
@@ -113,6 +117,57 @@ export function renderLint(r: LintReport, now = new Date()): string {
     sec('ลิงก์เสีย', r.broken, (x) => `[[${title(x.path)}]] → \`${String(x.dst_name).replace(/`/g, '')}\``);
 }
 
+/** Auto-retire machine-owned (!isHis) expired facts, unretired replaced targets, and ≥0.95 duplicate pairs (provenance merged). */
+export async function fixLint(db: pg.Pool, now = new Date()) {
+  const r = await lintReport(db, now);
+  const vault = MEMORY_VAULT.replace(/\\/g, '/');
+  const rel = (p: string) => String(p).replace(/\\/g, '/').slice(vault.length + 1);
+  const load = (p: string) => (existsSync(p) ? parseNote(readFileSync(p, 'utf8')) : null);
+  const out = { expired: 0, replaced: 0, dups: 0 };
+  const retired = new Set<string>();
+  try {
+    for (const x of r.expired) {
+      const n = load(x.path);
+      if (!n || isHis(n.fm, n.body)) continue;
+      if (writeNote(rel(x.path), { status: 'superseded', expired_at: fmStr(n.fm.expired_at) || now.toISOString() }) === 'written') {
+        retired.add(x.fid); out.expired++;
+      }
+    }
+    for (const x of r.replaced) {
+      if (retired.has(x.ofid)) continue;
+      const n = load(x.opath);
+      if (!n || isHis(n.fm, n.body)) continue;
+      if (writeNote(rel(x.opath), { status: 'superseded', superseded_by: x.nfid, expired_at: fmStr(n.fm.expired_at) || now.toISOString() }) === 'written') {
+        retired.add(x.ofid); out.replaced++;
+      }
+    }
+    for (const x of r.dups) {
+      if (retired.has(x.a) || retired.has(x.b)) continue;
+      const na = load(x.apath), nb = load(x.bpath);
+      if (!na || !nb) continue;
+      const ha = isHis(na.fm, na.body), hb = isHis(nb.fm, nb.body);
+      if (ha && hb) continue;
+      const [keep, kpath, kn, drop, dpath, dn] = ha ? [x.a, x.apath, na, x.b, x.bpath, nb] : hb ? [x.b, x.bpath, nb, x.a, x.apath, na]
+        : fmList(na.fm.source_uuids).length >= fmList(nb.fm.source_uuids).length ? [x.a, x.apath, na, x.b, x.bpath, nb] : [x.b, x.bpath, nb, x.a, x.apath, na];
+      if (!isHis(kn.fm, kn.body)) {
+        const merged = [...new Set([...fmList(kn.fm.source_uuids), ...fmList(dn.fm.source_uuids)])];
+        writeNote(rel(kpath), { source_uuids: merged });
+      }
+      if (writeNote(rel(dpath), { status: 'superseded', superseded_by: keep, expired_at: fmStr(dn.fm.expired_at) || now.toISOString() }) === 'written') {
+        retired.add(drop); out.dups++;
+      }
+    }
+  } finally {
+    if (out.expired + out.replaced + out.dups > 0)
+      commitBatch(MEMORY_VAULT, `lint --fix ${day(now)}: -${out.expired} expired, -${out.replaced} replaced, -${out.dups} dups`);
+  }
+  if (out.expired + out.replaced + out.dups > 0) {
+    await indexVault(db, MEMORY_VAULT);
+    await resolveLinks(db);
+  }
+  return out;
+}
+
 /** forget: older sections (KEEP days) still link the notes it just deleted → drop those lines. An edited _lint.md is his. */
 export async function pruneLint(db: pg.Pool, titles: string[], msg: string) {
   const path = join(MEMORY_VAULT, LINT_REL);
@@ -125,12 +180,14 @@ export async function pruneLint(db: pg.Pool, titles: string[], msg: string) {
   if (res === 'written') await indexVault(db, MEMORY_VAULT); // searchable until re-indexed
 }
 
-/** lint [--dry]: dry = print the section; else hubs/_lint.md (one vault commit). Never fails on what it finds. */
-export async function runLint(db: pg.Pool, o: { dry?: boolean; now?: Date } = {}): Promise<string> {
+/** lint [--dry] [--fix]: dry = print the section; fix = auto-retire machine dups/expired/replaced first; else hubs/_lint.md. */
+export async function runLint(db: pg.Pool, o: { dry?: boolean; fix?: boolean; now?: Date } = {}): Promise<string> {
   const now = o.now ?? new Date();
+  const fixed = o.fix ? await fixLint(db, now) : undefined;
+  const fixMsg = fixed ? `fixed: -${fixed.expired} expired, -${fixed.replaced} replaced, -${fixed.dups} dups\n` : '';
   const r = await lintReport(db, now);
   const section = renderLint(r, now);
-  if (o.dry) return section;
+  if (o.dry) return `${fixMsg}${section}`;
   const path = join(MEMORY_VAULT, LINT_REL);
   const DATED = /^## \d{4}-\d{2}-\d{2}\n/;
   const older = (existsSync(path) ? parseNote(readFileSync(path, 'utf8')).body : '').split(/^(?=## \d{4}-\d{2}-\d{2}\n)/m)
@@ -140,5 +197,5 @@ export async function runLint(db: pg.Pool, o: { dry?: boolean; now?: Date } = {}
   let res;
   try { res = writeNote(LINT_REL, { memhub: 'hub', tags: ['memhub/lint'] }, body); }
   finally { commitBatch(MEMORY_VAULT, `lint ${day(now)}: ${lintSummary(r)}`); }
-  return res === 'kept-user-edit' ? `${LINT_REL} was edited by ลุงจืด: left alone. Tonight's report:\n${section}` : `${LINT_REL} ${res}: ${lintSummary(r)}`;
+  return res === 'kept-user-edit' ? `${fixMsg}${LINT_REL} was edited by ลุงจืด: left alone. Tonight's report:\n${section}` : `${fixMsg}${LINT_REL} ${res}: ${lintSummary(r)}`;
 }

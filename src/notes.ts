@@ -17,9 +17,9 @@ export const md5 = (s: string) => createHash('md5').update(s.toLowerCase().repla
 /** Same uuid obsidian.ts gives a note → a saved note can cite itself as provenance. */
 export const noteUuid = (path: string) => 'obs:' + createHash('sha256').update(path).digest('hex').slice(0, 24);
 
-/** Obsidian-safe file name (Thai kept). */
+/** Obsidian-safe file name (Thai kept); trailing .md stripped so adding .md never makes .md.md. */
 export const fileName = (s: string, max = 80) =>
-  cutAtWord(s.replace(/[\\/:*?"<>|#^[\]\x00-\x1f`]+/g, ' ').replace(/\s+/g, ' ').trim(), max).trim() || 'untitled';
+  cutAtWord(s.replace(/[\\/:*?"<>|#^[\]\x00-\x1f`]+/g, ' ').replace(/\s+/g, ' ').trim(), max).replace(/(?:\.md)+$/i, '').trim() || 'untitled';
 
 /** Truncate on a word boundary (Thai-aware) so names/IPs/numbers are never cut into a different-looking value. */
 export function cutAtWord(s: string, max: number) {

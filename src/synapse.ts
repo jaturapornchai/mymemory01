@@ -3,6 +3,8 @@
 //      prov  fact/card ↔ the sources holding its cited turns · spawn  subagent/headless run ↔ its main session ·
 //      next  consecutive main sessions of one project (any app) with a gap ≤ 24 h
 //  - plastic kind coaccess, rebuilt nightly ('sleep') from access_log: three-factor Hebbian + homeostatic downscaling
+//  - judged kind sem: top-cosine pairs the local Gemma judged 'certainly the same thread' (blind opus check P 0.86 vs cosine 0.38,
+//      2026-10-11); written outside rebuildSynapses (which never deletes it), shown by associate, not in competition
 //  - associate(): bounded spreading activation from search hits (the '⇢ linked' lines), never part of the ranking.
 // Claude-only sources (guard.PRIVATE_TOOLS, also via hide_as) never become an endpoint; readers filter again per caller.
 // Design, constants and measurements: docs/research/phase4-design.md §4b.
@@ -129,12 +131,12 @@ type Arc = { to: number; w: number; kind: string };   // w = τ·weight
 type Cell = { cls: string; status: string | null; arcs: Arc[] };
 export type Graph = { cells: Map<number, Cell>; edges: { a: number; b: number; kind: string; w: number }[] };
 
-const TAU: Record<string, number> = { link: 1, prov: 0.8, spawn: 0.5, next: 0.3, entity: 0.5, cites: 0.8 }; // coaccess: its own w
+const TAU: Record<string, number> = { link: 1, prov: 0.8, spawn: 0.5, next: 0.3, entity: 0.5, cites: 0.8, sem: 0.8 }; // coaccess: its own w
 const COACCESS_MIN = 0.15; // a co-access synapse spreads only once confirmed (≈ ≥ 2 sessions)
 const RELAY_MAX_DEGREE = 24; // p99 visible degree: hubs above it never relay (APL-like)
 /** Bridges (entity, cites) are fan-normalized on their own, at half gain: a node's many bridges never dilute its link/spawn/prov
  *  arcs (joint normalization cost the N1 tune split 20.2 → 18.6 B-visible; per-family 19.7, gain 0.5 = 1 there, kinder to spawn). */
-const BRIDGE = new Set(['entity', 'cites']), BRIDGE_GAIN = 0.5;
+const BRIDGE = new Set(['entity', 'cites', 'sem']), BRIDGE_GAIN = 0.5; // sem: a bridge too (cross-session, not structural)
 function share(out: { kind: string; w: number }[]) {
   const sum = { base: 0, bridge: 0 }, fam = (k: string) => (BRIDGE.has(k) ? 'bridge' : 'base');
   for (const e of out) sum[fam(e.kind)] += e.w;
@@ -150,7 +152,7 @@ export async function loadGraph(db: pg.Pool): Promise<Graph> {
   const rows = (await db.query(`
     WITH e AS (SELECT DISTINCT least(src_id, dst_id) a, greatest(src_id, dst_id) b, 'link' kind, 1::float8 w FROM links
                WHERE dst_id IS NOT NULL AND src_id <> dst_id
-               UNION ALL SELECT a, b, kind, w FROM edges WHERE kind IN ('prov', 'spawn', 'next', 'entity', 'cites') OR (kind = 'coaccess' AND w >= $1))
+               UNION ALL SELECT a, b, kind, w FROM edges WHERE kind IN ('prov', 'spawn', 'next', 'entity', 'cites', 'sem') OR (kind = 'coaccess' AND w >= $1))
     SELECT e.a::float8 a, e.b::float8 b, e.kind, e.w, coalesce(sa.hide_as, sa.tool) acls, sa.status ast, coalesce(sb.hide_as, sb.tool) bcls, sb.status bst
     FROM e JOIN sources sa ON sa.id = e.a JOIN sources sb ON sb.id = e.b
     WHERE NOT ${SCAFFOLD('sa')} AND NOT ${SCAFFOLD('sb')}`, [COACCESS_MIN, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`])).rows;

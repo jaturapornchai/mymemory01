@@ -20,7 +20,8 @@ const RULES: Rule[] = [
   { kind: 'hex64', re: /\b0x[0-9a-fA-F]{64}\b/g },
   { kind: 'digitalocean', re: /\bdo[opr]_v1_[0-9a-f]{64}\b/g },
   { kind: 'ark', re: /\bark-(?=(?:[\w-]*\d){4})[0-9a-z-]{30,}/gi }, // BytePlus/Volcengine Ark keys (hex+dash: entropy rule skips them)
-  { kind: 'ollama', re: /\b[0-9a-f]{32}\.[A-Za-z0-9_-]{20,}/g }, // Ollama cloud keys
+  { kind: 'ollama', re: /\b[0-9a-f]{32}\.[A-Za-z0-9_-]{16,}/g }, // Ollama cloud keys, Zhipu GLM / z.ai (16 after the dot)
+  { kind: 'sk', re: /\b(?:mcp_)?sk_[0-9a-f]{32,}\b/g }, // ElevenLabs sk_ + 48 hex, mcp_sk_ + 32 hex: pure hex, so entropy skips them
   { kind: 'syn', re: /\bsyn_[0-9a-f]{32}\b/gi }, // syn_ + 32 hex: pure hex, so the entropy rule skips it (one reached the index)
   // natural language: password `x` / รหัสผ่าน "x" (quoted value, no = or :)
   { kind: 'kv', re: /(\b(?:password|passwd|pwd)\s+(?:is\s+)?|(?:รหัสผ่าน|พาสเวิร์ด)\s*(?:คือ\s*)?)[`'"]([^`'"\s]{3,})[`'"]/gi, group: 2 },
@@ -174,3 +175,10 @@ export function redactPersonal(input: string): RedactResult {
   for (const [s, e] of spans.sort((a, b) => b[0] - a[0])) text = text.slice(0, s) + tag('otp') + text.slice(e);
   return { text, hits };
 }
+
+// Key shapes too short or too regular for the import rules: mixed case + digit 20+, 24+ alnum with 4+ digits, hex 32+.
+const OFFSITE = /\b(?:(?=[\w-]*\d)(?=[\w-]*[a-z])(?=[\w-]*[A-Z])[\w-]{20,}|(?=(?:[a-zA-Z]*\d){4})[a-zA-Z\d]{24,}|[\da-fA-F]{32,})\b/g;
+
+/** Text that leaves the machine (DeepSeek dream, ลุงจืด 2026-10-10: "api key หรืออะไรที่ผมจะเสียเงิน ห้ามส่งไป"): both passes
+ *  above, then every remaining key-shaped token. Over-masks on purpose (full commit hashes, long mixed-case ids). */
+export const redactOffsite = (s: string) => redact(redactPersonal(s).text).text.replace(OFFSITE, '[REDACTED:offsite]');

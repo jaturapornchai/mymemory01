@@ -19,7 +19,7 @@ const REL = ['same_task', 'fixes', 'explains', 'uses', 'updates', 'none'];
 export type Node = { id: number; label: string; text: string };
 export type Verdict = { rel: string; strength: number };
 export type Judge = (anchor: Node, candidate: Node) => Promise<Verdict>;
-type Pair = { a: number; b: number; cos: number };
+type Pair = { a: number; b: number; cos: number; same?: number };
 
 /** Visible nodes: main sessions (described by their card, else their user lines), facts/rules/notes, GitHub docs; each with
  *  its descriptor text and the unit mean vector of its first 8 chunks. No hubs/daily scaffolding, rejected or superseded. */
@@ -27,7 +27,8 @@ async function nodes(db: pg.Pool) {
   const hide = [...PRIVATE_TOOLS];
   const HIDDEN_CITE = (f: string) => `EXISTS (SELECT 1 FROM sources h WHERE h.session_id = ANY(${f}.session_ids) AND coalesce(h.hide_as, h.tool) = ANY($1::text[]))`;
   const rows = (await db.query(`
-    SELECT s.id::int id, s.kind, s.tool, coalesce(s.project, '') project, coalesce(s.session_id, s.path, '') sid, f.kind fkind, f.fid,
+    SELECT s.id::int id, s.kind, s.tool, coalesce(s.project, '') project, coalesce(f.project, s.project, '') proj,
+           coalesce(s.session_id, s.path, '') sid, f.kind fkind, f.fid,
            (SELECT max(cs.id)::int FROM facts cf JOIN sources cs ON cs.id = cf.source_id WHERE s.kind = 'main' AND cf.kind = 'card'
               AND s.session_id = ANY(cf.session_ids) AND coalesce(cs.status, 'active') NOT IN ('rejected', 'superseded')
               AND coalesce(cs.hide_as, cs.tool) <> ALL($1::text[]) AND NOT ${HIDDEN_CITE('cf')}) card
@@ -52,14 +53,14 @@ async function nodes(db: pg.Pool) {
     }
   }
   const clip = (s: string, n = 700) => (s.length > n ? s.slice(0, n) + '…' : s);
-  const live = new Map<number, Node & { card: number | null; v: Float32Array }>();
+  const live = new Map<number, Node & { card: number | null; proj: string; v: Float32Array }>();
   for (const n of rows) {
     const t = txt.get(dsrc(n)) ?? [], v = vec.get(dsrc(n));
     const text = n.kind === 'main' && !n.card
       ? clip(t.join('\n').split('\n').filter((l) => l.startsWith('U: ')).join('\n') || t[0] || '')
       : clip(t.slice(0, 2).join('\n').replace(/^D: /, ''));
     const label = n.kind === 'main' ? `${n.tool} session · ${n.project}` : n.tool === 'github' ? `GitHub · ${n.sid}` : n.fid ? `${n.fkind} ${n.fid}` : `note · ${n.sid}`;
-    if (v && text.length >= 40) live.set(n.id, { id: n.id, label, text, card: n.card, v });
+    if (v && text.length >= 40) live.set(n.id, { id: n.id, label, text, card: n.card, proj: n.proj, v });
   }
   return live;
 }
@@ -81,7 +82,8 @@ async function candidates(db: pg.Pool, live: Awaited<ReturnType<typeof nodes>>) 
       if (s >= MIN_COS && !conn.has(key(x.id, y.id))) best.push([y, s]);
     }
     best.sort((p, q) => q[1] - p[1]);
-    for (const [y, s] of best.slice(0, K)) pairs.set(key(x.id, y.id), { a: Math.min(x.id, y.id), b: Math.max(x.id, y.id), cos: s });
+    for (const [y, s] of best.slice(0, K))
+      pairs.set(key(x.id, y.id), { a: Math.min(x.id, y.id), b: Math.max(x.id, y.id), cos: s, same: x.proj && x.proj === y.proj ? 1 : 0 });
   }
   return [...pairs.values()];
 }
@@ -118,7 +120,7 @@ const RECORD = `WITH j AS (INSERT INTO judged_pairs (a, b, verdict, strength, mo
     ON CONFLICT DO NOTHING RETURNING a, b, verdict, strength)
   INSERT INTO edges (a, b, kind, w, updated_at) SELECT a, b, 'sem', 1, now() FROM j WHERE verdict <> 'none' AND strength = 3 ON CONFLICT DO NOTHING`;
 
-/** Nightly: judge up to `limit` pending pairs (highest cosine first) on 2 workers (llama-server's 2 slots). dry = counts only,
+/** Nightly: judge up to `limit` pending pairs (highest cosine first, same-project boosted) on 2 workers (llama-server's 2 slots). dry = counts only,
  *  no judge needed (read-only role is enough). No judge given → the local Gemma, or { skipped } when it is not up. */
 export async function runSem(db: pg.Pool, o: { dry?: boolean; limit?: number; judge?: Judge; model?: string } = {}) {
   let { judge, model = 'unknown' } = o;
@@ -130,7 +132,7 @@ export async function runSem(db: pg.Pool, o: { dry?: boolean; limit?: number; ju
   const live = await nodes(db), cands = await candidates(db, live);
   const open = new Set((await db.query(`SELECT p.a::int a, p.b::int b FROM unnest($1::bigint[], $2::bigint[]) p(a, b)
     WHERE NOT EXISTS (SELECT 1 FROM judged_pairs j WHERE j.a = p.a AND j.b = p.b)`, [cands.map((c) => c.a), cands.map((c) => c.b)])).rows.map((r) => `${r.a}-${r.b}`));
-  const pending = cands.filter((c) => open.has(`${c.a}-${c.b}`)).sort((p, q) => q.cos - p.cos);
+  const pending = cands.filter((c) => open.has(`${c.a}-${c.b}`)).sort((p, q) => (q.cos + (q.same ?? 0) * 0.05) - (p.cos + (p.same ?? 0) * 0.05));
   const r = { nodes: live.size, candidates: cands.length, pending: pending.length, judged: 0, sem: 0, failed: 0 };
   if (o.dry || !judge) return r;
   // anchor = the endpoint with more candidates, as in the measured build (prompt order matters a little)

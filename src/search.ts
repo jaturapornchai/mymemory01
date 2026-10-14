@@ -230,7 +230,7 @@ export function dateRange(since?: string, until?: string): { since: string | nul
 // drops it, and an hour's TTL covers a long-lived MCP process (the hourly refresh runs in another one). A failed build = no project named.
 type Named = { name: string; raw: string[] };
 const CATALOGUE = new WeakMap<pg.Pool, { at: number; p: Promise<Named[]> }>();
-function projectCatalogue(db: pg.Pool): Promise<Named[]> {
+export function projectCatalogue(db: pg.Pool): Promise<Named[]> {
   const c = CATALOGUE.get(db);
   if (c && Date.now() - c.at < 36e5) return c.p;
   const p = db.query(`SELECT c.name, c.raw, c.n, coalesce(d.ndoc, 0) df FROM (

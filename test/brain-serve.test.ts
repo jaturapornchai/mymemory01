@@ -18,8 +18,10 @@ test('brain-serve refuses a foreign Host header on every route (DNS rebinding)',
     { cwd: ROOT, env: { ...process.env, MEMHUB_PG_SCHEMA: `memhub_brainserve_test_${process.pid}` } });
   try {
     await new Promise<void>((resolve, reject) => {
+      let err = '';
+      p.stderr.on('data', (d) => (err += d));
       p.stdout.on('data', (d) => { if (String(d).includes(`127.0.0.1:${port}`)) resolve(); });
-      p.on('exit', (c) => reject(new Error(`brain-serve exited ${c}`)));
+      p.on('exit', (c) => reject(new Error(`brain-serve exited ${c}: ${err.slice(-400)}`)));
     });
     for (const path of ['/graph.json', '/feed.json', '/live.json', '/search?q=x', '/']) assert.equal(await get(path, `evil.example:${port}`), 403, path);
     assert.equal(await get('/search?q=x', 'evil.example'), 403, 'no port');

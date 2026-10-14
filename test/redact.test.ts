@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { redact, stripPrivate } from '../src/redact.ts';
+import { redact, redactOffsite, stripPrivate } from '../src/redact.ts';
 
 // Fake fixtures, split with + so secret scanners (GitHub push protection) don't read them as real tokens.
 const SECRETS: [string, string][] = [
@@ -23,6 +23,9 @@ const SECRETS: [string, string][] = [
   ['ark', 'ark-' + '5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b-12345'],
   ['ollama', '67117a0b1c2d3e4f5a6b7c8d9e0f1a2b.' + 'Zx9_Qw-ErTyUiOpAsDfGhJkLI'],
   ['syn', 'syn_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f0'], // pragma: allowlist secret
+  ['ollama', '67117a0b1c2d3e4f5a6b7c8d9e0f1a2b.' + 'Zx9QwErTyUiOpAsD'], // z.ai GLM: 16 after the dot. pragma: allowlist secret
+  ['sk', 'sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a6978'], // ElevenLabs. pragma: allowlist secret
+  ['sk', 'mcp_sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f0'], // pragma: allowlist secret
 ];
 
 for (const [kind, secret] of SECRETS) {
@@ -93,6 +96,16 @@ for (const s of KEEP) {
     assert.equal(redact(s).text, s);
   });
 }
+
+test('offsite: short / low-entropy key shapes the import rules let through never leave the machine', () => {
+  const r = (n: number, a = 'abcdef0123456789') => Array.from({ length: n }, (_, i) => a[(i * 7 + 3) % a.length]).join('');
+  const AL = 'aB3dE5gH7jK9mN1pQ2rS4tU6vW8xY0zC';
+  const fakes = [r(25, AL), r(24, AL), r(40, AL + '_-'), r(32), r(64), r(24, 'abcdefghijklmnopqrstuvwxyz0123456789')];
+  for (const v of fakes) for (const ctx of [`ใช้ตัวนี้ ${v} นะ`, `ELEVEN=${v}`, `"${v}"`])
+    assert.ok(!redactOffsite(ctx).includes(v), ctx);
+  for (const s of ['deploy v2.3 ไป port 5434 แล้ว', 'getUserByIdAndProjectName()', 'commit 5d72ad9 fixed it', '2026-10-10T07:30:00Z'])
+    assert.equal(redactOffsite(s), s);
+});
 
 test('idempotent', () => {
   const once = redact('PGPASSWORD=Sup3rS3cret and ghp_' + 'abcdefghijklmnopqrstuvwxyz0123456789').text; // pragma: allowlist secret

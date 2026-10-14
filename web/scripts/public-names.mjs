@@ -3,7 +3,7 @@
 import { assertAnonymous } from '../../src/brain.ts';
 
 /** the exact display spellings, standalone: a project called e.g. codex-tools or Codex-tools is not one */
-export const PUBLIC_NAMES = /(?<![\w./\\-])(Claude|Codex|Gemini|Antigravity|ZCode|LM Studio|GitHub|Obsidian|memory-hub)(?![\w./\\-])/g;
+export const PUBLIC_NAMES = /(?<![\w./\\-])(Claude|Codex|Gemini|Antigravity|ZCode|LM Studio|Kimi|GitHub|Obsidian|memory-hub)(?![\w./\\-])/g;
 
 /**
  * Visible page text → '' when clean, else what leaked: project/repo names, session ids, path parts, or `user` (the OS

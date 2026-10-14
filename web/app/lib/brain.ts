@@ -2,7 +2,7 @@
 
 export type NodeType = 'project' | 'session' | 'subagent' | 'note' | 'memory';
 /** The AI app a source came from (= sources.tool). Names are public; counts only. */
-export type App = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'zcode' | 'lmstudio' | 'github' | 'obsidian';
+export type App = 'claude' | 'codex' | 'gemini' | 'antigravity' | 'zcode' | 'lmstudio' | 'kimi' | 'github' | 'obsidian';
 export type AppStats = { sessions: number; subagents: number; turns: number; chunks: number; t1: number }; // t1 = last activity
 export type BrainNode = {
   id: string;
@@ -75,6 +75,7 @@ export const APP_COLOR: Record<App, string> = {
   zcode: '#c98500',
   antigravity: '#d55181',
   lmstudio: '#008300',
+  kimi: '#2095b5',
   obsidian: '#9085e9',
   gemini: '#e66767',
 };
@@ -85,6 +86,7 @@ export const APP_NAME: Record<App, string> = {
   antigravity: 'Antigravity',
   zcode: 'ZCode',
   lmstudio: 'LM Studio',
+  kimi: 'Kimi',
   github: 'GitHub',
   obsidian: 'Obsidian',
 };

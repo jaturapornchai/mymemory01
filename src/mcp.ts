@@ -11,7 +11,7 @@ import { embed, toVec, warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
 import { clean, normProject, projectName } from './importer.ts';
 import { fmStr, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
-import { day, HIDDEN, hitLine, type Origin, origins, originText, place, privateLabel, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
+import { day, HIDDEN, hitLine, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
@@ -28,7 +28,7 @@ const session = `mcp-${process.pid}-${startedAt.getTime()}`; // one MCP process 
 // they see everything (their own memory_save is found at once). Other unknown clients (e.g. a gateway serving many callers) keep the old rule: nothing
 // newer than server start. own.project = the importer's unmapped normProject(cwd) (home/temp too), not currentProject.
 const TOOL_OF: Record<string, string> = { 'claude-code': 'claude', 'claude-ai': 'claude', 'codex-mcp-client': 'codex',
-  'gemini-cli-mcp-client': 'gemini', 'antigravity-client': 'antigravity', zcode: 'zcode', lmstudio: 'lmstudio' };
+  'gemini-cli-mcp-client': 'gemini', 'antigravity-client': 'antigravity', zcode: 'zcode', lmstudio: 'lmstudio', 'kimi-code': 'kimi', kimi: 'kimi' };
 const ownProject = normProject(process.cwd());
 const GATEWAY = new Set(['remote', 'claude-remote', 'chatgpt', 'web-claude-ai']);
 const freshness = (): { before?: Date; own?: { since: Date; tool: string; project: string } } => GATEWAY.has(client()) ? {} : ((tool?: string) => tool ? { own: { since: startedAt, tool, project: ownProject } } : { before: startedAt })(TOOL_OF[client()]);
@@ -98,6 +98,8 @@ const server = new McpServer({ name: 'memory-hub', version: '0.2.0' }, {
     'memory-hub = ลุงจืด\'s long-term memory shared by all his AI apps: past AI sessions (all projects) + his Obsidian notes + his GitHub repos/commits/issues + ' +
     'facts distilled by Claude. ' +
     'When he refers to earlier work/decisions/rules, or you are unsure of a project fact, call memory_search first (cheap). ' +
+    // 20 sessions in 60 days grepped old transcripts for a command memory_search had at rank 1 (demo-login, dotnet publish)
+    'Need an earlier command/login/deploy step? memory_search it before grepping old transcripts: past tool calls are indexed. ' +
     'When he says จำไว้/remember or states a lasting rule, call memory_save. ' +
     // loaded into every session of every app (tool descriptions may be deferred): the memory_get/brief token tips live in memory_search's description
     'When he says a memory is wrong: memory_save the corrected text with replaces:[its fid]; "อย่าพูดถึงอีก": memory_save mute:[fid].',
@@ -108,7 +110,8 @@ server.registerTool(
   {
     description:
       'Search ลุงจืด\'s past AI sessions (Claude Code, Codex, Gemini, Antigravity, ZCode, LM Studio), notes, GitHub (repos, commits, issues/PRs) and facts (Thai+English+code). Use when he refers to the past ("เคย", ' +
-      '"ครั้งก่อน", "last time"), before R0/R1 actions, or when unsure of a project fact; since+until = a date range. ≤8 snippets with ids, age, use count; ' +
+      '"ครั้งก่อน", "last time"), before R0/R1 actions, when unsure of a project fact, or for an earlier command/login/deploy step (past tool calls are indexed: ' +
+      'search here, not old transcript files); since+until = a date range. ≤8 snippets with ids, age, use count; ' +
       'OLD = superseded. Priority order: curated rules/facts first, raw chats are evidence (↳ = the chat a fact came from); ' +
       'src = where a hit came from, cite it when you rely on it (app:session#turn, github:repo@sha, note:path; a fact: its source turn + date, ' +
       '×N = sessions behind it, AI-only = no turn of his says it, memory_save = he said remember); ' +
@@ -451,6 +454,7 @@ if (import.meta.main) { // imported by scripts/eval.ts for searchText → no std
   await server.connect(new StdioServerTransport());
   if (!offsite) { // the first memory_search pays no cold start: bge-m3 load (seconds), PG connection + catalog caches (~20 ms)
     warmUp();
+    projectCatalogue(db).catch(() => {});
     search(db, 'warm up', { semantic: false, limit: 1 }).catch(() => {});
   }
 }

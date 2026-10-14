@@ -344,7 +344,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-tasks.ps1 -Remove
 | `daily [YYYY-MM-DD] [--out dir]` | บันทึกประจำวันลง vault memory-hub `daily/YYYY-MM-DD.md` (ไม่ใส่วัน = เมื่อวาน ตามเวลาไทย): ต่อโปรเจกต์ แอปไหนกี่ session เวลาแรก–สุดท้าย เรื่องที่ทำ commit/issue ความจำใหม่/ถูกแทนที่ งานส่งต่อ — ไม่ใช้ LLM, ไม่มีข้อมูล Google/สถานที่, โน้ตที่เราแก้แล้วจะไม่ถูกเขียนทับ, ค้นได้แต่อันดับต่ำกว่าแชต; `--out` = เขียนไฟล์ตัวอย่างไว้ที่อื่น ไม่แตะ vault |
 | `index-vault [vault]` | ทำดัชนี Obsidian ใหม่ (ไม่ระบุ = ทุก vault) |
 | `forget --session <id>` / `forget --project <path>` | ลบออกจากดัชนีถาวรและกันนำเข้าซ้ำ (ไฟล์ดิบใน archive ไม่ถูกลบ) พร้อมลบข้อเท็จจริง/การ์ดที่ฝันจากแชตนั้นอย่างเดียว แล้วพิมพ์รายการที่ลบ |
-| `dream [--limit n] [--runner claude\|files] [--run id] [--force]` | ฝัน (เห็นคำตอบที่เรากดเลือกจากตัวเลือกของ AI ด้วย: เลือกตัวที่ AI แนะนำ = การตัดสินใจ, เลือกตัวอื่น/แก้/เลือกแบบเดิมซ้ำ = สิ่งที่ชอบ): สรุปแชตใหม่เป็นการ์ด + ข้อเท็จจริง (ปกติไม่เกิน 25 session ต่อรอบ ใหม่สุดก่อน) |
+| `dream [--limit n] [--runner deepseek\|claude\|files] [--run id] [--force]` | ฝัน (เห็นคำตอบที่เรากดเลือกจากตัวเลือกของ AI ด้วย: เลือกตัวที่ AI แนะนำ = การตัดสินใจ, เลือกตัวอื่น/แก้/เลือกแบบเดิมซ้ำ = สิ่งที่ชอบ): สรุปแชตใหม่เป็นการ์ด + ข้อเท็จจริง (ปกติไม่เกิน 25 session ต่อรอบ ใหม่สุดก่อน; ค่าเริ่มต้นคือ `deepseek` ซึ่งข้ามรอบถ้าตรงช่วงราคาแพงของ DeepSeek เว้นใส่ `--force`; `--runner claude` = ใช้ `claude -p`) |
 | `dream --consolidate` | งานกลางคืนที่ไม่ใช้ LLM: อนุมัติ, เส้นเชื่อมใช้คู่กัน, โน้ตศูนย์กลาง |
 | `lint [--dry]` | ตรวจสุขภาพความจำ (รายงานอย่างเดียว ไม่ใช้ LLM): ข้อเท็จจริงเลยวันหมดอายุ, คู่ที่อาจซ้ำ, ข้อเท็จจริงที่แชตต้นทางหายหมด, ลิงก์เสีย, งานส่งต่อค้าง, ข้อเท็จจริงที่ Claude สรุปแต่ชื่อเฉพาะ/ตัวเลขส่วนใหญ่ไม่มีในแชตที่อ้าง (หลักฐานไม่ตรง), คู่ในโปรเจกต์เดียวกันที่ความหมายใกล้กันแต่ตัวเลขต่างกันหรือฝั่งหนึ่งปฏิเสธ (อาจขัดกัน), ข้อที่เขียนว่าแทน/ยกเลิกอีกข้อ (อ้าง fid) แต่ข้อเก่ายัง active → `hubs/_lint.md` ใน vault (`--dry` = พิมพ์ออกจอ ไม่เขียน) |
 | `sem [--dry] [--limit n]` | Gemma ในเครื่องตัดสินคู่ที่เวกเตอร์ใกล้กันซึ่งยังไม่เคยตัดสิน → เส้น `sem` (เฉพาะ strength 3), สูงสุด 1500 คู่ต่อรอบ (~35 นาที, ใกล้สุดก่อน; ที่เหลือรอคืนถัดไป), llama-server ไม่เปิด = ข้าม · `--dry` = นับคู่ที่รอตัดสินด้วย role อ่านอย่างเดียว ไม่เรียก Gemma |
@@ -413,11 +413,14 @@ node src/cli.ts vault undo <rev>     # ย้อน แล้วทำดัช�
 
 | ตัวแปร | ค่าเริ่มต้น | ความหมาย |
 |---|---|---|
-| `MEMHUB_DREAM_MODEL` | `sonnet` | โมเดล Claude ที่ใช้ฝัน |
-| `MEMHUB_CLAUDE_BIN` | `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` | ตัว Claude CLI ที่เรียก `claude -p` |
-| `MEMHUB_DREAM_RUNS` | `~/ai-archive/raw/memhub-dream` | บันทึกผลการฝันแต่ละรอบ |
+| `MEMHUB_DREAM_RUNNER` | `deepseek` | ตัวรันฝันเริ่มต้น (`deepseek`, `claude`, หรือ `files`) |
+| `MEMHUB_DEEPSEEK_KEY` | — | API key ของ DeepSeek สำหรับการฝัน (ใส่ใน `.env` เท่านั้น) |
+| `MEMHUB_DEEPSEEK_MODEL` | `deepseek-flash` | โมเดล DeepSeek ที่ใช้ฝัน |
+| `MEMHUB_DREAM_MODEL` | `sonnet` | โมเดล Claude ที่ใช้ฝันเมื่อเลือก `--runner claude` |
 | `MEMHUB_GEMMA_URL` | `http://127.0.0.1:8080` | llama-server ที่รัน Gemma สำหรับ `sem` (ปิดอยู่หรือโหลดโมเดลอื่น = ข้ามคืนนั้น) |
 | `MEMHUB_GEMMA_KEY` | — | API key ของ llama-server ถ้าตั้ง `--api-key` ไว้ (ใส่ใน `.env` เท่านั้น) |
+| `MEMHUB_CLAUDE_BIN` | `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` | ตัว Claude CLI ที่เรียก `claude -p` |
+| `MEMHUB_DREAM_RUNS` | `~/ai-archive/raw/memhub-dream` | บันทึกผลการฝันแต่ละรอบ |
 
 **การค้นและจัดลำดับ** (ค่าที่จูนแล้ว ปกติไม่ต้องแก้)
 
@@ -473,9 +476,9 @@ src/
   handoff.ts        บรรทัด "AI ตัวอื่นเพิ่งทำงานที่นี่" ตอนเปิดแชต
   dream.ts          ฝัน: สรุปแชตเป็นการ์ด/ข้อเท็จจริง (+ ลบตาม forget)
   lint.ts           ตรวจสุขภาพความจำรายคืน → hubs/_lint.md
+  sem.ts            เส้น sem: Gemma ในเครื่องตัดสินคู่ใกล้กันรายคืน (judged_pairs)
   daily.ts          บันทึกประจำวัน (SQL ล้วน ไม่ใช้ LLM)
   notes.ts          เขียนโน้ตลง vault memory-hub
-  sem.ts            เส้น sem: Gemma ในเครื่องตัดสินคู่ใกล้กันรายคืน (judged_pairs)
   obsidian.ts       อ่าน vault Obsidian + wikilink
   vault-git.ts      ประวัติ git ของ vault
   geo.ts            หาชื่อสถานที่ออฟไลน์ (GeoNames)
@@ -537,7 +540,7 @@ node web/scripts/public-check.mjs https://<เว็บของเรา>/  # �
 **ข้อมูลออกนอกเครื่องไหม?**
 ดัชนี เวกเตอร์ และสำเนาทั้งหมดอยู่ในเครื่อง สิ่งที่ออกไปมีเท่านี้:
 1. สิ่งที่แอป AI อ่านผ่าน MCP จะไปถึงผู้ให้บริการโมเดลของแอปนั้น (Anthropic สำหรับ Claude, OpenAI สำหรับ Codex, Google สำหรับ Gemini/Antigravity, Z.ai สำหรับ ZCode, ไม่ไปไหนถ้าใช้โมเดลในเครื่องกับ LM Studio)
-2. ตอนฝัน แชตที่ยังไม่สรุปถูกส่งให้ Claude (Anthropic) อ่าน — ข้อมูล Google ไม่เคยถูกส่งไปฝัน
+2. ตอนฝัน แชตที่ยังไม่สรุปถูกส่งให้ Claude (Anthropic) อ่าน — ข้อมูล Google ไม่เคยถูกส่งไปฝัน; ถ้าใช้ `dream --runner deepseek` จะส่งให้ DeepSeek (เก็บข้อมูลที่จีน) แทน หลังลบทุกอย่างที่หน้าตาเหมือนคีย์/token/เลขบัตร/บัญชีออกอีกชั้น (`MEMHUB_ANTHROPIC_ONLY=1` = ไม่ส่งเลย)
 3. การนำเข้า GitHub/Google เป็นการ "อ่าน" จาก API ของเขา (อ่านด้วย GET เท่านั้น; ฝั่ง Google มี POST แค่ต่ออายุ/ยกเลิก token)
 4. `publish` ส่งกราฟแบบปิดชื่อ (รูปร่าง ตัวเลข เวลา) ขึ้น Vercel — เฉพาะเมื่อผูกโปรเจกต์ Vercel ไว้แล้ว
 ชื่อสถานที่ของ Timeline หาแบบออฟไลน์ พิกัดไม่ออกจากเครื่อง

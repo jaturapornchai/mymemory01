@@ -408,15 +408,15 @@ export async function forget(db: pg.Pool, what: 'session' | 'project', value: st
   // a folder and what is under it, never a sibling that merely starts the same (d:/app ≠ d:/app2): the cascade deletes notes
   const where = what === 'session' ? 'session_id = $1' : `(project = $1 OR starts_with(project, $1 || '/'))`;
   const doomed = (await db.query(`SELECT id, session_id FROM sources WHERE ${where}`, [v])).rows;
-  // Before the delete (its turns name the cited uuids). For a session, session_ids also finds facts of one forgotten before
-  // this cascade existed (or a crashed run); a project rerun cannot (its sources are gone): lint lists those as orphans.
-  // keep = cited turns that stay indexed; obs: = a note citing itself, never a chat.
+  // Before the delete (its turns name the cited uuids). session_ids / project also finds facts of one forgotten before
+  // this cascade existed (or a crashed run). keep = cited turns that stay indexed; obs: = a note citing itself, never a chat.
   const facts = (await db.query(
     `SELECT f.fid, s.path, array(SELECT u FROM unnest(f.source_uuids) u WHERE u LIKE 'obs:%'
               OR EXISTS (SELECT 1 FROM turns t WHERE t.uuid = u AND t.source_id <> ALL($1::bigint[]))) keep
      FROM facts f JOIN sources s ON s.id = f.source_id
-     WHERE f.session_ids && $2::text[] OR f.source_uuids && array(SELECT uuid FROM turns WHERE source_id = ANY($1::bigint[]))`,
-    [doomed.map((s) => s.id), what === 'session' ? [v] : [...new Set(doomed.map((s) => s.session_id).filter(Boolean))]])).rows;
+     WHERE f.session_ids && $2::text[] OR f.source_uuids && array(SELECT uuid FROM turns WHERE source_id = ANY($1::bigint[]))
+       OR ($3 = 'project' AND cardinality(f.session_ids) > 0 AND (f.project = $4 OR starts_with(f.project, $4 || '/')))`,
+    [doomed.map((s) => s.id), what === 'session' ? [v] : [...new Set(doomed.map((s) => s.session_id).filter(Boolean))], what, v])).rows;
   // its recalls (access_log; queries may quote it): by turn (stable across re-chunking), or by chunk for rows logged before
   // turn_uuid. Only these: purging every row whose chunk id is gone also wiped the history of every re-chunked turn
   const used = (await db.query(`SELECT array(SELECT uuid FROM turns WHERE source_id = ANY($1::bigint[])) turns,
@@ -424,7 +424,7 @@ export async function forget(db: pg.Pool, what: 'session' | 'project', value: st
   const r = await db.query(`DELETE FROM sources WHERE ${where} RETURNING id, project`, [v]);
   // and their layout pins (src/layout.ts): forgotten raw keys must not linger in state, and the pin store stays bounded
   if (what === 'project') { // ponytail: a session forget keeps its hub's pin
-    await db.query(`UPDATE state SET v = v - $1::text[] WHERE k = 'layout'`, [[...new Set(r.rows.map((s) => `project:${s.project ?? '?'}`))]]);
+    await db.query(`UPDATE state SET v = v - $1::text[] WHERE k = 'layout'`, [[v, `project:${v}`, ...new Set(r.rows.map((s) => `project:${s.project ?? '?'}`))].filter((x) => x.startsWith('project:'))]);
   }
   await (await import('./layout.ts')).prunePins(db);
   await db.query('DELETE FROM access_log WHERE turn_uuid = ANY($1) OR chunk_id = ANY($2)', [used.turns, used.chunks]);
@@ -442,6 +442,14 @@ export async function forget(db: pg.Pool, what: 'session' | 'project', value: st
 
 export async function indexArchive(db: pg.Pool, force = false) {
   const stats: Record<string, number> = { skip: 0, excluded: 0, indexed: 0, empty: 0, failed: 0 };
+  const known = force ? new Map<string, { size: string | number; mtime_ms: string | number }>()
+    : new Map((await db.query('SELECT path, size, mtime_ms FROM sources')).rows.map((r) => [r.path, r]));
+  const unchanged = (f: string) => {
+    const o = known.get(f);
+    if (!o) return false;
+    const st = statSync(f);
+    return Number(o.size) === st.size && Number(o.mtime_ms) === Math.round(st.mtimeMs);
+  };
   const sessions = new Map<string, string[]>(); // <dir>/<sid>.jsonl + <dir>/<sid>/subagents/** = one batch (sessionHideAs)
   for (const f of walk(ARCHIVE_DIR)) {
     if (!f.endsWith('.jsonl') || f.split(sep).includes('tool-results')) continue;
@@ -449,6 +457,8 @@ export async function indexArchive(db: pg.Pool, force = false) {
     (sessions.get(k) ?? sessions.set(k, []).get(k)!).push(f);
   }
   for (const files of sessions.values()) {
+    try { if (!force && files.every(unchanged)) { stats.skip += files.length; continue; } }
+    catch (e) { stats.failed += files.length; console.error(`index failed: ${files[0]}: ${(e as Error).message}`); continue; }
     let hideAs: string | null;
     try { hideAs = await sessionHideAs(db, files, force); } // failed scan: skip the session (next run retries), never index it visible
     catch (e) { stats.failed += files.length; console.error(`index failed: ${files[0]}: ${(e as Error).message}`); continue; }
@@ -460,7 +470,7 @@ export async function indexArchive(db: pg.Pool, force = false) {
   for (const t of TOOLS) {
     for (const f of walk(join(ARCHIVE_ROOT, t.tool))) {
       if (!t.isTranscript(f)) continue;
-      try { stats[await indexToolFile(db, t, f, force)]++; }
+      try { stats[(!force && unchanged(f)) ? 'skip' : await indexToolFile(db, t, f, force)]++; }
       catch (e) { stats.failed++; console.error(`index failed: ${f}: ${(e as Error).message}`); }
     }
   }

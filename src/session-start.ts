@@ -30,8 +30,10 @@ try {
   const source = String(ev.source ?? ''); // Claude Code: startup | resume | clear | compact | fork
   if (ev.agent_id) process.exit(0); // inside a subagent (Claude Code docs): its parent briefs it, it can memory_search — 106 blocks/week went there
   const db = connect('ro');
-  // resume: Claude Code keeps the earlier block in the transcript it reloads, so sending it again only repeats it
-  if (source === 'resume' && session && (await db.query(`SELECT 1 FROM injections WHERE session = $1 LIMIT 1`, [session]).catch(() => ({ rowCount: 0 }))).rowCount) {
+  // resume: Claude Code keeps the earlier block in the transcript it reloads; compact: first compact re-briefs, repeated compacts within 10m skip
+  if (session && (source === 'resume' || source === 'compact') && (await db.query(
+    `SELECT 1 FROM injections WHERE session = $1 AND ($2 = 'resume' OR (source = 'compact' AND ts > now() - interval '10 minutes')) LIMIT 1`,
+    [session, source]).catch(() => ({ rowCount: 0 }))).rowCount) {
     await db.end();
     process.exit(0);
   }

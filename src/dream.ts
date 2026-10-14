@@ -1,6 +1,7 @@
 // Dream: distil finished AI sessions (every app: sources.tool except obsidian) into session cards + facts (notes in the
 // memory-hub vault), reconcile new facts with existing ones (ADD / NOOP / UPDATE / SUPERSEDE, never delete), then rebuild the synapses (synapse.ts) and hub notes.
-// LLM = Claude only (claude -p with Anthropic auth, or answered by Claude agents through request/result files).
+// LLM = Claude (claude -p with Anthropic auth, or answered by Claude agents through request/result files), or DeepSeek's API
+// (ลุงจืด 2026-10-10, --runner deepseek). Claude-only sources (Google = kind 'doc', chats shown them = hide_as) are never dreamed.
 // Design + sources: docs/research/phase4-design.md §3–5.
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -12,6 +13,7 @@ import { ROOT } from './db.ts';
 import { backfill } from './embed.ts';
 import { offsiteBackend } from './guard.ts';
 import { hideDreamed, projectName } from './importer.ts';
+import { redactOffsite } from './redact.ts';
 import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { search } from './search.ts';
@@ -82,6 +84,61 @@ export const claudeRunner = (model = process.env.MEMHUB_DREAM_MODEL ?? 'sonnet',
   }
 };
 
+/** DeepSeek bills double 01:00-04:00 and 06:00-10:00 UTC on weekdays (api-docs.deepseek.com pricing, 2026-10-10). Chinese
+ *  holidays are off-peak too; treating them as peak only skips a night. */
+export const deepseekPeak = (t: Date) => t.getUTCDay() >= 1 && t.getUTCDay() <= 5 && [1, 2, 3, 6, 7, 8, 9].includes(t.getUTCHours());
+
+// One value per JSON-schema node: the first enum / anyOf branch, ids from their pattern (^S\d+$ → S1).
+const sample = (s: Record<string, any>): unknown =>
+  s.type === 'object' ? Object.fromEntries(Object.entries(s.properties ?? {}).map(([k, v]) => [k, sample(v as Record<string, any>)]))
+  : s.type === 'array' ? [sample(s.items)] : s.enum ? s.enum[0] : s.anyOf ? sample(s.anyOf[0])
+  : s.type === 'string' ? (s.pattern ? String(s.pattern).replace(/^\^|\$$/g, '').replace('\\d+', '1') : '...')
+  : s.type === 'integer' || s.type === 'number' ? (s.minimum ?? 0) : null;
+
+/**
+ * DeepSeek API ("ใช้แบบประหยัด"): non-thinking model, JSON mode, temperature 0. Prompt + schema go first so every batch of a
+ * pass shares one cached prefix (cache hits bill at a fraction). Offsite, so every key-shaped token is scrubbed (redactOffsite).
+ * JSON mode has no schema enforcement: an example object cut the pilot's invalid batches (s: 1/null, 9 facts) from 2/4 to 1/12.
+ * JSON mode may return empty content: one retry.
+ * Pass A only: thinking + a rule checklist (prompts/dream-extract-deepseek.md). 2026-10-10 blind opus judge, 3 batches / 25 sessions:
+ * facts without evidence 13/88 -> 0/58, wrong kind 30 -> 2, ~3-4x output tokens. Claude never sees the checklist.
+ */
+export const deepseekRunner = (model = process.env.MEMHUB_DEEPSEEK_MODEL ?? 'deepseek-flash', log = console.log, retryMs = 1000): Llm => async (req) => {
+  const key = process.env.MEMHUB_DEEPSEEK_KEY;
+  if (!key) throw new Error('MEMHUB_DEEPSEEK_KEY is not set (.env)');
+  if (process.env.MEMHUB_ANTHROPIC_ONLY === '1') throw new Error('refusing deepseek: MEMHUB_ANTHROPIC_ONLY=1');
+  const passA = req.id.startsWith('A-');
+  // thinking is on by default (billed as output); max_tokens defaults to 8K, too small for a 12-session pass A in Thai (thinking: up to 18K seen)
+  const body = JSON.stringify({ model, thinking: { type: passA ? 'enabled' : 'disabled' }, temperature: 0, max_tokens: 65536, response_format: { type: 'json_object' }, messages: [
+    { role: 'system', content: `${req.system}${passA ? `\n\n${PROMPT('dream-extract-deepseek')}` : ''}\n\nReply with one json object that follows this JSON schema:\n${JSON.stringify(req.schema)}\n\nExample json (format only):\n${JSON.stringify(sample(req.schema))}` },
+    // a lone surrogate (an emoji cut by a length cap) becomes \ud83d in JSON, which DeepSeek's parser rejects with a 400
+    { role: 'user', content: redactOffsite(req.user).toWellFormed() }] });
+  for (let attempt = 1; ; attempt++) {
+    const t0 = Date.now();
+    let res: Response;
+    try {
+      res = await fetch('https://api.deepseek.com/chat/completions', { method: 'POST', body, signal: AbortSignal.timeout(600_000),
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` } });
+    } catch (e) {
+      if (attempt >= 3) throw e;
+      await new Promise((r) => setTimeout(r, attempt * retryMs));
+      continue;
+    }
+    if (!res.ok) {
+      if ((res.status === 429 || res.status >= 500) && attempt < 3) {
+        await new Promise((r) => setTimeout(r, attempt * retryMs));
+        continue;
+      }
+      throw new Error(`deepseek ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    }
+    const r = await res.json() as { choices: { message: { content: string }; finish_reason: string }[]; usage?: Record<string, number> };
+    const u = r.usage ?? {};
+    log(`  ${req.id}: in ${u.prompt_cache_miss_tokens ?? '?'} + cache ${u.prompt_cache_hit_tokens ?? 0}, out ${u.completion_tokens ?? '?'} tokens, ${Date.now() - t0} ms`);
+    try { return JSON.parse(r.choices[0].message.content); }
+    catch (e) { if (attempt >= 3) throw new Error(`deepseek: no json (${r.choices[0]?.finish_reason}): ${String(e).slice(0, 200)}`); }
+  }
+};
+
 // ---------------- schemas (JSON schema for the LLM; validation per item in Node: reject, never repair ids) ----------------
 
 const FACT_KINDS = ['rule', 'feedback', 'decision', 'preference', 'fact', 'howto'] as const;
@@ -102,12 +159,51 @@ export const SchemaA = z.object({
 });
 export const SchemaB = z.object({
   ops: z.array(z.object({
-    n: z.string().regex(/^N\d+$/), op: z.enum(['ADD', 'NOOP', 'UPDATE', 'SUPERSEDE']),
+    n: z.string().regex(/^N\d+$/), op: z.enum(['UPDATE', 'ADD', 'NOOP', 'SUPERSEDE']),
     target: z.string().regex(/^E\d+$/).nullable().optional(), text: z.string().max(400).optional(),
     links: z.array(z.object({ to: z.string().regex(/^E\d+$/), rel: z.enum(['supports', 'related']) })).max(3).optional(),
     why: z.string().max(160).optional(),
   })),
 });
+// DeepSeek's JSON mode has no schema (pilot: one over-long title dropped a whole session): clip at word/cluster boundary, drop only bad facts
+const SessionA = SchemaA.shape.sessions.element;
+export const clip = (t: unknown, n: number) => {
+  if (typeof t !== 'string') return t;
+  const s = t.toWellFormed().trim();
+  if (s.length <= n) return s;
+  const raw = s.slice(0, n - 1);
+  const cutAt = Math.max(raw.lastIndexOf(' '), raw.lastIndexOf('\n'));
+  const base = (cutAt >= n * 0.8 ? raw.slice(0, cutAt) : raw).replace(/[\s\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]+$/u, '');
+  return (base || raw) + '…';
+};
+const clipAll = (v: unknown, n: number) =>
+  Array.isArray(v) ? v.filter((t): t is string => typeof t === 'string' && t.trim().length > 0).slice(0, 5).map((t) => clip(t, n)) : undefined;
+const repairFact = (f: any) => (!f || typeof f !== 'object' ? f : {
+  ...f,
+  text: clip(f.text, 400),
+  importance: typeof f.importance === 'number' && Number.isFinite(f.importance) ? Math.min(10, Math.max(1, Math.round(f.importance))) : f.importance,
+  confidence: typeof f.confidence === 'number' && Number.isFinite(f.confidence) ? Math.min(1, Math.max(0, f.confidence > 1 ? f.confidence / 10 : f.confidence)) : f.confidence,
+  ...(f.valid_at === '' ? { valid_at: null } : {}),
+  ...(f.invalid_at === '' ? { invalid_at: null } : {}),
+});
+export const repairSession = (x: any) => (!x?.card ? x : { ...x,
+  card: { ...x.card, title: clip(x.card.title, 80), summary: clip(x.card.summary, 600), decisions: clipAll(x.card.decisions, 200), open: clipAll(x.card.open, 200) },
+  facts: Array.isArray(x.facts) ? x.facts.map(repairFact).filter((f: unknown) => SessionA.shape.facts.element.safeParse(f).success).slice(0, 8) : x.facts });
+// Pass B (trial 2026-10-10 + live 2026-10-13): DeepSeek JSON mode emits null for unused optional fields, >160-char Thai why,
+// or >400-char UPDATE text. An over-long UPDATE becomes ADD ("if both do not fit … choose ADD"); non-UPDATE ops drop text.
+const LinkB = SchemaB.shape.ops.element.shape.links.unwrap().element;
+export const repairOp = (x: any) => {
+  if (!x || typeof x !== 'object') return x;
+  const over = typeof x.text === 'string' && x.text.length > 400;
+  const op = over && x.op === 'UPDATE' ? 'ADD' : x.op;
+  const out: Record<string, unknown> = { ...x, op, ...(op === 'ADD' || x.target === '' ? { target: null } : {}) };
+  if (over || x.text === null || x.text === '' || (op !== 'UPDATE' && typeof x.text === 'string')) out.text = undefined;
+  if (x.links === null || !Array.isArray(x.links)) delete out.links;
+  else out.links = x.links.filter((l: unknown) => LinkB.safeParse(l).success).slice(0, 3);
+  if (x.why === null || x.why === '') delete out.why;
+  else if (typeof x.why === 'string' && x.why.length > 160) out.why = clip(x.why, 160);
+  return out;
+};
 const jsonSchema = (s: z.ZodType) => { const j = z.toJSONSchema(s) as Record<string, unknown>; delete j.$schema; return j; };
 
 // ---------------- digests ----------------
@@ -255,7 +351,8 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
     // The plan (turn ranges + batches) is frozen per run id, so a files-runner run resumes with the same digests →
     // the same request ids, whatever ลุงจืด said in the meantime.
     const planKey = `dream:plan:${o.run}`;
-    let plan: { ranges: Range[]; batches: string[][]; stats?: DreamStats } | undefined = (await db.query('SELECT v FROM state WHERE k = $1', [planKey])).rows[0]?.v;
+    let plan: { ranges: Range[]; batches: string[][]; stats?: DreamStats; missed?: string[]; resultsA?: unknown[] } | undefined =
+      (await db.query('SELECT v FROM state WHERE k = $1', [planKey])).rows[0]?.v;
     let batches: Batch[];
     if (plan?.ranges) {
       const all = new Map((await loadDigests(db, plan.ranges)).map((d) => [d.key, d]));
@@ -287,25 +384,37 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
     const doneHere = new Map<string, string>((await db.query(`SELECT k, v->>'upto' upto FROM state WHERE k LIKE 'dream:session:%' AND v->>'run' = $1`, [o.run])).rows.map((r) => [r.k.slice(14), r.upto]));
     const record: Record<string, unknown>[] = [];
 
-    // Pass A for every batch first (independent → a files runner can have them all answered in parallel).
+    // Pass A for every batch first (independent → parallel; completed batches cached in plan so a mid-run failure never re-bills them).
     const sysA = PROMPT('dream-extract'), schemaA = jsonSchema(SchemaA);
     const pending: string[] = [];
-    const resultsA = await Promise.all(batches.map(async (b) => {
+    const resultsA: unknown[] = [...(plan.resultsA ?? [])];
+    let errA: unknown;
+    await Promise.all(batches.map(async (b, i) => {
+      if (resultsA[i] !== undefined && resultsA[i] !== null) return;
       try {
-        return await o.llm({ id: `A-${sha(b.text)}`, system: sysA, user: `Current date: ${BKK(now)} (Asia/Bangkok)\n\n${b.text}`, schema: schemaA });
-      } catch (e) { if (e instanceof Pending) { pending.push(e.message); return null; } throw e; }
+        resultsA[i] = await o.llm({ id: `A-${sha(b.text)}`, system: sysA, user: `Current date: ${BKK(now)} (Asia/Bangkok)\n\n${b.text}`, schema: schemaA });
+      } catch (e) {
+        resultsA[i] = null;
+        if (e instanceof Pending) pending.push(e.message);
+        else errA ??= e;
+      }
     }));
+    plan = { ...plan, resultsA };
+    await db.query('UPDATE state SET v = $2 WHERE k = $1', [planKey, JSON.stringify(plan)]);
+    if (errA) throw errA;
     if (pending.length) return { status: 'pending', stats, pending };
 
     // Then reconcile + promote batch by batch, re-indexing in between so later batches see earlier facts.
+    const missed = new Set(plan.missed); // sessions left without a card this run (promoteBatch)
     for (const [i, b] of batches.entries()) {
-      if (b.digests.every((d) => (doneHere.get(d.sessionId) ?? '') >= d.upto)) continue; // promoted in an earlier invocation of this run
+      // promoted in an earlier invocation of this run
+      if (b.digests.every((d) => missed.has(d.sessionId) || (doneHere.get(d.sessionId) ?? '') >= d.upto)) continue;
       const bs = { ...stats }; // a batch stopped by Pending reruns whole: only a finished batch adds its counts
-      try { record.push(await promoteBatch(db, o, b, resultsA[i], bs, now)); }
+      try { record.push(await promoteBatch(db, o, b, resultsA[i], bs, now, missed)); }
       catch (e) { if (e instanceof Pending) return { status: 'pending', stats, pending: [e.message] }; throw e; }
       Object.assign(stats, bs);
       // a files runner stops at every pass-B request: kept with the plan, the run record counts the whole run, not its last invocation
-      await db.query('UPDATE state SET v = $2 WHERE k = $1', [planKey, JSON.stringify({ ...plan, stats })]);
+      await db.query('UPDATE state SET v = $2 WHERE k = $1', [planKey, JSON.stringify({ ...plan, stats, missed: [...missed] })]);
     }
     await db.query('DELETE FROM state WHERE k = $1', [planKey]);
     mkdirSync(RUNS_DIR, { recursive: true });
@@ -361,11 +470,11 @@ const markDone = (db: pg.Pool, sessionId: string, v: Record<string, unknown>) =>
 type Cand = { n: string; text: string; kind: string; scope: string; lang: string; importance: number; confidence: number;
   validAt: Date; invalidAt: Date | null; uuids: string[]; byUser: boolean; s: string; d: Digest; card: string; E: Existing[] };
 
-async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, stats: DreamStats, now: Date) {
+async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, stats: DreamStats, now: Date, missed: Set<string>) {
   const log = o.log ?? console.log;
   const a = SchemaA.safeParse(rawA);
   const sessions = a.success ? a.data.sessions : (z.object({ sessions: z.array(z.unknown()) }).safeParse(rawA).data?.sessions ?? [])
-    .map((x) => SchemaA.shape.sessions.element.safeParse(x)).filter((x) => x.success).map((x) => x.data!);
+    .map((x) => { const r = SessionA.safeParse(x); return r.success ? r : SessionA.safeParse(repairSession(x)); }).filter((x) => x.success).map((x) => x.data!);
   const cands: Cand[] = [];
   const cards = new Map<string, { d: Digest; card: (typeof sessions)[number]['card']; facts: string[] }>();
   for (const s of sessions) {
@@ -386,8 +495,9 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
     }
   }
 
-  // Fast path (no LLM): tombstoned / rejected → drop; identical text → NOOP; no similar fact → ADD.
-  const ops = new Map<string, { op: string; target?: Existing; text?: string; links: { e: Existing; rel: string }[]; why?: string }>();
+  // Fast path (no LLM): tombstoned / rejected → drop; identical text → NOOP; same md5 in batch → merge into first; no similar fact → ADD.
+  const ops = new Map<string, { op: string; target?: Existing; text?: string; links: { e: Existing; rel: string }[]; why?: string; sameAs?: string }>();
+  const seenMd5 = new Map<string, Cand>();
   for (const c of cands) {
     const h = md5(c.text);
     if ((await db.query(`SELECT 1 FROM forgotten WHERE key = $1`, [`fact:${h}`])).rowCount) { stats.dropped++; ops.set(c.n, { op: 'DROP', links: [] }); continue; }
@@ -395,6 +505,14 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
     if (same.some((e) => e.status === 'rejected')) { stats.dropped++; ops.set(c.n, { op: 'DROP', links: [] }); continue; }
     const live = same.find((e) => e.status !== 'superseded');
     if (live) { ops.set(c.n, { op: 'NOOP', target: live, links: [] }); continue; }
+    const first = seenMd5.get(h);
+    if (first) {
+      first.uuids = [...new Set([...first.uuids, ...c.uuids])];
+      first.byUser ||= c.byUser;
+      ops.set(c.n, { op: 'NOOP', sameAs: first.n, links: [] });
+      continue;
+    }
+    seenMd5.set(h, c);
     // tier 0: neighbours by similarity only (the priority tier pushed owned notes above closer dream facts → duplicate ADDs)
     const { hits } = await search(db, c.text, { project: MEMORY_PROJECT, limit: 12, semantic: true, perSession: 1, tier: 0 });
     const fids = [...new Set(hits.filter((x) => x.fid && x.kind !== 'card' && x.status !== 'superseded' && x.status !== 'rejected').map((x) => x.fid!))].slice(0, 5);
@@ -402,7 +520,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
     if (!c.E.length) ops.set(c.n, { op: 'ADD', links: [] });
   }
 
-  // Pass B: reconcile the rest with Claude.
+  // Pass B: reconcile the rest with the LLM.
   const needB = cands.filter((c) => !ops.has(c.n));
   if (needB.length) {
     const emap = new Map<string, Existing>(), eid = new Map<string, string>();
@@ -416,11 +534,12 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
     const rawB = await o.llm({ id: `B-${sha(lines.join('\n'))}`, system: PROMPT('dream-reconcile'), user: lines.join('\n\n'), schema: jsonSchema(SchemaB) }); // Pending propagates
     const parsed = z.object({ ops: z.array(z.unknown()) }).safeParse(rawB).data?.ops ?? [];
     for (const x of parsed) {
-      const r = SchemaB.shape.ops.element.safeParse(x);
+      let r = SchemaB.shape.ops.element.safeParse(x);
+      if (!r.success) r = SchemaB.shape.ops.element.safeParse(repairOp(x));
       if (!r.success) { stats.rejected_ids++; continue; }
       const c = needB.find((k) => k.n === r.data.n);
-      const allowed = (e?: string | null) => (e ? c?.E.find((k) => k.fid === emap.get(e)?.fid) : undefined);
-      const target = allowed(r.data.target);
+      const allowed = (e?: string | null) => (e ? c?.E.find((k) => k.fid === emap.get(e)?.fid) ?? emap.get(e) : undefined);
+      const target = r.data.op === 'ADD' ? undefined : allowed(r.data.target);
       if (!c || ops.has(c.n) || (r.data.op !== 'ADD' && !target)) { stats.rejected_ids++; continue; } // reject, never repair
       ops.set(c.n, { op: r.data.op, target, text: r.data.text, why: r.data.why,
         links: (r.data.links ?? []).map((l) => ({ e: allowed(l.to)!, rel: l.rel })).filter((l) => l.e) });
@@ -428,10 +547,15 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
   }
 
   // Promote: write notes. Only machine-owned keys change; ลุงจืด's own notes are never rewritten.
-  const written = new Map<string, string>(); // md5 → rel (same text twice in one batch)
+  const written = new Map<string, string>(), candRel = new Map<string, string>(); // md5 → rel, c.n → rel
   for (const c of cands) {
     const op = ops.get(c.n);
     if (!op || op.op === 'DROP') continue;
+    if (op.sameAs) {
+      const prevRel = candRel.get(op.sameAs);
+      if (prevRel) { stats.NOOP++; candRel.set(c.n, prevRel); cards.get(c.s)?.facts.push(prevRel); }
+      continue;
+    }
     stats[op.op]++;
     const base: Fm = { memhub: 'fact', kind: c.kind, scope: c.scope, project: c.scope === 'global' ? '' : c.d.project, lang: c.lang,
       importance: String(c.importance), confidence: String(c.confidence), pinned: 'false', run: o.run, created_at: now.toISOString(),
@@ -440,7 +564,12 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
       `${text}\n\n- from:: ${link(c.card)}\n${[...extra, ...op.links.map((l) => `- ${l.rel}:: ${link(l.e.rel)}`)].join('\n')}${extra.length || op.links.length ? '\n' : ''}`;
     const addNote = (text: string, uuids: string[], fm: Fm, extra: string[] = []) => {
       const h = md5(text);
-      if (written.has(h)) return written.get(h)!;
+      if (written.has(h)) {
+        const prev = written.get(h)!;
+        const cur = parseNote(readFileSync(join(MEMORY_VAULT, prev), 'utf8')).fm.source_uuids;
+        writeNote(prev, { source_uuids: [...new Set([...(Array.isArray(cur) ? cur : []), ...uuids])] });
+        return prev;
+      }
       const fid = factId(text);
       const rel = factRel(fid, text, c.scope, c.d.project);
       const res = writeNote(rel, { ...base, id: fid, md5: h, status: 'active', valid_at: c.validAt.toISOString(),
@@ -472,6 +601,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
         if (writeNote(t.rel, { status: 'superseded', superseded_by: newFid, expired_at: now.toISOString(), invalid_at: c.validAt.toISOString() }) === 'kept-user-edit') stats.kept_user_edit++;
       }
     }
+    candRel.set(c.n, rel);
     cards.get(c.s)?.facts.push(rel);
   }
 
@@ -492,8 +622,13 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
   await indexVault(db, MEMORY_VAULT);
   await resolveLinks(db);
   await backfill(db, 8, () => {}).catch(() => 0);
-  for (const d of b.digests) await markDone(db, d.sessionId, { run: o.run, card: d.card, upto: d.upto });
-  log(`dream batch: ${b.digests.length} sessions, ${cands.length} candidate facts`);
+  // The prompt asks for one card per session: one left without (the model skipped it) stays undone and is retried next run,
+  // and so are its later windows, or marking those would jump over the skipped turns.
+  const carded = new Set([...cards.values()].map((c) => c.d)), noCard = b.digests.filter((d) => !carded.has(d));
+  for (const d of noCard) missed.add(d.sessionId);
+  if (noCard.length) stats.no_card = (stats.no_card ?? 0) + noCard.length;
+  for (const d of b.digests) if (!missed.has(d.sessionId)) await markDone(db, d.sessionId, { run: o.run, card: d.card, upto: d.upto });
+  log(`dream batch: ${b.digests.length} sessions, ${cands.length} candidate facts${noCard.length ? `, ${noCard.length} without a card (retried next run)` : ''}`);
   return { sessions: b.digests.map((d) => d.sessionId), candidates: cands.map((c) => ({ n: c.n, text: c.text, kind: c.kind, uuids: c.uuids, op: ops.get(c.n)?.op, target: ops.get(c.n)?.target?.fid })) };
 }
 
@@ -501,6 +636,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
 
 /** Approvals, synapse rebuild ('sleep': structural kinds + co-access with downscaling, synapse.ts), hub + review notes. Safe to run every night. */
 export async function consolidate(db: pg.Pool, now = new Date()) {
+  await db.query(`DELETE FROM state WHERE k ~ '^dream:plan:\\d{4}-\\d{2}-\\d{2}-' AND k < $1`, [`dream:plan:${BKK(new Date(+now - 2 * 86400_000))}`]);
   await hideDreamed(db); // catch-all before synapses/hubs: a chat hidden after its facts were dreamed
   await applyApprovals(db, now);
   await rebuildSynapses(db, { structural: true, plastic: true, now });

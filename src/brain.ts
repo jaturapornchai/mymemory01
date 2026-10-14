@@ -15,7 +15,7 @@ import { MEMORY_PROJECT } from './notes.ts';
 export type NodeType = 'project' | 'session' | 'subagent' | 'note' | 'memory';
 /** The AI apps (= sources.tool). Approved for the public site by name; everything else stays an alias.
  *  google = the Claude-only tools (guard.PRIVATE_TOOLS): counts only, never a node, edge, label or time (local mode too). */
-export const APPS = ['claude', 'codex', 'gemini', 'antigravity', 'zcode', 'lmstudio', 'github', 'obsidian', 'google'] as const;
+export const APPS = ['claude', 'codex', 'gemini', 'antigravity', 'zcode', 'lmstudio', 'kimi', 'github', 'obsidian', 'google'] as const;
 export type App = (typeof APPS)[number];
 export type BrainNode = {
   id: string; type: NodeType; label?: string;

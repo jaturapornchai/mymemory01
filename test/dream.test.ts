@@ -18,7 +18,7 @@ process.env.MEMHUB_NO_REINDEX = '1';
 process.env.MEMORY_HUB_INTERNAL = '1';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
-const { dream, filesRunner, buildDigests, packBatches, DREAM_LIMIT } = await import('../src/dream.ts');
+const { dream, deepseekRunner, filesRunner, buildDigests, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
 const { rebuildSynapses } = await import('../src/synapse.ts');
 const { parseNote, saveNote, fileName, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
@@ -474,4 +474,123 @@ test('default cap: a backlog goes DREAM_LIMIT sessions per run, newest first; ju
   await run('cap-2');
   const rest = await db.query(`SELECT count(*)::int n FROM state WHERE k = ANY($1) AND v->>'run' = 'cap-2'`, [ids.slice(0, 3).map((x) => `dream:session:${x}`)]);
   assert.equal(rest.rows[0].n, 3); // the next run picks up the remainder
+});
+
+test('a session the model returns no card for is retried next run, and its later windows do not jump over it', async () => {
+  await indexFile(db, session('nc1', '2026-09-24', ['FACT: งาน nc1 ใช้พอร์ต 9101']));
+  // ~5 windows → one per batch; the model drops the first: the batches holding only later lw1 windows wait for the next run too
+  await indexFile(db, session('lw1', '2026-09-24', Array.from({ length: 40 }, (_, i) => `${i ? `รอบ ${i}` : 'เริ่ม lw1'} ${'ก'.repeat(1500)}`)));
+  const drop = async (req: LlmReq) => {
+    const r: any = await fake(req);
+    if (!req.id.startsWith('A-')) return r;
+    const blk = new Map(req.user.split(/^=== /m).slice(1).map((b) => [b.match(/^(S\d+)/)![1], b]));
+    return { sessions: r.sessions.filter((s: any) => !blk.get(s.s)!.includes('เริ่ม lw1')) };
+  };
+  const r = await dream(db, { llm: drop, run: 'nc-1', force: true, now: NOW, log: () => {} });
+  assert.equal(r.stats.no_card, 1, JSON.stringify(r.stats));
+  assert.deepEqual([r.stats.windows >= 3, r.stats.cards], [true, 1], JSON.stringify(r.stats)); // nc1 only
+  assert.equal((await sessionState('nc1')).run, 'nc-1');
+  assert.equal(await sessionState('lw1'), undefined, 'neither the skipped window nor the ones after it are marked done');
+  await run('nc-2');
+  assert.equal((await sessionState('lw1')).upto, await maxTs('lw1'));
+});
+
+test('deepseekPeak: weekday 01-04 and 06-10 UTC only', () => {
+  const at = (iso: string) => deepseekPeak(new Date(iso));
+  assert.deepEqual(['2026-10-12T01:00Z', '2026-10-12T03:59Z', '2026-10-12T06:00Z', '2026-10-16T09:59Z'].map(at), [true, true, true, true]);
+  assert.deepEqual(['2026-10-12T00:59Z', '2026-10-12T04:00Z', '2026-10-12T10:00Z', '2026-10-12T20:30Z', '2026-10-10T02:00Z', '2026-10-11T07:00Z'].map(at),
+    [false, false, false, false, false, false]); // 20:30Z = the 03:30 BKK nightly; 10-10/11 = Sat/Sun
+});
+
+test('repairSession: over-long card fields, null arrays, float importance, or one bad fact no longer drop the session', () => {
+  const fact = { text: 'ok', kind: 'fact', scope: 'project', lang: 'en', importance: 5, confidence: 0.9, source_turns: ['T1'] };
+  const floatFact = { ...fact, text: 'คำอธิบายภาษาไทย '.repeat(30), importance: 8.6, confidence: 9, valid_at: '' };
+  const bad = { s: 'S1', card: { title: 'x'.repeat(95), summary: 's', outcome: 'done', decisions: Array(7).fill('d'.repeat(250)), open: null },
+    facts: [floatFact, { ...fact, kind: 'gossip' }, ...Array(8).fill(fact)] };
+  const El = SchemaA.shape.sessions.element;
+  assert.equal(El.safeParse(bad).success, false);
+  const r = El.safeParse(repairSession(bad));
+  assert.ok(r.success);
+  assert.equal(r.data!.card.title.length, 80);
+  assert.equal(r.data!.card.decisions!.length, 5);
+  assert.equal(r.data!.card.open, undefined);
+  assert.equal(r.data!.facts.length, 8);
+  assert.equal(r.data!.facts[0].importance, 9);
+  assert.equal(r.data!.facts[0].confidence, 0.9);
+  assert.ok(r.data!.facts[0].text.length <= 400 && r.data!.facts[0].text.endsWith('…'));
+  assert.equal(El.safeParse(repairSession({ s: null, card: bad.card, facts: [] })).success, false); // unknown session: still dropped
+});
+
+test('repairOp: an over-long UPDATE becomes ADD instead of losing the fact; other ops just drop the text; DeepSeek nulls/long why repaired at word boundary', () => {
+  const El = SchemaB.shape.ops.element, long = 'x'.repeat(1500);
+  const up = { n: 'N1', op: 'UPDATE', target: 'E2', text: long, links: [{ to: 'E3', rel: 'related' }], why: 'merge' };
+  assert.equal(El.safeParse(up).success, false);
+  const r = El.safeParse(repairOp(up));
+  assert.ok(r.success);
+  assert.deepEqual([r.data!.op, r.data!.target, r.data!.text, r.data!.links], ['ADD', null, undefined, [{ to: 'E3', rel: 'related' }]]);
+  assert.deepEqual(El.safeParse(repairOp({ n: 'N2', op: 'NOOP', target: 'E1', text: long })).data, { n: 'N2', op: 'NOOP', target: 'E1', text: undefined });
+  const ds = { n: 'N3', op: 'SUPERSEDE', target: 'E1', text: null, links: null, why: 'เหตุผลภาษาไทยยาว '.repeat(15) };
+  assert.equal(El.safeParse(ds).success, false);
+  const rDs = El.safeParse(repairOp(ds));
+  assert.ok(rDs.success);
+  assert.ok(rDs.data!.why!.length <= 160 && rDs.data!.why!.endsWith('ยาว…'), rDs.data!.why);
+  assert.equal(rDs.data!.text, undefined);
+  assert.equal(rDs.data!.links, undefined);
+  assert.equal(El.safeParse(repairOp({ n: 'X', op: 'UPDATE', target: 'E1', text: long })).success, false); // a bad id is never repaired
+});
+
+test('intra-batch duplicate facts merge provenance; batch-wide E# targets resolve; Pass A cached on Pass B failure; stale dream:plan pruned', async () => {
+  await db.query(`INSERT INTO state (k, v) VALUES ('dream:plan:2026-08-01-claude', '{}'), ('dream:plan:2026-09-25-deepseek', '{}')`);
+  await indexFile(db, session('dup1', '2026-09-24', ['FACT: กฎช่อง Botstery ห้ามเดาข้อมูลเด็ดขาด']));
+  await indexFile(db, session('dup2', '2026-09-24', ['FACT: กฎช่อง Botstery ห้ามเดาข้อมูลเด็ดขาด']));
+  let callsA = 0, failB = true;
+  const flakyLlm = async (req: Parameters<typeof fake>[0]) => {
+    if (req.id.startsWith('A-')) callsA++;
+    if (req.id.startsWith('B-') && failB) { failB = false; throw new Error('network drop in Pass B'); }
+    return fake(req);
+  };
+  await assert.rejects(() => dream(db, { llm: flakyLlm, run: 'dup-run', force: true, now: NOW, log: () => {} }), /network drop in Pass B/);
+  assert.equal(callsA, 1, 'Pass A called once before Pass B failed');
+  const r = await dream(db, { llm: flakyLlm, run: 'dup-run', force: true, now: NOW, log: () => {} });
+  assert.equal(callsA, 1, 'Pass A result reused from dream:plan:<run> on retry without re-billing');
+  assert.equal(r.stats.ADD, 1, JSON.stringify(r.stats));
+  assert.equal(r.stats.NOOP, 1, JSON.stringify(r.stats));
+  const f = (await factRows()).find((x) => x.session_ids.includes('dup1') && x.session_ids.includes('dup2'));
+  assert.ok(f, 'both sessions merged into the single note provenance');
+  const stale = (await db.query(`SELECT k FROM state WHERE k LIKE 'dream:plan:%'`)).rows.map((x) => x.k);
+  assert.deepEqual(stale, ['dream:plan:2026-09-25-deepseek']);
+});
+
+test('deepseek runner: no key-shaped token leaves, JSON mode with an example, retries empty/503, thinking + checklist on pass A only', async () => {
+  const sent: { url: string; body: any }[] = [];
+  const replies: { status?: number; content: string }[] = [{ status: 503, content: 'overloaded' }, { content: '' }, { content: '{"sessions":[]}' }, { content: '{"sessions":[]}' }];
+  const realFetch = globalThis.fetch, realKey = process.env.MEMHUB_DEEPSEEK_KEY;
+  process.env.MEMHUB_DEEPSEEK_KEY = 'test-key'; // fetch is stubbed: nothing reaches the API
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    sent.push({ url, body: JSON.parse(String(init.body)) });
+    const next = replies.shift()!;
+    if (next.status) return new Response(next.content, { status: next.status });
+    return new Response(JSON.stringify({ choices: [{ message: { content: next.content }, finish_reason: 'stop' }], usage: {} }));
+  }) as typeof fetch;
+  try {
+    const leak = 'aB3dE5gH7jK9mN1pQ2rS4tU6v'; // 25-char key shape the import redaction keeps
+    const out = await deepseekRunner('deepseek-flash', () => {}, 1)({ id: 'x', system: 'SYS', user: `KEY=${leak} ใช้ตัวนี้ cut \uD83D`,
+      schema: { type: 'object', properties: { s: { type: 'string', pattern: '^S\\d+$' } } } });
+    assert.deepEqual(out, { sessions: [] });
+    assert.equal(sent.length, 3);
+    const b = sent[0].body;
+    assert.equal(sent[0].url, 'https://api.deepseek.com/chat/completions');
+    assert.deepEqual(b.thinking, { type: 'disabled' });
+    assert.equal(b.response_format.type, 'json_object');
+    assert.ok(!JSON.stringify(b).includes(leak));
+    assert.match(b.messages[0].content, /"s":"S1"/);
+    assert.ok(b.messages[1].content.isWellFormed()); // a lone surrogate made DeepSeek answer 400
+    assert.ok(!b.messages[0].content.includes('Final check'));
+    await deepseekRunner('deepseek-flash', () => {}, 1)({ id: 'A-1', system: 'SYS', user: 'u', schema: { type: 'object' } }); // pass A: thinking + checklist
+    assert.deepEqual(sent[3].body.thinking, { type: 'enabled' });
+    assert.match(sent[3].body.messages[0].content, /^SYS\n\nFinal check before you answer/);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (realKey === undefined) delete process.env.MEMHUB_DEEPSEEK_KEY; else process.env.MEMHUB_DEEPSEEK_KEY = realKey;
+  }
 });

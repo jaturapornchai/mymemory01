@@ -78,11 +78,12 @@ test('stats --injected [n] prints the last injections with their ids', () => {
   assert.match(spawnSync(process.execPath, [join(ROOT, 'src', 'cli.ts'), 'stats', '--injected', '1'], { encoding: 'utf8', env: ENV }).stdout, /^\S+ \S+  claude-code clear   /);
 });
 
-test('nothing for a subagent or for a resumed chat already briefed; a resume never briefed and a compact get it', async () => {
+test('nothing for a subagent or for a resumed chat already briefed; a resume never briefed and the first compact get it, repeated compact skips', async () => {
   assert.equal(await sessionStart('s-sub', { source: 'startup', agent_id: 'a1', agent_type: 'Explore' }), '', 'subagent');
   assert.equal(await sessionStart('s-new', { source: 'resume' }), '', 's-new was briefed at startup: its transcript still has it');
   assert.ok((await sessionStart('s-old', { source: 'resume' })).includes('injectrule'), 'no row for s-old (from before the log)');
   assert.ok((await sessionStart('s-new', { source: 'compact' })).includes('injectrule'), 'compact drops the old block: brief again');
+  assert.equal(await sessionStart('s-new', { source: 'compact' }), '', 'repeated compact within 10 minutes is skipped');
   const rows = (await db.query(`SELECT session, source FROM injections WHERE session IN ('s-sub', 's-new', 's-old') ORDER BY id`)).rows;
   assert.deepEqual(rows.map((r) => `${r.session}:${r.source}`), ['s-new:startup', 's-old:resume', 's-new:compact']);
 });

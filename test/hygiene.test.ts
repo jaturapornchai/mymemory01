@@ -110,7 +110,7 @@ test('forget --session: single-source fact + card retired, multi-source trimmed,
   assert.equal(git('status', '--porcelain'), '');
 });
 
-test('lint: expired, duplicate pair, orphan, broken link — private sources never listed', async () => {
+test('lint & fixLint: expired, duplicate pair, orphan, broken link, replaced — private sources never listed, fixLint retires only machine notes', async () => {
   note('facts/demo/F0000eee old.md', 'F0000eee', ['bbbb-u0'], { invalid_at: '2026-09-01T00:00:00.000Z' });
   note('facts/demo/F0000f01 twin one.md', 'F0000f01', ['bbbb-u0'], {}, 'twin one');
   note('facts/demo/F0000f02 twin two.md', 'F0000f02', ['bbbb-u0'], {}, 'twin two');
@@ -146,6 +146,14 @@ test('lint: expired, duplicate pair, orphan, broken link — private sources nev
   const lint = read(LINT_REL);
   assert.deepEqual([...lint.matchAll(/^## (\S+)$/gm)].map((m) => m[1]), ['2026-10-05', '2026-10-04']);
   assert.match(git('log', '-1', '--format=%s'), /^lint 2026-10-05: /);
+
+  // fixLint retires expired F0000eee and duplicate F0000f02 (keeping F0000f01), while leaving secret F0000f05 untouched
+  const fixedOut = await runLint(db, { dry: true, fix: true, now: NOW });
+  assert.match(fixedOut, /^fixed: -1 expired, -0 replaced, -1 dups\n## 2026-10-04\nเลยวันหมดอายุ 0 · อาจซ้ำ 0 คู่/);
+  assert.equal(parseNote(read('facts/demo/F0000eee old.md')).fm.status, 'superseded');
+  assert.equal(parseNote(read('facts/demo/F0000f02 twin two.md')).fm.status, 'superseded');
+  assert.equal(parseNote(read('facts/demo/F0000f01 twin one.md')).fm.status, 'active');
+  assert.equal(parseNote(read('facts/demo/F0000f05 secret.md')).fm.status, 'active');
 
   // ลุงจืด edited the lint note → never rewritten; the report goes to stdout (nightly.log) instead
   const { fm, body } = parseNote(lint);

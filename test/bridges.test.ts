@@ -58,6 +58,10 @@ test('entity: rare identifiers shared across sessions, IDF-weighted; cites: sha 
   assert.ok(g.edges.some((e) => e.kind === 'entity') && g.edges.some((e) => e.kind === 'cites'), 'loaded for associate / proposals');
   const s = shuffled(g, 1, ['entity']);
   assert.deepEqual(s.edges.filter((e) => e.kind === 'cites'), g.edges.filter((e) => e.kind === 'cites'), 'only the named kinds are shuffled');
+  await db.query(`INSERT INTO edges (a, b, kind, w, updated_at) VALUES ($1, $2, 'sem', 1, now())`, [Math.min(S.b, S.issue), Math.max(S.b, S.issue)]);
+  await rebuildSynapses(db, { structural: true, now: new Date() });
+  assert.deepEqual(await pairs('sem'), [['b', 'issue', 1]], 'sem (Gemma-judged, written outside rebuild) survives a rebuild');
+  assert.ok((await loadGraph(db)).edges.some((e) => e.kind === 'sem'), 'and is loaded for associate');
 });
 
 test('associate: bridges are normalized on their own at half gain, so they never dilute link/spawn/prov arcs', async () => {

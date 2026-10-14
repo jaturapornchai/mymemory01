@@ -105,7 +105,7 @@ test('search-api: a date-only since/until range is ลุงจืด\'s day (As
   assert.deepEqual(ids(hits), ['d-early', 'd-mid'], 'since=until=2026-09-10 should be 10 Sep 00:00–24:00 Bangkok');
 });
 
-test('hygiene: forget --project rerun after an earlier (pre-cascade or crashed) forget still retires its facts', { todo: "not fixed: project forget finds facts only through the sources it deletes now; lint lists the leftovers as orphans" }, async () => {
+test('hygiene: forget --project rerun after an earlier (pre-cascade or crashed) forget still retires its facts', async () => {
   await chat('p-s1', 'd:/oldproj', [[bkk('2026-09-04', '10:00'), 'เรื่องเก่า']]);
   const rel = 'facts/oldproj/F0000p01 old.md';
   dreamNote(rel, 'F0000p01', 'fact', ['p-s1-u0'], 'old project fact', { project: 'd:/oldproj' });

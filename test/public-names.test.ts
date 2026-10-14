@@ -8,8 +8,8 @@ import { PUBLIC_NAMES, textLeak } from '../web/scripts/public-names.mjs';
 const db = { query: async () => ({ rows: [{ v: 'D:/work/secret-app' }, { v: 'github/acme/widget-repo' }, { v: 'D:/work/codex-tools' }, { v: 'D:/memory-hub' },
   { v: 'C:/Users/someone/.gemini/antigravity/brain/abc.jsonl' }] }) } as unknown as pg.Pool;
 
-test('textLeak: the 8 app display names and memory-hub are fine', async () => {
-  const text = 'memory-hub\nClaude 1,234 · Codex 56 · Gemini 7 · Antigravity 8 · ZCode 9 · LM Studio 10 · GitHub 11 · Obsidian 12\nความจำ · V2';
+test('textLeak: the 9 app display names and memory-hub are fine', async () => {
+  const text = 'memory-hub\nClaude 1,234 · Codex 56 · Gemini 7 · Antigravity 8 · ZCode 9 · LM Studio 10 · Kimi 13 · GitHub 11 · Obsidian 12\nความจำ · V2';
   assert.equal(await textLeak(db, text, 'someone'), '');
   assert.equal(text.replace(PUBLIC_NAMES, '').match(/[A-Z]/g)?.join(''), 'V'); // all stripped, the alias stays
 });

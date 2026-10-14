@@ -22,10 +22,11 @@ function* notes(dir: string): Generator<string> {
 }
 
 /** Link target as Obsidian resolves it: last path segment, no .md, case-insensitive. */
-export const linkKey = (target: string) => basename(target.trim().replace(/\\/g, '/')).replace(/\.md$/i, '').toLowerCase();
+export const linkKey = (target: string) => basename(target.trim().replace(/\\/g, '/')).replace(/(?:\.md)+$/i, '').toLowerCase();
 
 export function wikilinks(md: string): string[] {
-  return [...new Set([...md.matchAll(WIKILINK)].map((m) => linkKey(m[1])).filter(Boolean))];
+  const cleanMd = md.replace(/```[\s\S]*?```|`[^`\n]+`/g, '');
+  return [...new Set([...cleanMd.matchAll(WIKILINK)].map((m) => linkKey(m[1])).filter((k) => /[\p{L}\p{N}]/u.test(k)))];
 }
 
 export async function indexVault(db: pg.Pool, vault: string) {
@@ -34,18 +35,21 @@ export async function indexVault(db: pg.Pool, vault: string) {
   const stats = { skip: 0, indexed: 0, removed: 0 };
   const seen = [...notes(vault)];
   // First (a renamed note must free its fid before the new path is indexed). Gone = not seen by this walk AND not on disk now (another process may have written it after our walk started).
-  const gone = (await db.query(`SELECT id, path FROM sources WHERE tool = 'obsidian' AND project = $1 AND NOT (path = ANY($2::text[]))`,
-    [project, seen])).rows.filter((r) => !existsSync(r.path)).map((r) => r.id);
+  const existing = (await db.query(`SELECT id, path, size, mtime_ms FROM sources WHERE tool = 'obsidian' AND project = $1`, [project])).rows;
+  const seenSet = new Set(seen);
+  const gone = existing.filter((r) => !seenSet.has(r.path) && !existsSync(r.path)).map((r) => r.id);
   if (gone.length && vault === MEMORY_VAULT) { // deleted fact file = ลุงจืด's decision → tombstone so the dream never re-creates it
     await db.query(`INSERT INTO forgotten (key) SELECT 'fact:' || md5 FROM facts WHERE source_id = ANY($1) AND kind <> 'card'
       ON CONFLICT DO NOTHING`, [gone]);
   }
   if (gone.length) await db.query('DELETE FROM sources WHERE id = ANY($1)', [gone]);
   stats.removed = gone.length;
+  const known = new Map<string, { size: number; mtimeMs: number }>();
+  for (const r of existing) known.set(r.path, { size: Number(r.size), mtimeMs: Number(r.mtime_ms) });
   for (const path of seen) {
     const st = statSync(path);
-    const old = (await db.query('SELECT size, mtime_ms FROM sources WHERE path = $1', [path])).rows[0];
-    if (old && Number(old.size) === st.size && Number(old.mtime_ms) === Math.round(st.mtimeMs)) { stats.skip++; continue; }
+    const old = known.get(path);
+    if (old && old.size === st.size && old.mtimeMs === Math.round(st.mtimeMs)) { stats.skip++; continue; }
     const raw = readFileSync(path, 'utf8');
     const own = vault === MEMORY_VAULT; // memory-hub's own notes: frontmatter is metadata (facts row), not searchable text
     const { fm, body } = own ? parseNote(raw) : { fm: {} as Fm, body: raw };
@@ -110,7 +114,7 @@ export async function resolveLinks(db: pg.Pool) {
   await db.query(`
     UPDATE links l SET dst_id = n.id
     FROM (SELECT DISTINCT ON (k) id, k FROM (                       -- session_id = 'vault/rel/path.md' (forward slashes)
-            SELECT id, lower(regexp_replace(session_id, '^.*/|[.]md$', '', 'g')) k, length(session_id) len
+            SELECT id, lower(regexp_replace(session_id, '^.*/|(?:[.]md)+$', '', 'g')) k, length(session_id) len
             FROM sources WHERE tool = 'obsidian') x
           ORDER BY k, len) n                                         -- duplicate names: shortest path wins, like Obsidian
     WHERE l.dst_name = n.k AND l.dst_id IS DISTINCT FROM n.id`);

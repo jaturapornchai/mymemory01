@@ -108,6 +108,16 @@ test('project = repo root: worktrees and subdirs map to the main repo; cwd-less 
   const want = repo.replace(/\\/g, '/').toLowerCase();
   assert.equal(normProject(join(repo, 'backend', 'internal')), want);
   assert.equal(normProject(join(repo, '.claude', 'worktrees', 'epic-x', 'src')), want);
+  const extWt = join(dir, 'worktrees', 'ext-wt');
+  mkdirSync(extWt, { recursive: true });
+  writeFileSync(join(extWt, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'ext-wt')}\n`);
+  assert.equal(normProject(join(extWt, 'src')), want, 'external git worktree file resolves to main repo');
+  const otherMachineClone = join(dir, 'other-machine', 'renamed-clone');
+  mkdirSync(join(otherMachineClone, '.git'), { recursive: true });
+  writeFileSync(join(otherMachineClone, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/jead/repo.git\n');
+  process.env.MEMHUB_PROJECT_MAP = `jead/repo=${want}`;
+  try { assert.equal(normProject(join(otherMachineClone, 'sub')), want, 'git remote origin maps clone on another path/machine to canonical project'); }
+  finally { delete process.env.MEMHUB_PROJECT_MAP; }
   assert.equal(normProject('D:\\no-such-dir\\sub'), 'd:/no-such-dir/sub');
 
   const wf = join(dir, 'proj', 'sess-1', 'subagents', 'agent-nocwd.jsonl');

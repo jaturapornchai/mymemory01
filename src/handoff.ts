@@ -15,12 +15,13 @@ const ago = (d: Date) => {
 
 /** "ล่าสุด codex ทำงานนี้ 3 ชม.ก่อน: <card title or first prompt>" when the last session in this
  *  project (≤ 48 h, imported) came from another app than the caller. */
-export async function lastOtherApp(db: pg.Pool, project: string, client: string, sessionId = ''): Promise<string | null> {
-  if (!project) return null;
+export async function lastOtherApp(db: pg.Pool, project: string | string[], client: string, sessionId = ''): Promise<string | null> {
+  const projects = (Array.isArray(project) ? project : [project]).filter(Boolean);
+  if (!projects.length) return null;
   const last = (await db.query(
     `SELECT s.tool, c.source_id, c.session_id, max(c.ts) ts FROM chunks c JOIN sources s ON s.id = c.source_id
-     WHERE c.project = $1 AND c.ts > now() - make_interval(hours => $2) AND s.kind = 'main' AND s.hide_as IS NULL AND c.session_id <> $3
-     GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 1`, [project, RECENT_HOURS, sessionId])).rows[0];
+     WHERE c.project = ANY($1::text[]) AND c.ts > now() - make_interval(hours => $2) AND s.kind = 'main' AND s.hide_as IS NULL AND c.session_id <> $3
+     GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 1`, [projects, RECENT_HOURS, sessionId])).rows[0];
   if (!last || last.tool === appOf(client)) return null;
   // card note text = "# <file>\n# <title>\n\n<summary>" (dream); else the session's first real prompt
   const r = (await db.query(

@@ -1,7 +1,7 @@
 // 1) sync: copy live ~/.claude/projects into the append-only archive (never deletes, never overwrites history)
 // 2) index: archive JSONL → redact → turns + chunks (idempotent: unchanged files skipped, rows keyed by uuid / content hash)
 import { createHash } from 'node:crypto';
-import { closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, utimesSync, writeSync } from 'node:fs';
+import { closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type pg from 'pg';
@@ -175,7 +175,7 @@ export async function indexToolFile(db: pg.Pool, t: ToolModule, path: string, fo
     return 'skip';
   }
   const p = await t.parse(path);
-  const project = p?.cwd ? normProject(p.cwd) : '';
+  const project = p?.cwd ? await canonicalProject(db, p.cwd) : '';
   if (!p?.msgs.length || EXCLUDE.some((x) => project.startsWith(x)) || await isForgotten(db, p.sessionId, project)) {
     if (old) await db.query('DELETE FROM sources WHERE id = $1', [old.id]);
     return p?.msgs.length ? 'excluded' : 'empty';
@@ -192,13 +192,60 @@ export async function indexToolFile(db: pg.Pool, t: ToolModule, path: string, fo
 // ---------------- index ----------------
 
 const roots = new Map<string, string>();
-/** Project = the repo a cwd belongs to: Claude worktrees → their main repo, subdirs → nearest git root, else the cwd. */
+let projMapCache: Record<string, string> | null = null;
+const SCRATCH_NAMES = new Set(['tmp', 'temp', 'test', 'test01', 'test02', 'new folder', 'verify', 'worktrees', 'src', 'app', 'ui', 'web', 'docs', 'scripts', 'dist', 'build', 'out']);
+
+/** owner/repo (lowercase) of a github.com remote origin in dir/.git/config. */
+export function gitOrigin(dir: string): string | null {
+  try {
+    const remote = /\[remote "origin"\]([^[]*)/.exec(readFileSync(join(dir, '.git', 'config'), 'utf8'))?.[1];
+    const url = remote && /^\s*url\s*=\s*(.+)$/m.exec(remote)?.[1];
+    return url ? github.remoteRepo(url) : null;
+  } catch { return null; }
+}
+
+function projectMap(): Record<string, string> {
+  if (projMapCache && process.env.MEMHUB_PROJECT_MAP === undefined) return projMapCache;
+  const m: Record<string, string> = {};
+  // 1) Auto-discovered GitHub repo -> canonical local clone (skip default ~/ai-archive in hermetic test schemas)
+  if (!process.env.MEMHUB_PG_SCHEMA || process.env.MEMHUB_ARCHIVE_ROOT || process.env.MEMHUB_ARCHIVE_DIR) {
+    try { Object.assign(m, JSON.parse(readFileSync(join(ARCHIVE_ROOT, 'github', '_local.json'), 'utf8'))); } catch {}
+    try { Object.assign(m, JSON.parse(readFileSync(join(ARCHIVE_ROOT, '_projects.json'), 'utf8'))); } catch {}
+  }
+  for (const pair of (process.env.MEMHUB_PROJECT_MAP ?? '').split(',')) {
+    const eq = pair.indexOf('=');
+    if (eq > 0) m[pair.slice(0, eq).trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()] =
+      pair.slice(eq + 1).trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  }
+  return (projMapCache = m);
+}
+
+/** Project = the repo a cwd belongs to: Claude/git worktrees → their main repo, subdirs → nearest git root, git remote/alias → canonical project. */
 export function normProject(cwd: string): string {
   const p = cwd.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase().replace(/\/\.claude\/worktrees\/[^/]+(?:\/.*)?$/, '');
   let root = roots.get(p);
-  if (root === undefined) {
+  if (root === undefined || process.env.MEMHUB_PROJECT_MAP !== undefined) {
     root = p;
-    for (let d = p; d.includes('/'); d = d.slice(0, d.lastIndexOf('/'))) if (existsSync(`${d}/.git`)) { root = d; break; }
+    for (let d = p; d.includes('/'); d = d.slice(0, d.lastIndexOf('/'))) {
+      if (existsSync(`${d}/.git`)) {
+        root = d;
+        try {
+          if (statSync(`${d}/.git`).isFile()) { // git worktree (.ao, git worktree add, etc.): gitdir: <main>/.git/worktrees/<name>
+            const gd = /^gitdir:\s*(.+)$/im.exec(readFileSync(`${d}/.git`, 'utf8'))?.[1]?.trim();
+            const full = gd ? resolve(d, gd).replace(/\\/g, '/').toLowerCase() : '';
+            const wt = full.indexOf('/.git/worktrees/');
+            if (wt > 0) root = full.slice(0, wt);
+          }
+        } catch {}
+        break;
+      }
+    }
+    const map = projectMap();
+    if (map[root]) root = map[root];
+    else {
+      const repo = gitOrigin(root);
+      if (repo && map[repo]) root = map[repo];
+    }
     roots.set(p, root);
   }
   return root;
@@ -215,6 +262,57 @@ export function projectChain(project: string): string[] {
   return chain;
 }
 export const projectName = (p: string) => p.split('/').filter(Boolean).at(-1) ?? p;
+
+/**
+ * Expand projectChain(normProject(cwd)) with cross-machine / moved-folder equivalents from the DB:
+ *  1) state 'project:aliases' (explicit path or git remote alias shared across machines via Postgres),
+ *  2) sources where tool = 'github' and session_id = 'github:<owner>/<repo>' (links a clone on another machine, even under a different folder name),
+ *  3) existing root projects in sources/facts with the same projectName(p) (when p is not a subfolder of another known project and not a scratch dir).
+ */
+export async function resolveProjectChain(db: pg.Pool, cwdOrProject: string, onlyCanonical = false): Promise<string[]> {
+  const p = normProject(cwdOrProject);
+  const chain = projectChain(p);
+  if (!p || p.startsWith('obsidian/') || p.startsWith('github/') || p.startsWith('google/') || /^[a-z]:$/.test(p) || p === 'c:/tmp') return chain;
+  const repo = gitOrigin(p);
+  const name = projectName(p);
+  const parents = chain.slice(1);
+  try {
+    const r = await db.query(
+      `WITH known AS (
+         SELECT project, count(*)::int n FROM sources WHERE project <> '' AND project !~ '^[a-z]:$' AND project <> 'c:/tmp' AND project NOT LIKE 'obsidian/%' AND project NOT LIKE 'github/%' AND project NOT LIKE 'google/%' GROUP BY 1
+         UNION ALL
+         SELECT project, 1 FROM facts WHERE coalesce(project, '') <> '' AND project !~ '^[a-z]:$' AND project <> 'c:/tmp' AND project NOT LIKE 'obsidian/%' AND project NOT LIKE 'github/%' GROUP BY 1
+       ),
+       agg AS (SELECT project, sum(n)::int n FROM known GROUP BY 1),
+       cur AS (SELECT coalesce((SELECT n FROM agg WHERE project = $1), 0) n),
+       al AS (SELECT coalesce(v->>$1, CASE WHEN $2::text IS NOT NULL THEN v->>$2 END, v->>$3) target FROM state WHERE k = 'project:aliases'),
+       gh AS (SELECT project FROM sources WHERE $2::text IS NOT NULL AND tool = 'github' AND lower(session_id) = 'github:' || $2 AND project NOT LIKE 'github/%' LIMIT 1),
+       same AS (
+         SELECT a.project, (a.n > (SELECT n FROM cur) OR (a.n = (SELECT n FROM cur) AND length(a.project) < length($1))) canon FROM agg a
+         WHERE $4::bool AND a.project <> $1 AND (a.project = $3 OR right(a.project, length($3) + 1) = '/' || $3)
+           AND NOT EXISTS (SELECT 1 FROM agg par WHERE par.project = ANY($5::text[]))
+           AND NOT EXISTS (SELECT 1 FROM agg par WHERE par.project <> a.project AND starts_with(a.project, par.project || '/'))
+         ORDER BY a.n DESC, length(a.project) ASC
+       )
+       SELECT target AS p, true canon FROM al WHERE target IS NOT NULL
+       UNION ALL SELECT project, true FROM gh
+       UNION ALL SELECT project, canon FROM same`,
+      [p, repo, name, !SCRATCH_NAMES.has(name), parents],
+    );
+    const out = [p];
+    for (const row of r.rows) if (row.p && (!onlyCanonical || row.canon) && !out.includes(row.p)) out.push(row.p);
+    for (const par of parents) if (!out.includes(par)) out.push(par);
+    return out;
+  } catch { return chain; }
+}
+
+/** Canonical project path for cwdOrProject: resolves worktrees, git remote origin, state 'project:aliases', or established root project with the same name. */
+export async function canonicalProject(db: pg.Pool, cwdOrProject: string): Promise<string> {
+  const p = normProject(cwdOrProject);
+  const chain = await resolveProjectChain(db, p, true);
+  const parents = new Set(projectChain(p).slice(1));
+  return chain.find((x) => x !== p && !parents.has(x)) ?? p;
+}
 /** Text as the index may hold it: no <private>, no secrets; personal = redactPersonal first (Claude-only Google sources). */
 export const clean = (t: string, personal = false) => { // PG text can't hold NUL
   const s = stripPrivate(t.replaceAll('\u0000', ''));
@@ -352,7 +450,7 @@ export async function indexFile(db: pg.Pool, path: string, force = false, shared
   const parent = isSub ? parts[parts.indexOf('subagents') - 1] : undefined;
   const sessionId = msgs.find((m) => m.sessionId)?.sessionId || parent || basename(path, '.jsonl');
   const cwd = msgs.find((m) => m.cwd)?.cwd;
-  const project = cwd ? normProject(cwd) : parent ? await parentProject(db, parts.slice(0, parts.indexOf('subagents')).join(sep), parent) : '';
+  const project = cwd ? await canonicalProject(db, cwd) : parent ? await parentProject(db, parts.slice(0, parts.indexOf('subagents')).join(sep), parent) : '';
   if (EXCLUDE.some((x) => project.startsWith(x)) || await isForgotten(db, sessionId, project)) {
     if (old) await db.query('DELETE FROM sources WHERE id = $1', [old.id]);
     return 'excluded';
@@ -389,10 +487,10 @@ export async function hideDreamed(c: pg.ClientBase | pg.Pool, sessionId: string 
 /** Project of the main session that spawned a subagent/workflow (indexed row, else its transcript's first cwd). */
 async function parentProject(db: pg.Pool, sessionDir: string, sessionId: string): Promise<string> {
   const row = (await db.query(`SELECT project FROM sources WHERE kind = 'main' AND session_id = $1 AND project <> '' LIMIT 1`, [sessionId])).rows[0];
-  if (row) return normProject(row.project);
+  if (row) return canonicalProject(db, row.project);
   const main = `${sessionDir}.jsonl`;
   const cwd = existsSync(main) ? parseClaude(readFileSync(main, 'utf8')).find((m) => m.cwd)?.cwd : undefined;
-  return cwd ? normProject(cwd) : '';
+  return cwd ? canonicalProject(db, cwd) : '';
 }
 
 const isForgotten = async (db: pg.Pool, sessionId: string, project: string) => !!(await db.query(
@@ -438,6 +536,54 @@ export async function forget(db: pg.Pool, what: 'session' | 'project', value: st
   // daily notes quote prompts, card titles and fact names: rewritten without what is gone now (daily.ts)
   const daily = await (await import('./daily.ts')).rewriteDailies(db, `forget ${what} ${v}: daily notes`); // a rerun redoes them too
   return { sources: r.rowCount ?? 0, ...notes, daily };
+}
+
+/** Save a permanent project alias (path, repo, or name → canonical project) in Postgres state ('project:aliases') and _projects.json. */
+export async function setProjectAlias(db: pg.Pool, fromRaw: string, toRaw: string) {
+  const from = fromRaw.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const to = normProject(toRaw);
+  if (!from || !to || from === to) throw new Error('invalid alias');
+  await db.query(
+    `INSERT INTO state (k, v) VALUES ('project:aliases', jsonb_build_object($1::text, $2::text))
+     ON CONFLICT (k) DO UPDATE SET v = coalesce(state.v, '{}'::jsonb) || jsonb_build_object($1::text, $2::text)`,
+    [from, to],
+  );
+  const file = join(ARCHIVE_ROOT, '_projects.json');
+  let map: Record<string, string> = {};
+  try { map = JSON.parse(readFileSync(file, 'utf8')); } catch {}
+  map[from] = to;
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(map, null, 2) + '\n');
+  projMapCache = null;
+  roots.clear();
+  return { from, to };
+}
+
+/** Merge an old/split project path into its canonical project across sources, turns, chunks, facts, and Obsidian notes, and record the alias. */
+export async function migrateProject(db: pg.Pool, fromRaw: string, toRaw: string) {
+  const { from, to } = await setProjectAlias(db, fromRaw, toRaw);
+  const s = await db.query(`UPDATE sources SET project = $2 WHERE project = $1`, [from, to]);
+  await db.query(`UPDATE turns SET project = $2 WHERE project = $1`, [from, to]);
+  await db.query(`UPDATE chunks SET project = $2 WHERE project = $1`, [from, to]);
+  await db.query(`UPDATE injections SET project = $2 WHERE project = $1`, [from, to]).catch(() => {});
+  await db.query(`UPDATE access_log SET project = $2 WHERE project = $1`, [from, to]).catch(() => {});
+  const { MEMORY_VAULT, parseNote, renderNote } = await import('./notes.ts');
+  const { beforeMachineWrite, commitBatch } = await import('./vault-git.ts');
+  const vault = MEMORY_VAULT.replace(/\\/g, '/');
+  const notes = (await db.query(`SELECT f.fid, s.path FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.project = $1`, [from])).rows;
+  let updatedNotes = 0;
+  for (const n of notes) {
+    const p = String(n.path).replace(/\\/g, '/');
+    if (!p.startsWith(vault + '/') || !existsSync(n.path)) continue;
+    const rel = p.slice(vault.length + 1);
+    const { fm, body } = parseNote(readFileSync(n.path, 'utf8'));
+    beforeMachineWrite(MEMORY_VAULT, rel);
+    writeFileSync(n.path, renderNote({ ...fm, project: to }, body));
+    updatedNotes++;
+  }
+  await db.query(`UPDATE facts SET project = $2 WHERE project = $1`, [from, to]);
+  if (updatedNotes) commitBatch(MEMORY_VAULT, `project mv ${from} -> ${to}: ${updatedNotes} notes`);
+  return { from, to, sources: s.rowCount ?? 0, notes: updatedNotes };
 }
 
 export async function indexArchive(db: pg.Pool, force = false) {

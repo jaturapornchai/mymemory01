@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { connect } from './db.ts';
 import { embed, toVec, warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
-import { clean, normProject, projectName } from './importer.ts';
+import { canonicalProject, clean, normProject, projectName } from './importer.ts';
 import { fmStr, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
 import { day, HIDDEN, hitLine, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, proposals } from './synapse.ts';
@@ -21,6 +21,8 @@ const db = connect('ro');
 const NO_PROJECT = /^[a-z]:$|^[a-z]:\/(?:program files[^/]*|windows)(?:\/|$)|^[a-z]:\/users\/[^/]+(?:\/appdata(?:\/.*)?)?$/;
 const toProject = (cwd: string) => ((p) => (NO_PROJECT.test(p) ? '' : p))(normProject(cwd));
 const currentProject = toProject(process.cwd());
+let canonProj: Promise<string> | null = null;
+const getProject = () => (canonProj ??= currentProject ? canonicalProject(db, currentProject) : Promise.resolve(''));
 const startedAt = new Date();
 const session = `mcp-${process.pid}-${startedAt.getTime()}`; // one MCP process = one session of the calling AI app
 // Freshness: search / timeline / related hide only the caller's own live session (its app's chunks in this project since server
@@ -134,7 +136,7 @@ server.registerTool(
     const brief = detail === 'brief';
     const n = limit && Math.min(limit, 8); // ≤ 8 hits in both modes; default = search()'s 6
     const filters = { project, since, until, ...freshness() };
-    const res = await search(db, query, { ...filters, limit: n, currentProject, now: new Date(), showPrivate: privateOk(client()) });
+    const res = await search(db, query, { ...filters, limit: n, currentProject: await getProject(), now: new Date(), showPrivate: privateOk(client()) });
     const { semantic } = res;
     // Synapse competition (MEMHUB_COMPETE=0 turns it off): 1-hop graph neighbours of the top 6 compete with results 7..n for
     // those slots (no extra lines). Fresh N1b holdout: linked answer visible 13.5 → 22.4 % vs plain limit 8 (+22 −1), shuffled
@@ -426,7 +428,8 @@ server.registerTool(
         // counts; other vaults) go to the existing review path
         if (!r.his && n && !isHis(n.fm, n.body)) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
       }
-      const rel = saveNote(content, { title, kind, global, project: currentProject, client: client(), supersede: sup.map((x) => x.rel), review: review[0] });
+      const proj = await getProject();
+      const rel = saveNote(content, { title, kind, global, project: proj, client: client(), supersede: sup.map((x) => x.rel), review: review[0] });
       // saveNote decides: pending (his note to review) supersedes nothing yet; the same text already active stays active
       const pending = fmStr(parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.status) === 'pending';
       const ids = (xs: string[]) => xs.map((x) => `[${x}]`).join(' ');
@@ -437,7 +440,7 @@ server.registerTool(
         : `[${review[0]}] เป็นโน้ตของลุงจืด: ไม่แก้ไฟล์ให้ — โน้ตใหม่เป็น pending รอลุงจืดอนุมัติ (คิว hubs/_review.md อัปเดตตอนกลางคืน; ตั้ง status: active = แทน [${review[0]}])` +
         (review.length > 1 ? `; ยังไม่ได้เสนอแทน ${ids(review.slice(1))}: เสนอได้ทีละโน้ต` : ''));
       if (old.length) out.push(`already OLD, left as is: ${old.join(' · ')}`);
-      for (const x of await similar(clean(content).trim(), kind ?? 'fact', global ? '' : currentProject, hide, [fid, ...replaces]))
+      for (const x of await similar(clean(content).trim(), kind ?? 'fact', global ? '' : proj, hide, [fid, ...replaces]))
         out.push(`คล้าย [${x.fid}] ${x.txt} — ส่ง replaces:[${x.fid}] ถ้าจะแทน`);
     }
     const lost = want.filter((x) => !seen.has(x));

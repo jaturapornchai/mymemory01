@@ -243,6 +243,24 @@ try {
     // facts/cards dreamed from it: printed as fid + note file name (what was retired), not the note body
     for (const [k, xs] of [['retired (note deleted)', r.retired], ['kept, provenance trimmed', r.trimmed], ['kept: edited by you, see hubs/_review.md', r.review], ['daily notes you edited (may still quote it)', r.daily]] as const)
       if (xs.length) console.log(`${k}: ${xs.length}\n${xs.map((x) => `  ${x}`).join('\n')}`);
+  } else if (cmd === 'project') {
+    // project [--mv <from> <to> | --alias <from> <to> | --sync]: link or merge moved/multi-machine project paths
+    const imp = await import('./importer.ts');
+    if (args[0] === '--mv' && args[1] && args[2]) {
+      console.log('project mv', JSON.stringify(await imp.migrateProject(db, args[1], args[2])));
+    } else if (args[0] === '--alias' && args[1] && args[2]) {
+      console.log('project alias', JSON.stringify(await imp.setProjectAlias(db, args[1], args[2])));
+    } else {
+      const sync = args.includes('--sync');
+      const rows = (await db.query(`SELECT project, count(*)::int n FROM sources WHERE project <> '' AND project NOT LIKE 'obsidian/%' AND project NOT LIKE 'github/%' AND project NOT LIKE 'google/%' GROUP BY 1 ORDER BY 2 DESC`)).rows;
+      const splits: { from: string; to: string; sources: number; notes?: number }[] = [];
+      for (const r of rows) {
+        const to = await imp.canonicalProject(db, r.project);
+        if (to !== r.project) splits.push(sync ? await imp.migrateProject(db, r.project, to) : { from: r.project, to, sources: r.n });
+      }
+      const aliases = (await db.query(`SELECT v FROM state WHERE k = 'project:aliases'`)).rows[0]?.v ?? {};
+      console.log(JSON.stringify({ aliases, ...(sync ? { migrated: splits } : { pending_splits: splits }) }, null, 2));
+    }
   } else if (cmd === 'dream') {
     // dream [--runner deepseek|claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, synapses, hubs)
     const d = await import('./dream.ts');

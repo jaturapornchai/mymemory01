@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { connect } from './db.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { lastOtherApp } from './handoff.ts';
-import { normProject, projectChain } from './importer.ts';
+import { normProject, resolveProjectChain } from './importer.ts';
 import { cutAtWord } from './notes.ts';
 import { hiddenNameMask } from './search.ts';
 
@@ -48,7 +48,6 @@ try {
   for await (const c of process.stdin) raw += c;
   const ev = JSON.parse(raw);
   const project = normProject(String(ev.cwd ?? process.cwd()));
-  const chain = projectChain(project); // a sub-folder start (no .git of its own) also gets the project above it
   const session = String(ev.session_id ?? '');
   const source = String(ev.source ?? ''); // Claude Code: startup | resume | clear | compact | fork
   if (ev.agent_id || (app === 'codex' && isCodexSubOrExec(session, ev))) process.exit(0); // subagent or headless codex exec
@@ -60,6 +59,7 @@ try {
     await db.end();
     process.exit(0);
   }
+  const chain = await resolveProjectChain(db, project); // includes cross-machine / moved-folder canonical project + parent folders
   const body = `(SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1)`;
   // this folder's facts, then each folder above it, then global ones (NULL sorts last)
   const near = `CASE WHEN f.scope IS DISTINCT FROM 'global' THEN array_position($1::text[], f.project) END`;
@@ -88,7 +88,7 @@ try {
        WHERE s.kind = 'main' AND coalesce(s.hide_as, s.tool) <> ALL($3::text[]) AND t.project = ANY($1::text[]) AND t.role = 'user' AND t.session_id <> $2 AND left(t.text_redacted, 1) <> '['
          AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND t.session_id = ANY(f.session_ids))
        ORDER BY t.session_id, t.seq`, [chain, session, [...PRIVATE_TOOLS]]),
-    lastOtherApp(db, project, app, session).catch(() => null), // best-effort: the rest still shows
+    lastOtherApp(db, chain, app, session).catch(() => null), // best-effort: the rest still shows
     db.query(`SELECT k, v FROM state WHERE k LIKE 'health:%' ORDER BY k`).catch(() => ({ rows: [] })), // cli.ts health(): last run of each background job
   ]);
   // fact note text = "# <file name>\n<fact>\n\n- from:: …"; card = "# <file>\n# <title>\n\n<summary>…"

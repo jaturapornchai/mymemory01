@@ -123,6 +123,10 @@ test('a sub-folder start gets the folders above it, nearest first: whole path se
   assert.ok(!ctx.includes(drive), 'the drive root is a catch-all, not this project');
   assert.ok((await sessionStart('s-drive', { cwd: 'q:\\' })).includes(drive), 'a start at the drive root still gets its own');
   assert.ok(!(await sessionStart('s-ctmp', { cwd: 'c:\\tmp\\chaintest' })).includes(ctmp), 'c:/tmp: scratch folders, not one project');
+  // Cross-machine / moved folder: opening the same project name on another OS/drive (/Users/jead/<projectName> or E:\work\<projectName>)
+  // resolves to the canonical project and injects its rules, session cards, and handoff
+  const otherMac = await sessionStart('s-mac', { cwd: `/Users/jead/${PROJECT.split('/').at(-1)}` });
+  assert.ok(otherMac.includes(rule) && otherMac.includes('Sc2c2c2c2') && otherMac.includes('injectmarker'), 'another machine with the same root project name gets full context');
 });
 
 test('the log write fails (no table before migrate, no grant): the chat still gets its context', async () => {

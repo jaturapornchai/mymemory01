@@ -263,6 +263,7 @@ export function projectChain(project: string): string[] {
 }
 export const projectName = (p: string) => p.split('/').filter(Boolean).at(-1) ?? p;
 
+const chainCache = new Map<string, { at: number; out: string[] }>(), knownProjects = new Set<string>();
 /**
  * Expand projectChain(normProject(cwd)) with cross-machine / moved-folder equivalents from the DB:
  *  1) state 'project:aliases' (explicit path or git remote alias shared across machines via Postgres),
@@ -274,6 +275,9 @@ export async function resolveProjectChain(db: pg.Pool, cwdOrProject: string, onl
   const chain = projectChain(p);
   if (!p || p.startsWith('obsidian/') || p.startsWith('github/') || p.startsWith('google/') || /^[a-z]:$/.test(p) || p === 'c:/tmp') return chain;
   const repo = gitOrigin(p);
+  const ck = `${process.env.MEMHUB_PG_SCHEMA ?? ''}|${onlyCanonical ? 1 : 0}|${p}|${repo ?? ''}`;
+  const hit = chainCache.get(ck);
+  if (hit && Date.now() - hit.at < 15_000) return hit.out;
   const name = projectName(p);
   const parents = chain.slice(1);
   try {
@@ -302,6 +306,7 @@ export async function resolveProjectChain(db: pg.Pool, cwdOrProject: string, onl
     const out = [p];
     for (const row of r.rows) if (row.p && (!onlyCanonical || row.canon) && !out.includes(row.p)) out.push(row.p);
     for (const par of parents) if (!out.includes(par)) out.push(par);
+    chainCache.set(ck, { at: Date.now(), out });
     return out;
   } catch { return chain; }
 }
@@ -388,6 +393,8 @@ ${k.text}`))), b.map((k) => bigramTsvector(bigramRuns(k.text)))],
     }
     if (inTx) await inTx(c, sourceId);
     await c.query('COMMIT');
+    const pk = `${process.env.MEMHUB_PG_SCHEMA ?? ''}|${m.project}`;
+    if (m.project && !knownProjects.has(pk)) { knownProjects.add(pk); chainCache.clear(); }
     return sourceId as string;
   } catch (e) {
     await c.query('ROLLBACK');
@@ -556,6 +563,7 @@ export async function setProjectAlias(db: pg.Pool, fromRaw: string, toRaw: strin
   writeFileSync(file, JSON.stringify(map, null, 2) + '\n');
   projMapCache = null;
   roots.clear();
+  chainCache.clear();
   return { from, to };
 }
 

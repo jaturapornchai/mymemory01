@@ -73,13 +73,16 @@ const factText = (t: string) => String(t ?? '').replace(/^# [^\n]*\n/, '').repla
 /** Hard anchors a paraphrase keeps verbatim: Latin/digit tokens with a digit, _ . / : or an inner '-' (dates, fids: the note's own). */
 const anchors = (s: string) => [...new Set((s.match(/[A-Za-z0-9_./:-]+/g) ?? []).map((w) => w.replace(/^[.:/-]+|[.:/-]+$/g, '').toLowerCase())
   .filter((w) => w.length >= 3 && /[0-9_./:]|[a-z0-9]-[a-z0-9]/.test(w) && !/^\d{4}-\d\d-\d\d/.test(w) && !/^[fsi][0-9a-f]{8}$/.test(w)))];
-const hasAnchor = (src: string, srcFlat: string, w: string) => src.includes(w) || srcFlat.includes(w.replace(/[-_]/g, ''))
-  || (w.includes('/') && (src.includes(basename(w)) || w.split('/').filter((p) => p.length >= 2).every((p) => src.includes(p))));
+const hasAnchor = (src: string, srcFlat: string, w: string) => {
+  const wf = w.replace(/[-_]/g, '').replace(/×/g, 'x');
+  return src.includes(w) || srcFlat.includes(wf)
+    || (w.includes('/') && (src.includes(basename(w)) || w.split('/').filter((p) => p.length >= 2).every((p) => src.includes(p) || srcFlat.includes(p.replace(/[-_]/g, '')))));
+};
 const withTotal = (rows: Row[]) => rows.slice(0, CAP).map((r) => ({ ...r, total: rows.length }));
 /** Facts with ≥ 2 anchors, more than half of them absent from every cited turn. ponytail: substring match on redacted text, Latin only. */
 function unsupported(rows: Row[]) {
   return withTotal(rows.flatMap((r) => {
-    const a = anchors(factText(r.body)), src = `${r.project ?? ''} ${projectName(r.project ?? '')} ${r.src ?? ''}`.toLowerCase(), srcFlat = src.replace(/[-_]/g, '');
+    const a = anchors(factText(r.body)), src = `${r.project ?? ''} ${projectName(r.project ?? '')} ${r.src ?? ''}`.toLowerCase(), srcFlat = src.replace(/[-_\s]/g, '').replace(/×/g, 'x');
     const miss = a.filter((w) => !hasAnchor(src, srcFlat, w));
     return a.length >= 2 && miss.length * 2 > a.length ? [{ fid: r.fid, path: r.path, have: a.length - miss.length, of: a.length, miss: miss.slice(0, 3) }] : [];
   }));

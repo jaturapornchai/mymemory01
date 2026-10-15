@@ -172,7 +172,7 @@ x AS (
   SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header AS header, c.text, c.source_id, c.seq_from, c.seq_to, s.status, s.tool,
          s.kind src_kind, coalesce(u.n, 0)::int uses, u.last, fa.fid, fa.kind, fa.project fact_project, fa.superseded_by, fa.review_target,
          fa.source_uuids, f.s rrf,
-         CASE WHEN s.kind = 'daily' THEN $20::float8 WHEN fa.fid IS NULL OR fa.kind = 'card' OR s.status = 'superseded' THEN 0
+         CASE WHEN s.kind = 'daily' OR (s.tool = 'obsidian' AND s.session_id LIKE '%/hubs/%') THEN $20::float8 WHEN fa.fid IS NULL OR fa.kind = 'card' OR s.status = 'superseded' THEN 0
               WHEN fa.pinned OR fa.user_owned OR fa.run IS NULL OR fa.kind IN ('rule', 'feedback') THEN 2 ELSE 1 END tier,
          CASE WHEN $5::text <> '' AND (c.project = $5 OR fa.project = $5) THEN 1.3 ELSE 1 END proj,
          greatest(extract(epoch FROM coalesce($7, now()) - greatest(c.ts, u.last)) / 86400, 1.0 / 24) t1,

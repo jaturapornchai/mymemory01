@@ -229,7 +229,7 @@ test('late-arriving older fact is born superseded (Zep rule)', async () => {
   assert.equal(born.status, 'superseded');
 });
 
-test('identical fact = NOOP: provenance merged, no new note', async () => {
+test('identical fact = NOOP: provenance merged, no new note, hub Knowledge Page shows full text + ×2 proof count + freshness', async () => {
   const before = notes('facts').length;
   await indexFile(db, session('s4', '2026-09-17', ['FACT: ตัดสินใจใช้ bge-m3 สำหรับ vector']));
   const r = await run('t4');
@@ -237,6 +237,12 @@ test('identical fact = NOOP: provenance merged, no new note', async () => {
   assert.equal(notes('facts').length, before);
   const f = (await factRows()).find((x) => x.source_uuids.some((u: string) => u.startsWith('s4-')))!;
   assert.ok(f.source_uuids.some((u: string) => u.startsWith('s1-')), 'kept the original provenance too');
+  const hub = parseNote(readFileSync(join(MEMORY_VAULT, 'hubs', 'demo hub.md'), 'utf8'));
+  assert.equal(hub.fm.freshness, 'up_to_date');
+  assert.ok(Number(hub.fm.active_facts) >= 2);
+  assert.match(hub.body, /ความจำ active \d+ รายการ · การ์ดเซสชัน \d+ ใบ · สถานะ: สด \(ฝันครบทุกแชต\)/);
+  assert.match(hub.body, /## โมเดลโปรเจกต์และการตัดสินใจ \(Mental Model\)[\s\S]*ตัดสินใจใช้ bge-m3 สำหรับ vector · ×2 แชต/);
+  assert.match(hub.body, /## Recent sessions[\s\S]*— การ์ด S\d+: สรุปสั้น/);
 });
 
 test('ลุงจืด-owned target → proposal goes to review (pending), target untouched', async () => {

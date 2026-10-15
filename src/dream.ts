@@ -11,12 +11,12 @@ import type pg from 'pg';
 import { z } from 'zod';
 import { ROOT } from './db.ts';
 import { backfill } from './embed.ts';
-import { offsiteBackend } from './guard.ts';
+import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { hideDreamed, projectName } from './importer.ts';
 import { redactOffsite } from './redact.ts';
 import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
-import { search } from './search.ts';
+import { hiddenNameMask, search } from './search.ts';
 import { rebuildSynapses } from './synapse.ts';
 import { beforeMachineWrite, commitBatch } from './vault-git.ts';
 
@@ -323,14 +323,15 @@ const factRel = (fid: string, text: string, scope: string, project: string) =>
 const hubName = (project: string) => `${projectSlug(project)} hub`;
 const link = (rel: string) => `[[${basename(rel, '.md')}]]`;
 
-type Existing = { fid: string; kind: string; status: string | null; text: string; rel: string; owned: boolean; hand: boolean; pinned: boolean; validAt: Date; uuids: string[] };
+type Existing = { fid: string; kind: string; status: string | null; text: string; rel: string; owned: boolean; hand: boolean; pinned: boolean; validAt: Date; uuids: string[]; proof: number };
 
 async function existingFacts(db: pg.Pool, where: string, params: unknown[]): Promise<Existing[]> {
   return (await db.query(
-    `SELECT f.fid, f.kind, s.status, f.user_owned owned, (f.edited OR f.pinned OR f.run IS NULL) hand, f.pinned, f.valid_at, f.source_uuids uuids, s.path,
+    `SELECT f.fid, f.kind, s.status, f.user_owned owned, (f.edited OR f.pinned OR f.run IS NULL) hand, f.pinned, f.valid_at, f.source_uuids uuids,
+            greatest(cardinality(f.session_ids), 1)::int proof, s.path,
             (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1) body
      FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${where}`, params)).rows.map((r) => ({
-    fid: r.fid, kind: r.kind, status: r.status, owned: r.owned, hand: r.hand, pinned: r.pinned, validAt: r.valid_at, uuids: r.uuids,
+    fid: r.fid, kind: r.kind, status: r.status, owned: r.owned, hand: r.hand, pinned: r.pinned, validAt: r.valid_at, uuids: r.uuids, proof: r.proof,
     rel: r.path.replace(/\\/g, '/').slice(MEMORY_VAULT.replace(/\\/g, '/').length + 1),
     text: String(r.body ?? '').replace(/^# [^\n]*\n/, '').split('\n\n- ')[0].trim(),
   }));
@@ -527,7 +528,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
     const lines = needB.map((c) => {
       const es = c.E.map((e) => {
         if (!eid.has(e.fid)) { const id = `E${eid.size + 1}`; eid.set(e.fid, id); emap.set(id, e); }
-        return `  ${eid.get(e.fid)} [${e.kind}${e.owned ? ' owned' : ''}${e.pinned ? ' pinned' : ''}, valid ${BKK(e.validAt)}]: ${e.text}`;
+        return `  ${eid.get(e.fid)} [${e.kind}${e.owned ? ' owned' : ''}${e.pinned ? ' pinned' : ''}${e.proof > 1 ? ` ×${e.proof}` : ''}, valid ${BKK(e.validAt)}]: ${e.text}`;
       });
       return `${c.n} [${c.kind}, ${projectName(c.d.project)}, valid ${BKK(c.validAt)}]: ${c.text}\n${es.join('\n')}`;
     });
@@ -710,29 +711,78 @@ export async function retireForgotten(db: pg.Pool, facts: { fid: string; path: s
   return out;
 }
 
-/** hubs/<project> hub.md (pinned, ใช้บ่อย, ใหม่, ถูกแทนที่, recent cards) + hubs/_review.md. SQL only, no LLM. */
+/** hubs/<project> hub.md (Living Project Knowledge Page / Mental Model: freshness, rules, decisions/architecture, experiences/howto,
+ *  ใช้บ่อย, ใหม่, ถูกแทนที่, recent cards) + hubs/_review.md. SQL only, no LLM. */
 async function writeHubs(db: pg.Pool) {
   // a fact dreamed from a chat hidden later (importer.hideDreamed) is no hub line, and an arrow to it shows [[?]]
   const HID = (col: string) => `CASE WHEN EXISTS (SELECT 1 FROM facts t JOIN sources ts ON ts.id = t.source_id WHERE t.fid = ${col} AND ts.hide_as IS NOT NULL) THEN '?' ELSE ${col} END`;
   const rel = (p: string) => basename(p.replace(/\\/g, '/'), '.md');
-  const rows = (await db.query(
-    `SELECT f.fid, f.kind, coalesce(f.project, '') project, f.pinned, f.created_at, ${HID('f.superseded_by')} superseded_by, ${HID('f.review_target')} review_target, s.status, s.path,
-            (SELECT count(DISTINCT a.session) FROM access_log a JOIN chunks c ON c.turn_uuid = a.turn_uuid
-             WHERE c.source_id = s.id AND a.kind IN ('get', 'related') AND a.ts > now() - interval '30 days') uses
-     FROM facts f JOIN sources s ON s.id = f.source_id WHERE s.hide_as IS NULL`)).rows; // hubs are read by every app
+  const [rowsRes, unsummarizedRes, mask] = await Promise.all([
+    db.query(
+      `SELECT f.fid, f.kind, coalesce(f.project, '') project, f.pinned, coalesce(f.importance, 5)::int importance,
+              greatest(cardinality(f.session_ids), 1)::int proof, f.created_at,
+              ${HID('f.superseded_by')} superseded_by, ${HID('f.review_target')} review_target, s.status, s.path,
+              (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1) body,
+              (SELECT count(DISTINCT a.session)::int FROM access_log a JOIN chunks c ON c.turn_uuid = a.turn_uuid
+               WHERE c.source_id = s.id AND a.kind IN ('get', 'related') AND a.ts > now() - interval '30 days') uses
+       FROM facts f JOIN sources s ON s.id = f.source_id WHERE s.hide_as IS NULL`), // hubs are read by every app
+    db.query(
+      `SELECT coalesce(s.project, '') project, count(DISTINCT s.session_id)::int n
+       FROM sources s WHERE s.kind = 'main' AND s.tool NOT IN ('obsidian', 'github') AND s.hide_as IS NULL
+         AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND s.session_id = ANY(f.session_ids))
+         AND NOT EXISTS (SELECT 1 FROM state st WHERE st.k = 'dream:session:' || s.session_id)
+       GROUP BY 1`),
+    hiddenNameMask(db, [...PRIVATE_TOOLS]),
+  ]);
+  const rows = rowsRes.rows;
+  const pendingByProj = new Map<string, number>(unsummarizedRes.rows.map((r) => [r.project as string, Number(r.n)]));
+  const factTxt = (r: (typeof rows)[number]) =>
+    mask(String(r.body ?? '').replace(/^# [^\n]*\n/, '').split(/\n\n- |\n- (?:from|related|supersedes|superseded_by|review)::/)[0].replace(/\s+/g, ' ').trim());
+  const cardTxt = (r: (typeof rows)[number]) => {
+    const b = mask(String(r.body ?? '').replace(/^# [^\n]*\n/, ''));
+    const title = b.match(/^# ([^\n]+)/)?.[1]?.trim() ?? '';
+    const sum = (b.split('\n\n')[1] ?? '').replace(/^\*\*Outcome:\*\*.*$/s, '').replace(/\s+/g, ' ').trim();
+    const s = title && sum ? `${title}: ${sum}` : title || sum;
+    return s.length > 200 ? `${s.slice(0, 199).trimEnd()}…` : s;
+  };
+  const proofTag = (r: (typeof rows)[number]) => (r.proof > 1 ? ` · ×${r.proof} แชต` : '');
+  const withTxt = (r: (typeof rows)[number], extra = '') => {
+    const t = factTxt(r);
+    return `[[${rel(r.path)}]]${t ? ` — ${t}` : ''}${proofTag(r)}${extra}`;
+  };
+  const rankModel = (a: (typeof rows)[number], b: (typeof rows)[number]) =>
+    (b.proof > 1 ? 1 : 0) - (a.proof > 1 ? 1 : 0) || b.proof - a.proof || b.uses - a.uses || b.importance - a.importance || +b.created_at - +a.created_at;
+  const EXP_RE = /แก้บั๊ก|สาเหตุ|เพราะ|ต้องรัน|วิธี|ระวัง|fix|bug|root cause|workaround/i;
   const byProject = new Map<string, typeof rows>();
   for (const r of rows) (byProject.get(r.project) ?? byProject.set(r.project, []).get(r.project)!).push(r);
   const fidRel = new Map(rows.map((r) => [r.fid, rel(r.path)]));
   for (const [project, rs] of byProject) {
     const facts = rs.filter((r) => r.kind !== 'card');
-    const list = (xs: typeof rows, f = (r: (typeof rows)[number]) => `[[${rel(r.path)}]]`) => (xs.length ? xs.map((r) => `- ${f(r)}`).join('\n') : '- (none)');
+    const active = facts.filter((r) => r.status === 'active');
+    const cards = rs.filter((r) => r.kind === 'card').sort((a, b) => +b.created_at - +a.created_at);
+    const unsummarized = pendingByProj.get(project) ?? 0;
+    const freshLabel = unsummarized > 0 ? `มี ${unsummarized} แชตใหม่รอฝัน` : 'สด (ฝันครบทุกแชต)';
+    const rules = active.filter((r) => r.pinned || ['rule', 'feedback'].includes(r.kind))
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || rankModel(a, b));
+    const experiences = active.filter((r) => !r.pinned && (r.kind === 'howto' || (r.kind === 'fact' && EXP_RE.test(factTxt(r)))))
+      .sort((a, b) => (b.kind === 'howto' ? 1 : 0) - (a.kind === 'howto' ? 1 : 0) || rankModel(a, b)).slice(0, 10);
+    const expIds = new Set(experiences.map((r) => r.fid));
+    const mentalModel = active.filter((r) => !r.pinned && ['decision', 'preference', 'fact', 'insight'].includes(r.kind) && !expIds.has(r.fid))
+      .sort((a, b) => (b.kind === 'decision' ? 1 : 0) - (a.kind === 'decision' ? 1 : 0) || rankModel(a, b)).slice(0, 12);
+    const list = (xs: typeof rows, f = (r: (typeof rows)[number]) => withTxt(r)) => (xs.length ? xs.map((r) => `- ${f(r)}`).join('\n') : '- (none)');
     const body = `# ${project ? projectName(project) : 'global'} hub\n\n` +
-      `## Pinned / rules\n${list(facts.filter((r) => r.status === 'active' && (r.pinned || ['rule', 'feedback'].includes(r.kind))))}\n\n` +
-      `## ใช้บ่อย (30 วัน)\n${list(facts.filter((r) => r.uses > 0).sort((a, b) => b.uses - a.uses).slice(0, 10), (r) => `[[${rel(r.path)}]] · ${r.uses} sessions`)}\n\n` +
-      `## ใหม่\n${list(facts.filter((r) => r.status === 'active').sort((a, b) => +b.created_at - +a.created_at).slice(0, 10))}\n\n` +
+      `ความจำ active ${active.length} รายการ · การ์ดเซสชัน ${cards.length} ใบ · สถานะ: ${freshLabel}\n\n` +
+      `## Pinned / rules\n${list(rules)}\n\n` +
+      `## โมเดลโปรเจกต์และการตัดสินใจ (Mental Model)\n${list(mentalModel)}\n\n` +
+      `## บทเรียนและวิธีแก้ปัญหา (Experiences & How-to)\n${list(experiences)}\n\n` +
+      `## ใช้บ่อย (30 วัน)\n${list(facts.filter((r) => r.uses > 0).sort((a, b) => b.uses - a.uses || b.proof - a.proof).slice(0, 10), (r) => withTxt(r, ` · ${r.uses} sessions`))}\n\n` +
+      `## ใหม่\n${list(active.slice().sort((a, b) => +b.created_at - +a.created_at).slice(0, 10))}\n\n` +
       `## ถูกแทนที่ล่าสุด\n${list(facts.filter((r) => r.status === 'superseded').sort((a, b) => +b.created_at - +a.created_at).slice(0, 10), (r) => `[[${rel(r.path)}]] → [[${fidRel.get(r.superseded_by) ?? r.superseded_by}]]`)}\n\n` +
-      `## Recent sessions\n${list(rs.filter((r) => r.kind === 'card').sort((a, b) => +b.created_at - +a.created_at).slice(0, 10))}\n`;
-    writeNote(`hubs/${hubName(project || 'global')}.md`, { memhub: 'hub', project, tags: ['memhub/hub'] }, body);
+      `## Recent sessions\n${list(cards.slice(0, 10), (r) => { const c = cardTxt(r); return `[[${rel(r.path)}]]${c ? ` — ${c}` : ''}`; })}\n`;
+    writeNote(`hubs/${hubName(project || 'global')}.md`, {
+      memhub: 'hub', project, freshness: unsummarized > 0 ? `stale:${unsummarized}` : 'up_to_date',
+      active_facts: String(active.length), tags: ['memhub/hub'],
+    }, body);
   }
   const pending = rows.filter((r) => r.status === 'pending');
   // forget cascade left these alone: ลุงจืด edited/pinned/wrote them, yet every chat they cite is gone (retireForgotten)

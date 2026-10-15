@@ -74,7 +74,7 @@ flowchart LR
 | Gmail · Google Docs · Google Sheets | Google API สิทธิ์ `gmail.readonly` + `drive.readonly` เท่านั้น | **เห็นได้เฉพาะ Claude** ดู [Google](#google-gmail-docs-sheets--maps-timeline-ไม่บังคับ) |
 | Google Maps Timeline | ไฟล์ export จากมือถือ | **เห็นได้เฉพาะ Claude** ชื่อสถานที่หาแบบออฟไลน์ด้วย GeoNames |
 
-ทุกแอปใช้กฎเดียวกัน: ข้อมูลสดของแอปแค่ "อ่าน" ไม่เคยแก้, สำเนาใน `~/ai-archive/raw/<แอป>/` เพิ่มอย่างเดียว, "โปรเจกต์" = git root ของโฟลเดอร์ที่ทำงาน
+ทุกแอปใช้กฎเดียวกัน: ข้อมูลสดของแอปแค่ "อ่าน" ไม่เคยแก้, สำเนาใน `~/ai-archive/raw/<แอป>/` เพิ่มอย่างเดียว, "โปรเจกต์" = git root ของโฟลเดอร์ที่ทำงาน (รวม worktree แยกโฟลเดอร์ และจับคู่ข้ามเครื่อง/ย้ายโฟลเดอร์ให้อัตโนมัติด้วย git remote `origin`, ชื่อโปรเจกต์ระดับ root, หรือ `project --alias` / `--mv`)
 
 ### การค้น
 
@@ -346,7 +346,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install-tasks.ps1 -Remove
 | `daily [YYYY-MM-DD] [--out dir]` | บันทึกประจำวันลง vault memory-hub `daily/YYYY-MM-DD.md` (ไม่ใส่วัน = เมื่อวาน ตามเวลาไทย): ต่อโปรเจกต์ แอปไหนกี่ session เวลาแรก–สุดท้าย เรื่องที่ทำ commit/issue ความจำใหม่/ถูกแทนที่ งานส่งต่อ — ไม่ใช้ LLM, ไม่มีข้อมูล Google/สถานที่, โน้ตที่เราแก้แล้วจะไม่ถูกเขียนทับ, ค้นได้แต่อันดับต่ำกว่าแชต; `--out` = เขียนไฟล์ตัวอย่างไว้ที่อื่น ไม่แตะ vault |
 | `index-vault [vault]` | ทำดัชนี Obsidian ใหม่ (ไม่ระบุ = ทุก vault) |
 | `forget --session <id>` / `forget --project <path>` | ลบออกจากดัชนีถาวรและกันนำเข้าซ้ำ (ไฟล์ดิบใน archive ไม่ถูกลบ) พร้อมลบข้อเท็จจริง/การ์ดที่ฝันจากแชตนั้นอย่างเดียว แล้วพิมพ์รายการที่ลบ |
-| `dream [--limit n] [--runner deepseek\|claude\|files] [--run id] [--force]` | ฝัน (เห็นคำตอบที่เรากดเลือกจากตัวเลือกของ AI ด้วย: เลือกตัวที่ AI แนะนำ = การตัดสินใจ, เลือกตัวอื่น/แก้/เลือกแบบเดิมซ้ำ = สิ่งที่ชอบ): สรุปแชตใหม่เป็นการ์ด + ข้อเท็จจริง (ปกติไม่เกิน 25 session ต่อรอบ ใหม่สุดก่อน; ค่าเริ่มต้นคือ `deepseek` ซึ่งข้ามรอบถ้าตรงช่วงราคาแพงของ DeepSeek เว้นใส่ `--force`; `--runner claude` = ใช้ `claude -p`) |
+| `project [--sync \| --mv <from> <to> \| --alias <from> <to>]` | ดูรายการโปรเจกต์และการจับคู่ข้ามเครื่อง/ย้ายโฟลเดอร์; `--sync` = รวมโปรเจกต์ที่ซ้ำอัตโนมัติ (ตาม git remote / ชื่อโฟลเดอร์ระดับ root), `--mv` = ย้ายรวมข้อมูล+โน้ตและจำถาวร, `--alias` = ผูกชื่อ/path/repo เข้ากับโปรเจกต์หลัก |
+| `dream [--limit n] [--runner deepseek\|claude\|files] [--run id] [--force]` | ฝัน (เห็นคำตอบที่เรากดเลือกจากตัวเลือกของ AI ด้วย: เลือกตัวที่ AI แนะนำ = การตัดสินใจ, เลือกตัวอื่น/แก้/เลือกแบบเดิมซ้ำ = สิ่งที่ชอบ): สรุปแชตใหม่เป็นการ์ด + ข้อเท็จจริง (ปกติไม่เกิน 40 session ต่อรอบ ใหม่สุดก่อน; ค่าเริ่มต้นคือ `deepseek` ซึ่งข้ามรอบถ้าตรงช่วงราคาแพงของ DeepSeek เว้นใส่ `--force`; `--runner claude` = ใช้ `claude -p`) |
 | `dream --consolidate` | งานกลางคืนที่ไม่ใช้ LLM: อนุมัติ, เส้นเชื่อมใช้คู่กัน, โน้ตศูนย์กลาง |
 | `lint [--dry]` | ตรวจสุขภาพความจำ (รายงานอย่างเดียว ไม่ใช้ LLM): ข้อเท็จจริงเลยวันหมดอายุ, คู่ที่อาจซ้ำ, ข้อเท็จจริงที่แชตต้นทางหายหมด, ลิงก์เสีย, งานส่งต่อค้าง, ข้อเท็จจริงที่ Claude สรุปแต่ชื่อเฉพาะ/ตัวเลขส่วนใหญ่ไม่มีในแชตที่อ้าง (หลักฐานไม่ตรง), คู่ในโปรเจกต์เดียวกันที่ความหมายใกล้กันแต่ตัวเลขต่างกันหรือฝั่งหนึ่งปฏิเสธ (อาจขัดกัน), ข้อที่เขียนว่าแทน/ยกเลิกอีกข้อ (อ้าง fid) แต่ข้อเก่ายัง active → `hubs/_lint.md` ใน vault (`--dry` = พิมพ์ออกจอ ไม่เขียน) |
 | `sem [--dry] [--limit n]` | Gemma ในเครื่องตัดสินคู่ที่เวกเตอร์ใกล้กันซึ่งยังไม่เคยตัดสิน → เส้น `sem` (เฉพาะ strength 3), สูงสุด 1500 คู่ต่อรอบ (~35 นาที, ใกล้สุดก่อน; ที่เหลือรอคืนถัดไป), llama-server ไม่เปิด = ข้าม · `--dry` = นับคู่ที่รอตัดสินด้วย role อ่านอย่างเดียว ไม่เรียก Gemma |
@@ -404,6 +405,7 @@ node src/cli.ts vault undo <rev>     # ย้อน แล้วทำดัช�
 | `MEMHUB_ARCHIVE_ROOT` | `~/ai-archive/raw` | สำเนาของแอปอื่น (`<root>/<แอป>`) |
 | `MEMHUB_CODEX_HOME` / `MEMHUB_GEMINI_HOME` / `MEMHUB_ANTIGRAVITY_HOME` / `MEMHUB_ZCODE_HOME` / `MEMHUB_LMSTUDIO_HOME` / `KIMI_CODE_HOME` | `~/.codex` / `~/.gemini` / `~/.gemini` / `~/.zcode` / `~/.lmstudio` / `~/.kimi-code` | โฟลเดอร์ข้อมูลของแต่ละแอป |
 | `MEMHUB_EXCLUDE_PROJECTS` | — | path โปรเจกต์ที่ห้ามเข้าดัชนี คั่นด้วย `,` เช่น `d:/clientx` |
+| `MEMHUB_PROJECT_MAP` | — | ผูก path หรือ `owner/repo` ข้ามเครื่องเข้ากับโปรเจกต์หลัก คั่นด้วย `,` เช่น `/users/jead/bccode=d:/bccode,owner/repo=d:/app` (หรือใช้ `project --alias` / `--mv`) |
 | `MEMHUB_VAULTS` | — | vault Obsidian ที่ให้อ่าน คั่นด้วย `,` |
 | `MEMHUB_MEMORY_VAULT` | `D:/obsidian-vault/memory-hub` | vault ที่ฝัน/`memory_save` เขียนลง |
 | `MEMHUB_GOOGLE_DIR` | `~/.memory-hub/google` | ไฟล์ OAuth client, `token.dpapi`, `sheets-allow.txt` |
@@ -416,6 +418,7 @@ node src/cli.ts vault undo <rev>     # ย้อน แล้วทำดัช�
 | ตัวแปร | ค่าเริ่มต้น | ความหมาย |
 |---|---|---|
 | `MEMHUB_DREAM_RUNNER` | `deepseek` | ตัวรันฝันเริ่มต้น (`deepseek`, `claude`, หรือ `files`) |
+| `MEMHUB_DREAM_LIMIT` | `40` | จำนวน session สูงสุดต่อรอบฝัน (เมื่อไม่ได้ใส่ `--limit`) |
 | `MEMHUB_DEEPSEEK_KEY` | — | API key ของ DeepSeek สำหรับการฝัน (ใส่ใน `.env` เท่านั้น) |
 | `MEMHUB_DEEPSEEK_MODEL` | `deepseek-flash` | โมเดล DeepSeek ที่ใช้ฝัน |
 | `MEMHUB_DREAM_MODEL` | `sonnet` | โมเดล Claude ที่ใช้ฝันเมื่อเลือก `--runner claude` |

@@ -115,6 +115,7 @@ function clones(): Record<string, string> {
   let dirs = env !== undefined ? env.split(',').map((s) => s.trim()).filter(Boolean) : dbProjects();
   if (env === undefined) {
     try { dirs = [...dirs, ...readdirSync('D:/', { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => `D:/${e.name}`)]; } catch {}
+    dirs = dirs.filter((d) => !/(?:^|[\\/])tmp(?:[\\/]|$)/i.test(d));
   }
   const map: Record<string, string> = {};
   for (const d of dirs) {

@@ -129,10 +129,15 @@ test('a sub-folder start gets the folders above it, nearest first: whole path se
   assert.ok(otherMac.includes(rule) && otherMac.includes('Sc2c2c2c2') && otherMac.includes('injectmarker'), 'another machine with the same root project name gets full context');
 });
 
-test('the log write fails (no table before migrate, no grant): the chat still gets its context', async () => {
+test('the log write fails (no table before migrate, no grant): the chat still gets its context; settled project decisions/howtos are briefed in the Mental Model block', async () => {
   await guard();
+  const dec = saveNote('ตัดสินใจ: ใช้ HNSW halfvec สำหรับค้นเวกเตอร์ใน memory-hub', { project: PROJECT, kind: 'decision' }).match(/(F\w{8})/)![1];
+  const how = saveNote('วิธีแก้บั๊ก: ถ้า pgvector ช้าให้ตรวจ maintenance_work_mem ก่อนสร้าง index', { project: PROJECT, kind: 'howto' }).match(/(F\w{8})/)![1];
+  await indexVault(db, MEMORY_VAULT);
   // REVOKE, not DROP: with the scratch table gone the hook's search_path (scratch, public) would log into the live table
   await db.query('REVOKE INSERT ON injections FROM memhub_ro');
-  assert.ok((await sessionStart('s-next')).includes('injectrule'));
+  const ctx = await sessionStart('s-next');
+  assert.ok(ctx.includes('injectrule') && ctx.includes(dec) && ctx.includes(how), ctx);
+  assert.match(ctx, /โมเดลโปรเจกต์\/การตัดสินใจและบทเรียนสำคัญ/);
   assert.equal((await db.query(`SELECT count(*)::int n FROM injections WHERE session = 's-next'`)).rows[0].n, 0);
 });

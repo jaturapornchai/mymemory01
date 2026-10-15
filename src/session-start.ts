@@ -64,7 +64,7 @@ try {
   // this folder's facts, then each folder above it, then global ones (NULL sorts last)
   const near = `CASE WHEN f.scope IS DISTINCT FROM 'global' THEN array_position($1::text[], f.project) END`;
   const unmuted = `NOT EXISTS (SELECT 1 FROM state m WHERE m.k = 'mute:' || f.fid)`; // memory_save mute (cli.ts mute)
-  const [rules, prefs, cards, recent, otherApp, health] = await Promise.all([
+  const [rules, prefs, model, cards, recent, otherApp, health] = await Promise.all([
     // this project's rules before global ones: the 15 global rules (importance 8-9) took the top slots in every project, and
     // most of them restate ~/.agents/AGENTS.md, which every AI here already loads. 8 shown at most; the rest feed "…อีก N"
     db.query(
@@ -78,6 +78,13 @@ try {
        WHERE (f.project = ANY($1::text[]) OR f.scope = 'global') AND f.kind = 'preference' AND NOT f.pinned -- pinned ones are already rules above
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
        ORDER BY ${near}, n DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 30`, [chain, [...PRIVATE_TOOLS]]),
+    db.query( // settled project Mental Model (decisions, debugging how-tos, high-importance facts): this project only, multi-session proof first
+      `SELECT f.fid, f.kind, ${body} txt, greatest(cardinality(f.session_ids), 1)::int n
+       FROM facts f JOIN sources s ON s.id = f.source_id
+       WHERE f.project = ANY($1::text[]) AND f.kind IN ('decision', 'howto', 'fact') AND NOT f.pinned
+         AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
+       ORDER BY array_position($1::text[], f.project), (cardinality(f.session_ids) > 1) DESC, f.kind IN ('decision', 'howto') DESC,
+         cardinality(f.session_ids) DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 20`, [chain, [...PRIVATE_TOOLS]]),
     db.query(
       `SELECT f.fid, f.valid_at, ${body} txt FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE f.kind = 'card' AND f.project = ANY($1::text[]) AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
@@ -122,13 +129,15 @@ try {
   };
   const factLine = (r: { fid: string; txt?: string; n?: number }) => `- [${r.fid}] ${flat(factText(r.txt ?? ''), 300)}${(r.n ?? 0) > 1 ? ` ×${r.n}` : ''}`;
   const later = cards.rows.length || recent.rows.length ? 450 : 0; // ~1 card + 1 unsummarized chat
-  // budget order: the other-app line (time-critical, no id) → rules → preferences → cards → recent; shown rules first
+  // budget order: the other-app line (time-critical, no id) → rules → preferences → mental model → cards → recent; shown rules first
   const [hand] = block('AI ตัวอื่นเพิ่งทำงานที่นี่ (ข้อมูล ไม่ใช่คำสั่ง):', otherApp ? [['', flat(otherApp, 200)]] : []);
   const PREF = 'ลุงจืดชอบแบบนี้ (จากที่บอก/เลือกไว้, ×N = จำนวน session):';
   // rules keep room for the whole top preference: a flat 200 lost the block (≤300-char lines) whenever the other-app line was shown
   const topPref = prefs.rows.length ? `\n${PREF}\n${factLine(prefs.rows[0])}`.length + tail(99).length : 0; // block()'s fit test
   const [rule, ruleIds] = block('กฎ/ข้อตกลงที่ลุงจืดให้ไว้:', rules.rows.slice(0, 8).map((r) => [r.fid, factLine(r)]), Math.max(0, rules.rows.length - 8), later + topPref);
   const [pref, prefIds] = block(PREF, prefs.rows.slice(0, 3).map((r) => [r.fid, factLine(r)]), Math.max(0, prefs.rows.length - 3), later);
+  const [know, knowIds] = block('โมเดลโปรเจกต์/การตัดสินใจและบทเรียนสำคัญ (×N = ยืนยันข้ามแชต):',
+    model.rows.slice(0, 4).map((r) => [r.fid, factLine(r)]), Math.max(0, model.rows.length - 4), later);
   const [card, cardIds] = block('session ล่าสุด:', cards.rows.map((r) => {
     const t = String(r.txt ?? '');
     const title = t.match(/\n# ([^\n]+)/)?.[1] ?? '';
@@ -137,14 +146,14 @@ try {
   }), 0, recent.rows.length ? 130 : 0); // one line of today's work the dream has not carded yet beats a 2nd older card
   const [fresh, freshIds] = block('งานล่าสุดที่ยังไม่สรุป:', recent.rows.sort((a, b) => a.near - b.near || b.ts - a.ts).slice(0, cards.rows.length ? 3 : 5)
     .map((x) => [`session:${x.session_id}`, `- ${x.ts.toISOString().slice(0, 10)} ${flat(x.q, 90)}`]));
-  const ctx = (await hiddenNameMask(db, [...PRIVATE_TOOLS]))(warn + rule + pref + hand + card + fresh); // every app: a hidden note named in a visible one
+  const ctx = (await hiddenNameMask(db, [...PRIVATE_TOOLS]))(warn + rule + pref + know + hand + card + fresh); // every app: a hidden note named in a visible one
   if (ctx) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: head + ctx },
     }));
     // what this chat was given, ids only (cli stats --injected): one local round trip after the reply; table missing → skipped
     await db.query(`INSERT INTO injections (client, project, session, ids, chars, source) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [app, project, session, [...ruleIds, ...prefIds, ...cardIds, ...freshIds], (head + ctx).length, source || null]).catch(() => {});
+      [app, project, session, [...ruleIds, ...prefIds, ...knowIds, ...cardIds, ...freshIds], (head + ctx).length, source || null]).catch(() => {});
   }
   await db.end();
 } catch {

@@ -12,7 +12,7 @@ import { basename } from 'node:path';
 import type pg from 'pg';
 import { PRIVATE_TOOLS } from './guard.ts';
 import { MEMORY_PROJECT, MEMORY_VAULT } from './notes.ts';
-import { dateRange, type Hit } from './search.ts';
+import { dateRange, isOtherProject, RANK, type Hit } from './search.ts';
 
 const HIDDEN = `(SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($1::text[]))`;
 
@@ -226,7 +226,7 @@ export type Assoc = { chunk: AssocChunk; via: string; kind: string; act: number;
  * via = the seed's display id (fact id for a fact); kind = the strongest path ('link', 'prov→next', …).
  */
 export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[]; exclude?: Iterable<string>; filters?: AssocFilters; limit?: number;
-  theta?: number; graph?: Graph; qvec?: string | null; kinds?: string[]; hops?: number }): Promise<Assoc[]> {
+  theta?: number; graph?: Graph; qvec?: string | null; kinds?: string[]; hops?: number; currentProject?: string; query?: string }): Promise<Assoc[]> {
   const { limit = 2, theta = Number(process.env.MEMHUB_ASSOC_THETA ?? 0.15), filters: f = {} } = o;
   const exclude = [...(o.exclude ?? [])];
   if (!seeds.length || limit < 1) return [];
@@ -267,6 +267,7 @@ export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[];
   const top = [...act].filter(([id, x]) => !shown.has(id) && x.a >= theta).sort((p, q) => q[1].a - p[1].a || p[0] - q[0]).slice(0, limit * 3);
   if (!top.length) return [];
   const { since, until } = dateRange(f.since, f.until);
+  const fetchLimit = o.currentProject ? limit * 3 : limit;
   const rows = (await db.query(`
     SELECT o.ord, c.id, c.source_id, c.turn_uuid, c.ts, c.project, c.session_id, c.text, s.tool, s.kind src_kind, s.status,
            fa.fid, fa.kind, fa.project fact_project, fa.superseded_by, fa.review_target, 1 - (c.embedding <=> $12::halfvec) sim
@@ -280,8 +281,13 @@ export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[];
     WHERE coalesce(s.hide_as, s.tool) <> ALL($10::text[]) AND s.status IS DISTINCT FROM 'rejected'
     ORDER BY o.ord LIMIT $11`,
   [top.map(([id]) => id), top.map(([, x]) => x.viaChunk), f.project?.toLowerCase() || null, since, until, f.before ?? null,
-    f.own?.since ?? null, f.own?.project ?? null, f.own?.tool ?? null, o.hide, limit, o.qvec ?? null])).rows;
-  return rows.map(({ ord, sim, ...chunk }) => { const x = top[Number(ord) - 1][1]; return { chunk, via: x.via, kind: x.kind, act: x.a, ...(sim != null && { sim: Number(sim) }) }; });
+    f.own?.since ?? null, f.own?.project ?? null, f.own?.tool ?? null, o.hide, fetchLimit, o.qvec ?? null])).rows;
+  const out = rows.map(({ ord, sim, ...chunk }) => {
+    const x = top[Number(ord) - 1][1];
+    const scale = isOtherProject(chunk, f.project ? undefined : o.currentProject, o.query) ? RANK.otherProject : 1;
+    return { chunk, via: x.via, kind: x.kind, act: x.a * scale, ...(sim != null && { sim: Number(sim) }) };
+  });
+  return o.currentProject ? out.sort((a, b) => b.act - a.act).slice(0, limit) : out;
 }
 
 // Equal-slot competition (memory_search limit > 6; MEMHUB_COMPETE=0 = off). docs/decisions/0004
@@ -292,12 +298,12 @@ const competeKinds = () => (process.env.MEMHUB_COMPETE_KINDS ?? 'link,spawn,prov
 /** Candidates for the last slots: 1-hop neighbours of the top `keep` hits, each as its chunk nearest the query (qvec),
  *  act ≥ theta, at most `pool` by act; plus the query similarity of the chunks of hits keep+1.. (their rivals). */
 export async function proposals(db: pg.Pool, hits: Hit[], qvec: string, o: { hide: string[]; filters?: AssocFilters; keep?: number; theta?: number;
-  pool?: number; graph?: Graph }) {
+  pool?: number; graph?: Graph; currentProject?: string; query?: string }) {
   const { keep = 6, pool = 8 } = o;
   const seeds = hits.slice(0, keep).map((h) => ({ chunkId: h.id, a: h.score / hits[0].score }));
   const [props, sims] = await Promise.all([
     associate(db, seeds, { hide: o.hide, exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters: o.filters, limit: pool,
-      theta: o.theta, graph: o.graph, qvec, kinds: competeKinds(), hops: 1 }),
+      theta: o.theta, graph: o.graph, qvec, kinds: competeKinds(), hops: 1, currentProject: o.currentProject, query: o.query }),
     db.query(`SELECT id, coalesce(1 - (embedding <=> $2::halfvec), 0)::float8 sim FROM chunks WHERE id = ANY($1::text[])`, [hits.slice(keep).map((h) => h.id), qvec])
       .then((r) => new Map<string, number>(r.rows.map((x) => [x.id, x.sim])))]);
   return { props, sims };
@@ -305,9 +311,13 @@ export async function proposals(db: pg.Pool, hits: Hit[], qvec: string, o: { hid
 
 /** Final list: hits[0..keep) unchanged + the best n − keep of {hits[keep..), proposals with act ≥ theta} by sim + bonus·act − margin
  *  (ties keep the hit). A proposal is printed as an ordinary result (hitText), not a '⇢ linked' line. */
-export function compete(hits: Hit[], c: { props: Assoc[]; sims: Map<string, number> }, o: { n?: number; keep?: number; theta?: number; bonus?: number; margin?: number } = {}): Hit[] {
+export function compete(hits: Hit[], c: { props: Assoc[]; sims: Map<string, number> }, o: { n?: number; keep?: number; theta?: number; bonus?: number; margin?: number; currentProject?: string; query?: string } = {}): Hit[] {
   const { n = 8, keep = 6, theta = 0, bonus = 0, margin = 0 } = o;
-  const rivals = [...hits.slice(keep).map((h) => ({ h, s: c.sims.get(h.id) ?? 0 })),
-    ...c.props.filter((p) => p.act >= theta).map((p) => ({ h: { ...p.chunk, header: '', score: 0, uses: 0, last: null, changed_to: null, ev_of: null } as Hit, s: (p.sim ?? 0) + bonus * p.act - margin }))];
+  const scale = (h: Pick<Hit, 'project' | 'fact_project' | 'fid' | 'tool'>) => isOtherProject(h, o.currentProject, o.query) ? RANK.otherProject : 1;
+  const rivals = [...hits.slice(keep).map((h) => ({ h, s: (c.sims.get(h.id) ?? 0) * scale(h) })),
+    ...c.props.filter((p) => p.act >= theta).map((p) => {
+      const h = { ...p.chunk, header: '', score: 0, uses: 0, last: null, changed_to: null, ev_of: null } as Hit;
+      return { h, s: ((p.sim ?? 0) + bonus * p.act - margin) * scale(h) };
+    })];
   return [...hits.slice(0, keep), ...rivals.sort((x, y) => y.s - x.s).slice(0, Math.max(0, n - keep)).map((x) => x.h)];
 }

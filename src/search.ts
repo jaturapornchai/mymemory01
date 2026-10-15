@@ -96,7 +96,28 @@ export const RANK = {
   slotRatio: Number(process.env.MEMHUB_RANK_SLOT_RATIO ?? 0.5),
   daily: Number(process.env.MEMHUB_RANK_DAILY ?? -1),         // tier of daily notes (daily.ts): below chats
   foldDup: Number(process.env.MEMHUB_RANK_FOLD_DUP ?? 0.5), // a source chat repeating ≥ this share of its fact (char 5-grams) folds
+  inProject: Number(process.env.MEMHUB_RANK_IN_PROJECT ?? 3.0), // currentProject match boost
+  otherProject: Number(process.env.MEMHUB_RANK_OTHER_PROJECT ?? 0.35), // non-currentProject penalty (global/personal stay 1.0)
 };
+
+/** True if query explicitly names projName (≥ 3 chars) as a token/substring. */
+export function queryNamesProject(query: string | undefined, projName: string): boolean {
+  const p = projName.toLowerCase();
+  if (!query || p.length < 3) return false;
+  const ql = query.toLowerCase();
+  return /^[a-z0-9_-]+$/.test(p) ? ql.split(/[^a-z0-9_-]+/).includes(p) : ql.includes(p);
+}
+
+/** True when currentProject is set and hit h belongs to a different code project (not global, general Obsidian note, personal PRIVATE_TOOLS, or explicitly named in query). */
+export function isOtherProject(h: Pick<Hit, 'project' | 'fact_project' | 'fid' | 'tool'>, currentProject?: string, query?: string): boolean {
+  if (!currentProject) return false;
+  const hp = h.fact_project ?? h.project ?? '';
+  if (!hp || (h.fid && !h.fact_project) || (h.tool === 'obsidian' && !h.fid) || PRIVATE_TOOLS.has(h.tool) || hp.startsWith('google/')) return false;
+  if (hp === currentProject) return false;
+  const a = projectName(hp).toLowerCase(), b = projectName(currentProject).toLowerCase();
+  if (!a || !b || a === b) return false;
+  return !queryNamesProject(query, a);
+}
 
 const LATIN = /^[a-z][a-z0-9_]{2,}$/;
 const RARE_FRACTION = 0.05; // terms in >5% of chunks don't select candidates (they still add score)
@@ -174,7 +195,12 @@ x AS (
          fa.source_uuids, f.s rrf,
          CASE WHEN s.kind = 'daily' OR (s.tool = 'obsidian' AND s.session_id LIKE '%/hubs/%') THEN $20::float8 WHEN fa.fid IS NULL OR fa.kind = 'card' OR s.status = 'superseded' THEN 0
               WHEN fa.pinned OR fa.user_owned OR fa.run IS NULL OR fa.kind IN ('rule', 'feedback') THEN 2 ELSE 1 END tier,
-         CASE WHEN $5::text <> '' AND (c.project = $5 OR fa.project = $5) THEN 1.3 ELSE 1 END proj,
+         CASE WHEN $5::text = '' THEN 1
+              WHEN c.project = $5 OR fa.project = $5
+                OR lower(regexp_replace(coalesce(fa.project, c.project, ''), '^.*[/\\\\:]', '')) = lower(regexp_replace($5, '^.*[/\\\\:]', ''))
+                OR lower(regexp_replace(coalesce(fa.project, c.project, ''), '^.*[/\\\\:]', '')) = ANY($27::text[]) THEN $25::float8
+              WHEN (fa.fid IS NOT NULL AND coalesce(fa.project, '') = '') OR (s.tool = 'obsidian' AND fa.fid IS NULL) OR c.project LIKE 'google/%' THEN 1
+              WHEN $3::text IS NULL THEN $26::float8 ELSE 1 END proj,
          greatest(extract(epoch FROM coalesce($7, now()) - greatest(c.ts, u.last)) / 86400, 1.0 / 24) t1,
          greatest(extract(epoch FROM coalesce($7, now()) - c.ts) / 86400, 1.0 / 24) tn,
          CASE WHEN fa.pinned OR fa.kind IN ('rule', 'feedback') THEN 1
@@ -302,10 +328,12 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   const [legs, v, pj] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(kq), project, since, before,
     scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until, ...own]), vec, projectPun(db, cat, query, scored, hide, before)]);
   const w = legs.rows.filter((r) => r.leg === 'w'), b = legs.rows.filter((r) => r.leg === 'b');
+  const qProjTokens = query.toLowerCase().split(/[^a-z0-9_\u0E00-\u0E7F-]+/).filter((t) => t.length >= 3);
   const rows = (await db.query(SQL, [
     w.map((r) => r.id), w.map((r) => r.r), project, since, o.currentProject ?? '', Math.max(limit, 8) * 3, // ≥ 24 rows: same curated slot at every limit
     before, b.map((r) => r.id), b.map((r) => r.r), v,
     RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide, tw.from ?? null, tw.to ?? null, tw.from ? T_WIN : 0, tw.recent ? T_REC : 0, RANK.daily, until, ...own,
+    RANK.inProject, RANK.otherProject, qProjTokens,
   ])).rows;
   // Familiarity, apart from rank (RRF is rank-only: an off-topic query scores like a real match): how close the nearest
   // chunks are, and the share of the query's IDF the best keyword chunk carries. Ranking never reads it.
@@ -315,7 +343,8 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     // each term votes "never seen" with its IDF, normalized by the query's total (FlyWire: weight = share of the target's input)
     unseen: idf ? scored.filter((t) => st.unseen.includes(t.key)).reduce((a, t) => a + t.idf, 0) / idf : 0, agree: vs?.ag ?? 0, ...pj };
   for (const r of rows) delete r.vsig;
-  const ci = rows.slice(0, 24).findIndex((r) => r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active');
+  const ci = rows.slice(0, 24).findIndex((r) => r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active'
+    && !isOtherProject(r, project ? undefined : o.currentProject, query));
   if (ci >= RANK.slot && Number(rows[ci].score) >= RANK.slotRatio * Number(rows[0].score)) rows.splice(RANK.slot - 1, 0, ...rows.splice(ci, 1));
   const perSession = new Map<string, number>();
   const hits: Hit[] = [];

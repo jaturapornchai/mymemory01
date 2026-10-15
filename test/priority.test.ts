@@ -19,7 +19,8 @@ const { indexFile } = await import('../src/importer.ts');
 const { saveNote, writeNote, md5, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { search, hitLine, RANK } = await import('../src/search.ts');
-const { searchText } = await import('../src/mcp.ts');
+const { searchText, briefLine, assocText } = await import('../src/mcp.ts');
+const { compete } = await import('../src/synapse.ts');
 
 const db = connect('rw');
 /** Refuse to write anywhere but the scratch schema (search_path = <schema>,public falls back to public if it is gone). */
@@ -79,6 +80,11 @@ before(async () => {
   dreamFact('Fa0000001', 'lynxport = 8001', { source_uuids: ['ch1-u1'], status: 'superseded', superseded_by: 'Fa0000002' });
   dreamFact('Fa0000002', 'lynxport = 8002', { source_uuids: ['ch2-u1'], status: 'superseded', superseded_by: 'Fa0000003' });
   dreamFact('Fa0000003', 'lynxport is 8003 now', { source_uuids: ['ch1-u1'] });
+  // cross-project isolation: a chat in d:/demo matching 1 term vs a top-tier rule in d:/otherproj matching 2 terms
+  await chat('inproj', 'falconkey ตั้งค่าในโปรเจกต์หลัก');
+  dreamFact('Ff0000001', `falconkey eaglekey ในโปรเจกต์อื่น ${'รายละเอียดเพิ่มเติม '.repeat(25)}`, {
+    project: 'd:/otherproj', kind: 'rule', pinned: 'true',
+  });
   await guard();
   await indexVault(db, MEMORY_VAULT);
 });
@@ -174,4 +180,33 @@ test('GitHub docs are labelled github repo / commits / issue/PR, not chat', asyn
   assert.match(doc('github:o/r'), /\| github repo/);
   assert.match(doc('github:o/r:commits'), /\| github commits/);
   assert.match(doc('github:o/r#12'), /\| github issue\/PR/);
+});
+
+test('currentProject priority: in-project hit beats out-of-project rule; out-of-project hit prints compact summary', async () => {
+  const { hits } = await search(db, 'falconkey eaglekey', { semantic: false, limit: 8, currentProject: 'd:/demo' });
+  assert.equal(hits[0]?.session_id, 'inproj', 'currentProject chat ranks #1 ahead of other-project pinned rule');
+  const other = hits.find((h) => h.fid === 'Ff0000001')!;
+  assert.ok(other && hits.indexOf(other) > 0, 'other-project hit ranks below currentProject hit');
+  const rendered = searchText(hits, 'falconkey eaglekey', true, undefined, 'd:/demo');
+  assert.match(rendered, /\[Ff0000001\][^\n]*\| นอกโปรเจกต์\nเคยคุยในโปรเจกต์ "otherproj" \(2026-09-25, rule\): /);
+  // [1] naming the other project explicitly in query lifts the penalty and renders full text
+  const named = await search(db, 'otherproj falconkey eaglekey', { semantic: false, limit: 8, currentProject: 'd:/demo' });
+  assert.equal(named.hits[0]?.fid, 'Ff0000001', 'explicitly named project in query is not penalized');
+  const namedText = searchText(named.hits, 'otherproj falconkey eaglekey', true, undefined, 'd:/demo');
+  assert.doesNotMatch(namedText, /\| นอกโปรเจกต์|เคยคุยในโปรเจกต์/, 'explicitly named project renders full content');
+  // [2] briefLine and assocText tag out-of-project hits when currentProject is active
+  const bl = briefLine(other, 'falconkey', new Map([[other.id, 50]]), undefined, 'd:/demo');
+  assert.match(bl, /นอกโปรเจกต์ \(เคยคุยใน "otherproj"\): /);
+  const al = assocText([{ chunk: { ...other, source_id: '1' }, via: 'inproj', kind: 'entity', act: 0.5 }], 'falconkey', 'd:/demo');
+  assert.match(al, /นอกโปรเจกต์ \(เคยคุยใน "otherproj"\): /);
+  // [3] compete() scales down out-of-project proposals vs in-project hits
+  const top6 = Array.from({ length: 6 }, () => hits[0]);
+  const comp = compete([...top6, hits[0]], {
+    props: [{ chunk: { ...other, source_id: '2' }, via: 'inproj', kind: 'entity', act: 0.8, sim: 0.8 }],
+    sims: new Map([[hits[0].id, 0.5]]),
+  }, { n: 7, keep: 6, theta: 0.05, bonus: 0.3, currentProject: 'd:/demo', query: 'falconkey' });
+  assert.equal(comp[6]?.session_id, 'inproj', 'in-project hit keeps slot 7 against out-of-project proposal');
+  // [4] expression indexes exist on chunks and facts
+  const idx = (await db.query(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND indexname IN ('chunks_proj_name', 'facts_proj_name') ORDER BY 1`, [SCHEMA])).rows.map((r) => r.indexname);
+  assert.deepEqual(idx, ['chunks_proj_name', 'facts_proj_name']);
 });

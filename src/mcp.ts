@@ -11,7 +11,7 @@ import { embed, toVec, warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
 import { canonicalProject, clean, normProject, projectName } from './importer.ts';
 import { fmStr, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
-import { day, HIDDEN, hitLine, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
+import { day, HIDDEN, hitLine, isOtherProject, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
@@ -136,27 +136,29 @@ server.registerTool(
     const brief = detail === 'brief';
     const n = limit && Math.min(limit, 8); // ≤ 8 hits in both modes; default = search()'s 6
     const filters = { project, since, until, ...freshness() };
-    const res = await search(db, query, { ...filters, limit: n, currentProject: await getProject(), now: new Date(), showPrivate: privateOk(client()) });
+    const curProj = await getProject();
+    const scopeProj = project ? undefined : curProj;
+    const res = await search(db, query, { ...filters, limit: n, currentProject: curProj, now: new Date(), showPrivate: privateOk(client()) });
     const { semantic } = res;
     // Synapse competition (MEMHUB_COMPETE=0 turns it off): 1-hop graph neighbours of the top 6 compete with results 7..n for
     // those slots (no extra lines). Fresh N1b holdout: linked answer visible 13.5 → 22.4 % vs plain limit 8 (+22 −1), shuffled
     // graph no gain; detail set −3 net (n.s.). docs/decisions/0004
     const hits = process.env.MEMHUB_COMPETE !== '0' && n > 6 && res.hits.length > 0 && res.qvec
-      ? compete(res.hits, await proposals(db, res.hits, res.qvec, { hide: hidden(), filters, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), pool: Number(process.env.MEMHUB_COMPETE_POOL ?? 16) })
-        .catch(() => ({ props: [], sims: new Map<string, number>() })), { n, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), bonus: Number(process.env.MEMHUB_COMPETE_BONUS ?? 0.3) })
+      ? compete(res.hits, await proposals(db, res.hits, res.qvec, { hide: hidden(), filters, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), pool: Number(process.env.MEMHUB_COMPETE_POOL ?? 16), currentProject: scopeProj, query })
+        .catch(() => ({ props: [], sims: new Map<string, number>() })), { n, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), bonus: Number(process.env.MEMHUB_COMPETE_BONUS ?? 0.3), currentProject: scopeProj, query })
       : res.hits;
     const ids = hits.map((h) => h.id); // origins after ranking: a citation never moves a hit; a failed lookup only drops the src parts
     const [og, cost, mask] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined,
       hiddenNameMask(db, hidden())]);
     // mask before passage(): its window may start inside a hidden note's [[id title]], after the id the output mask needs
     for (const h of hits) for (const x of [h, ...(h.evidence ?? [])]) x.text = mask(x.text);
-    const parts = [brief ? briefText(hits, query, semantic, cost!, og) : searchText(hits, query, semantic, og)];
+    const parts = [brief ? briefText(hits, query, semantic, cost!, og, scopeProj) : searchText(hits, query, semantic, og, scopeProj)];
     // metamemory "ไม่รู้": measured unfiltered and with a project filter (holdout: 0.6 % wrong); a date range never was
     if (hits.length && !since && !until && unfamiliar(res.signal)) parts.unshift(UNFAMILIAR_HEAD);
     const linked = process.env.MEMHUB_ASSOC === '1' && hits.length ? await associate(db, hits.slice(0, 3).map((h) => ({ chunkId: h.id, a: h.score / hits[0].score })),
-      { hide: hidden(), exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters }).catch(() => []) : [];
+      { hide: hidden(), exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters, currentProject: scopeProj, query }).catch(() => []) : [];
     for (const r of linked) r.chunk.text = mask(r.chunk.text);
-    if (linked.length) parts.push(assocText(linked, query));
+    if (linked.length) parts.push(assocText(linked, query, scopeProj));
     const out = mask(parts.join(brief ? '\n' : '\n\n'));
     logAccess('search', hits, { tool: 'search', t0, query, semantic, chars: out.length });
     return text(out);
@@ -173,14 +175,16 @@ const whatOf = (h: Pick<Hit, 'kind' | 'tool' | 'project' | 'session_id' | 'src_k
 // not a search hit: `⇢ linked [id] 2026-09-12 proj-a codex · via [hit id] prov→next: passage`, ≤ 220 chars.
 // memory_get view:"related" lists them without the prefix and the via (always the id asked about).
 const ASSOC_LINE = 220;
-function assocLine(r: Assoc, query: string, inSearch = true): string {
+function assocLine(r: Assoc, query: string, inSearch = true, currentProject?: string): string {
   const c = r.chunk, fact = c.fid && c.kind !== 'card';
-  const head = `${inSearch ? '⇢ linked ' : ''}[${idOf(c)}] ${day(c.ts)} ${projectName(c.fact_project ?? c.project ?? '') || 'global'} ${whatOf(c)}` +
-    `${c.status === 'superseded' ? ' OLD' : ''} · ${inSearch ? `via [${r.via}] ` : ''}${r.kind}: `;
+  const proj = projectName(c.fact_project ?? c.project ?? '') || 'global';
+  const outTag = isOtherProject(c, currentProject, query) ? `นอกโปรเจกต์ (เคยคุยใน "${proj}"): ` : '';
+  const head = `${inSearch ? '⇢ linked ' : ''}[${idOf(c)}] ${day(c.ts)} ${proj} ${whatOf(c)}` +
+    `${c.status === 'superseded' ? ' OLD' : ''} · ${inSearch ? `via [${r.via}] ` : ''}${r.kind}: ${outTag}`;
   return (head + passage(fact ? factBody(c.text) : c.text, fact ? '' : query, Math.max(40, Math.min(180, ASSOC_LINE - head.length - 2)))).slice(0, ASSOC_LINE);
 }
 /** memory_search's linked lines — exported so scripts/eval.ts measures exactly what the calling model reads. */
-export const assocText = (rows: Assoc[], query: string) => rows.map((r) => assocLine(r, query)).join('\n');
+export const assocText = (rows: Assoc[], query: string, currentProject?: string) => rows.map((r) => assocLine(r, query, true, currentProject)).join('\n');
 
 // A fact with its source chat (↳): the fact gets ≤ this, the ↳ line the rest of the 400 chars of one result.
 // eval tune: 250 kept the most question terms visible in the gold entry (200/300 lost some; chars equal).
@@ -199,10 +203,10 @@ export const UNFAMILIAR_HEAD = 'ไม่รู้ (not in memory): nothing stor
   'the near misses below unless one clearly is the thing asked.';
 
 /** memory_search reply text — exported so scripts/eval.ts measures exactly what the calling model reads. */
-export function searchText(hits: Hit[], query: string, semantic: boolean, og?: Map<string, Origin>): string {
+export function searchText(hits: Hit[], query: string, semantic: boolean, og?: Map<string, Origin>, currentProject?: string): string {
   if (!hits.length) return semantic ? 'no matches' : 'no matches (keyword-only: embedder busy)';
   const max = budgets(hits.length);
-  return (semantic ? '' : '(keyword-only: embedder busy)\n') + hits.map((h, i) => hitText(h, query, max[i], og?.get(h.id))).join('\n\n');
+  return (semantic ? '' : '(keyword-only: embedder busy)\n') + hits.map((h, i) => hitText(h, query, max[i], og?.get(h.id), currentProject)).join('\n\n');
 }
 
 /** Chars per result: 400 each, but rank 1 +300 and rank 2 +100, paid evenly by ranks ≥ 3 (≥ 200 each); total unchanged.
@@ -238,10 +242,14 @@ function passage(text: string, query: string, max: number): string {
 
 /** One result: line + passage (a fact from its head), then its best source chat (↳) in the rest of its `max` chars.
  *  More source chats are only counted (+N): memory_get(fact id) lists its provenance. */
-export function hitText(h: Hit, query: string, max = 400, o?: Origin): string {
+export function hitText(h: Hit, query: string, max = 400, o?: Origin, currentProject?: string): string {
   const [e, ...more] = h.evidence ?? [];
   const fact = h.fid && h.kind !== 'card';
   const text = fact ? factBody(h.text) : h.text, q = fact ? '' : query;
+  if (isOtherProject(h, currentProject, query)) {
+    const proj = projectName(h.fact_project ?? h.project ?? '') || (h.fact_project ?? h.project);
+    return `${hitLine(h, undefined, o)} | นอกโปรเจกต์\nเคยคุยในโปรเจกต์ "${proj}" (${day(h.ts)}, ${whatOf(h)}): ${passage(text, q, 140)}`;
+  }
   if (!e) return `${hitLine(h, undefined, o)}\n${passage(text, q, max)}`;
   // a source chat whose decision a later fact replaced keeps the warning it has as a result of its own (not when that fact is h)
   const later = e.changed_to?.filter((f) => f !== h.fid) ?? [];
@@ -257,22 +265,24 @@ export const BRIEF_LINE = 200;
 const BRIEF_HEAD = 'brief: ≈t = est. tokens of memory_get(id); memory_get view:"timeline" = what happened around it';
 
 /** memory_search detail:"brief" text. cost = getTokens() of the hits' chunk ids. */
-export function briefText(hits: Hit[], query: string, semantic: boolean, cost: Map<string, number>, og?: Map<string, Origin>): string {
+export function briefText(hits: Hit[], query: string, semantic: boolean, cost: Map<string, number>, og?: Map<string, Origin>, currentProject?: string): string {
   if (!hits.length) return searchText(hits, query, semantic);
-  return (semantic ? '' : '(keyword-only: embedder busy)\n') + `${BRIEF_HEAD}\n` + hits.map((h) => briefLine(h, query, cost, og?.get(h.id))).join('\n');
+  return (semantic ? '' : '(keyword-only: embedder busy)\n') + `${BRIEF_HEAD}\n` + hits.map((h) => briefLine(h, query, cost, og?.get(h.id), currentProject)).join('\n');
 }
 
 /** `[id] 2026-09-12 proj-a codex subagent src codex:1a2b3c4d#7 ≈850t ↳[source chat id]: gist` — OLD / PENDING / changed
  *  warnings kept from hitLine; src only when given (origins()). */
-export function briefLine(h: Hit, query: string, cost: Map<string, number>, o?: Origin): string {
+export function briefLine(h: Hit, query: string, cost: Map<string, number>, o?: Origin, currentProject?: string): string {
   const fact = h.fid && h.kind !== 'card', what = whatOf(h);
   const flag = h.status === 'superseded' ? ` OLD -> [${h.superseded_by ?? '?'}]` : h.status === 'pending' ? ` PENDING vs [${h.review_target ?? '?'}]`
     : h.changed_to ? ` (later changed -> [${h.changed_to.join('] [')}])` : '';
   const ev = h.evidence?.length ? ` ↳[${h.evidence[0].id}]${h.evidence.length > 1 ? `+${h.evidence.length - 1}` : ''}` : '';
   // brief = cheap: the src tag names the app/kind of a raw hit (what is dropped) and a fact's tag goes without date / ×N
   const src = o ? ` src ${o.tag}${o.ai ? ' AI-only' : ''}` : '';
-  const head = `[${idOf(h)}] ${day(h.ts)} ${projectName(h.fact_project ?? h.project ?? '') || 'global'}${o && !h.kind ? '' : ` ${what}`}${flag}${src}` +
-    ` ≈${cost.get(h.id) ?? '?'}t${ev}: `;
+  const proj = projectName(h.fact_project ?? h.project ?? '') || 'global';
+  const outTag = isOtherProject(h, currentProject, query) ? `นอกโปรเจกต์ (เคยคุยใน "${proj}"): ` : '';
+  const head = `[${idOf(h)}] ${day(h.ts)} ${proj}${o && !h.kind ? '' : ` ${what}`}${flag}${src}` +
+    ` ≈${cost.get(h.id) ?? '?'}t${ev}: ${outTag}`;
   return (head + passage(fact ? factBody(h.text) : h.text, fact ? '' : query, 100)).slice(0, BRIEF_LINE);
 }
 

@@ -98,6 +98,10 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
 
 export const projectSlug = (project?: string | null) => (project ? fileName(project.split('/').filter(Boolean).at(-1) ?? project, 40) : '_global');
 
+/** Keywords indicating a fact/rule/preference is cross-project or personal to ลุงจืด → defaults to scope: global when opts.global is omitted. */
+export const GLOBAL_HINT = /(?:กฎเหล็ก|ทุกโปรเจกต์|ทุก\s*(?:project|repo|เครื่อง)|all\s+projects|every\s+project|global\s+rule|ข้ามโปรเจกต์|google\s+timeline|ประวัติการเดินทาง|ข้อมูลส่วนตัวลุงจืด|(?:บ้าน|เบอร์โทร|อีเมล)ลุงจืด|ลุงจืดชอบ(?:กาแฟ|กิน|เที่ยว|ดื่ม|ให้สรุปท้ายงาน))/i;
+export const isGlobalFact = (text: string, title = '') => GLOBAL_HINT.test(`${title}\n${text}`);
+
 /** memory_save: ลุงจืด asked to remember → a user-owned fact note (redacted), indexed in the background. replaces (mcp.ts):
  *  supersede = AI-owned notes it corrects, made OLD at once as the dream does; review = fid of his own note it would replace →
  *  this note is saved pending with review_target (hubs/_review.md: he sets it active = accept, consolidate applies it).
@@ -107,7 +111,7 @@ export function saveNote(content: string, opts: { title?: string; project?: stri
   const now = opts.now ?? new Date();
   const text = clean(content).trim();
   const fid = noteFid(content);
-  const scope = opts.global || !opts.project ? 'global' : 'project';
+  const scope = (opts.global ?? (!opts.project || isGlobalFact(text, opts.title))) ? 'global' : 'project';
   // the title is redacted like the text: it becomes the file name, the vault commit message and every search citation
   const rel = `facts/${scope === 'global' ? '_global' : projectSlug(opts.project)}/${fid} ${fileName(opts.title ? clean(opts.title) : text.split('\n')[0], 40)}.md`;
   const path = join(MEMORY_VAULT, rel);

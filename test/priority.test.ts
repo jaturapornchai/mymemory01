@@ -16,7 +16,7 @@ process.env.MEMHUB_NO_REINDEX = '1';
 process.env.MEMORY_HUB_INTERNAL = '1';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile } = await import('../src/importer.ts');
-const { saveNote, writeNote, md5, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
+const { saveNote, writeNote, md5, isGlobalFact, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { search, hitLine, RANK } = await import('../src/search.ts');
 const { searchText, briefLine, assocText } = await import('../src/mcp.ts');
@@ -206,7 +206,15 @@ test('currentProject priority: in-project hit beats out-of-project rule; out-of-
     sims: new Map([[hits[0].id, 0.5]]),
   }, { n: 7, keep: 6, theta: 0.05, bonus: 0.3, currentProject: 'd:/demo', query: 'falconkey' });
   assert.equal(comp[6]?.session_id, 'inproj', 'in-project hit keeps slot 7 against out-of-project proposal');
-  // [4] expression indexes exist on chunks and facts
+  // [4] proj_basename SQL function and expression indexes exist on chunks and facts
   const idx = (await db.query(`SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND indexname IN ('chunks_proj_name', 'facts_proj_name') ORDER BY 1`, [SCHEMA])).rows.map((r) => r.indexname);
   assert.deepEqual(idx, ['chunks_proj_name', 'facts_proj_name']);
+  const bn = (await db.query(`SELECT proj_basename('D:\\work/My-App') a, proj_basename('/Users/jead/My-App') b`)).rows[0];
+  assert.equal(bn.a, 'my-app');
+  assert.equal(bn.b, 'my-app');
+  // [5] saveNote auto-detects global rules and personal facts even when called inside a project
+  assert.equal(isGlobalFact('กฎเหล็ก: ห้าม hardcode secret ทุกโปรเจกต์'), true);
+  assert.equal(isGlobalFact('แก้บั๊กหน้าใบกำกับภาษีในระบบนี้'), false);
+  const autoGlob = saveNote('กฎเหล็ก: ใช้กับทุกโปรเจกต์ autoglobtest', { project: 'd:/demo', kind: 'rule', now: NOW });
+  assert.match(autoGlob, /^facts\/_global\//, 'global hint saves under facts/_global/ even when project is passed');
 });

@@ -48,7 +48,11 @@ CREATE INDEX IF NOT EXISTS chunks_words ON chunks USING gin (words);
 CREATE INDEX IF NOT EXISTS chunks_bigrams ON chunks USING gin (bigrams);
 CREATE INDEX IF NOT EXISTS chunks_project_ts ON chunks (project, ts);
 CREATE INDEX IF NOT EXISTS chunks_source ON chunks (source_id);
-CREATE INDEX IF NOT EXISTS chunks_proj_name ON chunks ((lower(regexp_replace(project, '^.*[/\\:]', ''))));
+CREATE OR REPLACE FUNCTION proj_basename(p text) RETURNS text
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT lower(regexp_replace(p, '^.*[/\\:]', ''))
+$$;
+CREATE INDEX IF NOT EXISTS chunks_proj_name ON chunks (proj_basename(project));
 
 -- Document frequency per word lexeme (refreshed after bulk import) → IDF weighting + rare-term candidates.
 CREATE TABLE IF NOT EXISTS term_df (
@@ -157,7 +161,7 @@ CREATE TABLE IF NOT EXISTS facts (
 CREATE INDEX IF NOT EXISTS facts_sessions ON facts USING gin (session_ids);
 CREATE INDEX IF NOT EXISTS facts_uuids ON facts USING gin (source_uuids);
 CREATE INDEX IF NOT EXISTS facts_md5 ON facts (md5);
-CREATE INDEX IF NOT EXISTS facts_proj_name ON facts ((lower(regexp_replace(project, '^.*[/\\:]', ''))));
+CREATE INDEX IF NOT EXISTS facts_proj_name ON facts (proj_basename(project));
 
 -- Review queue = pending notes; ลุงจืด resolves them in Obsidian by setting status.
 CREATE OR REPLACE VIEW review_queue AS

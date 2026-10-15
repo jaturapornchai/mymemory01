@@ -101,7 +101,8 @@ async function indexFact(c: pg.PoolClient, sourceId: string, fm: Fm, body: strin
        coalesce((SELECT array_agg(DISTINCT session_id) FROM turns WHERE uuid = ANY($13::text[])), '{}'),
        $14, $15, $16, $17, $18, $19, $20)
      ON CONFLICT (fid) DO NOTHING`, // ponytail: two files claiming one id → first indexed wins
-    [sourceId, fmStr(fm.id), kind, fmStr(fm.scope) === 'global' ? 'global' : 'project', fmStr(fm.project) ? normProject(fmStr(fm.project)) : null,
+    [sourceId, fmStr(fm.id), kind, fmStr(fm.scope) === 'global' ? 'global' : 'project',
+      fmStr(fm.scope) === 'global' ? null : (fmStr(fm.project) ? normProject(fmStr(fm.project)) : null),
       fmStr(fm.lang) || null, isoOr(fmStr(fm.valid_at), created), isoOr(fmStr(fm.invalid_at), null), created,
       isoOr(fmStr(fm.expired_at), null), fmStr(fm.superseded_by) || null, fmStr(fm.review_target) || null,
       uuids.length ? uuids : [uuid], Number(fmStr(fm.confidence)) || null, Math.min(10, Math.max(1, Number(fmStr(fm.importance)) || 5)),

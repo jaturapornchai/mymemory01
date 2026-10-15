@@ -197,8 +197,8 @@ x AS (
               WHEN fa.pinned OR fa.user_owned OR fa.run IS NULL OR fa.kind IN ('rule', 'feedback') THEN 2 ELSE 1 END tier,
          CASE WHEN $5::text = '' THEN 1
               WHEN c.project = $5 OR fa.project = $5
-                OR lower(regexp_replace(coalesce(fa.project, c.project, ''), '^.*[/\\\\:]', '')) = lower(regexp_replace($5, '^.*[/\\\\:]', ''))
-                OR lower(regexp_replace(coalesce(fa.project, c.project, ''), '^.*[/\\\\:]', '')) = ANY($27::text[]) THEN $25::float8
+                OR proj_basename(coalesce(fa.project, c.project, '')) = proj_basename($5)
+                OR proj_basename(coalesce(fa.project, c.project, '')) = ANY($27::text[]) THEN $25::float8
               WHEN (fa.fid IS NOT NULL AND coalesce(fa.project, '') = '') OR (s.tool = 'obsidian' AND fa.fid IS NULL) OR c.project LIKE 'google/%' THEN 1
               WHEN $3::text IS NULL THEN $26::float8 ELSE 1 END proj,
          greatest(extract(epoch FROM coalesce($7, now()) - greatest(c.ts, u.last)) / 86400, 1.0 / 24) t1,
@@ -260,7 +260,7 @@ export function projectCatalogue(db: pg.Pool): Promise<Named[]> {
   const c = CATALOGUE.get(db);
   if (c && Date.now() - c.at < 36e5) return c.p;
   const p = db.query(`SELECT c.name, c.raw, c.n, coalesce(d.ndoc, 0) df FROM (
-      SELECT lower(regexp_replace(project, '^.*[/\\\\:]', '')) name, array_agg(DISTINCT project) raw, count(*)::int n FROM chunks
+      SELECT proj_basename(project) name, array_agg(DISTINCT project) raw, count(*)::int n FROM chunks
       WHERE project IS NOT NULL AND source_id NOT IN (${HIDDEN('$1')}) GROUP BY 1 HAVING count(*) >= 20) c LEFT JOIN term_df d ON d.word = c.name`,
     [[...PRIVATE_TOOLS]]).then((r) => r.rows.filter((x) => x.name.length >= 3 && !/\s/.test(x.name) && !x.name.startsWith('.') && x.df <= 3 * x.n)
     .map((x): Named => ({ name: x.name, raw: x.raw })), () => { CATALOGUE.delete(db); return []; });

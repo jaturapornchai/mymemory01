@@ -10,7 +10,7 @@ import { connect } from './db.ts';
 import { embed, toVec, warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
 import { canonicalProject, clean, normProject, projectName } from './importer.ts';
-import { fmStr, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
+import { fmStr, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
 import { day, HIDDEN, hitLine, isOtherProject, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
@@ -439,7 +439,8 @@ server.registerTool(
         if (!r.his && n && !isHis(n.fm, n.body)) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
       }
       const proj = await getProject();
-      const rel = saveNote(content, { title, kind, global, project: proj, client: client(), supersede: sup.map((x) => x.rel), review: review[0] });
+      const isGlobal = global ?? (!proj || isGlobalFact(content, title));
+      const rel = saveNote(content, { title, kind, global: isGlobal, project: proj, client: client(), supersede: sup.map((x) => x.rel), review: review[0] });
       // saveNote decides: pending (his note to review) supersedes nothing yet; the same text already active stays active
       const pending = fmStr(parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.status) === 'pending';
       const ids = (xs: string[]) => xs.map((x) => `[${x}]`).join(' ');
@@ -450,7 +451,7 @@ server.registerTool(
         : `[${review[0]}] เป็นโน้ตของลุงจืด: ไม่แก้ไฟล์ให้ — โน้ตใหม่เป็น pending รอลุงจืดอนุมัติ (คิว hubs/_review.md อัปเดตตอนกลางคืน; ตั้ง status: active = แทน [${review[0]}])` +
         (review.length > 1 ? `; ยังไม่ได้เสนอแทน ${ids(review.slice(1))}: เสนอได้ทีละโน้ต` : ''));
       if (old.length) out.push(`already OLD, left as is: ${old.join(' · ')}`);
-      for (const x of await similar(clean(content).trim(), kind ?? 'fact', global ? '' : proj, hide, [fid, ...replaces]))
+      for (const x of await similar(clean(content).trim(), kind ?? 'fact', isGlobal ? '' : proj, hide, [fid, ...replaces]))
         out.push(`คล้าย [${x.fid}] ${x.txt} — ส่ง replaces:[${x.fid}] ถ้าจะแทน`);
     }
     const lost = want.filter((x) => !seen.has(x));

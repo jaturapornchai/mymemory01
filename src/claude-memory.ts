@@ -20,6 +20,13 @@ export function parseMemory(src: string) {
   return text ? { title: get('name'), kind: KIND[type] ?? 'fact', global: type === 'user', text, modified: get('modified') } : null;
 }
 
+/** When Claude wrote a memory file (its metadata modified, else the file mtime), not the import run: an old memory imported
+ *  today must not look newer than his later words. */
+export function writtenAt(m: { modified: string }, path: string) {
+  const t = Date.parse(m.modified);
+  return new Date(Number.isFinite(t) ? t : statSync(path).mtimeMs);
+}
+
 /** Claude's folder name for a cwd ("d--code-myapp" = D:/code/myapp or D:/code-myapp): the one on disk, else null. */
 function slugDir(slug: string): string | null {
   const m = /^([a-z])--(.+)$/i.exec(slug);
@@ -51,8 +58,7 @@ export async function importClaudeMemory(db: pg.Pool, o: { dir?: string; dry?: b
       const k = `cmem:${slug}/${f}`, src = readFileSync(join(mdir, f), 'utf8'), sha = md5(src), old = state.get(k);
       const m = old?.sha === sha ? null : parseMemory(src);
       if (!m) continue;
-      // dated by when Claude wrote it, not this run: an old memory imported today must not look newer than his later words
-      const t = Date.parse(m.modified), now = new Date(Number.isFinite(t) ? t : statSync(join(mdir, f)).mtimeMs);
+      const now = writtenAt(m, join(mdir, f));
       const fid = noteFid(m.text), prev = old?.rel && old.fid !== fid ? old.rel : '';
       const dup = prev ? null : (await nearFacts(db, clean(m.text).trim(), m.global ? '' : p, [], [fid], { min: 0.92, n: 1 }))[0];
       (dup ? out.dup : out.saved).push(`${slug}/${f}${dup ? ` ≈ [${dup.fid}] ${dup.sim?.toFixed(2) ?? 'words'}` : ''}`);

@@ -17,7 +17,7 @@ for (const k of ['MEMORY_HUB_INTERNAL', 'MEMHUB_ANTHROPIC_ONLY', 'MEMHUB_PRIVATE
 Object.assign(process.env, ENV);
 const { connect, ROOT } = await import('../src/db.ts');
 const { normProject } = await import('../src/importer.ts');
-const { md5, noteFid, parseNote, saveNote, writeNote, MEMORY_VAULT } = await import('../src/notes.ts');
+const { md5, noteFid, parseNote, renderNote, saveNote, sha, writeNote, MEMORY_VAULT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { accuracyFlags, conflictPairs, missingPaths, polarity, saveFlags } = await import('../src/accuracy.ts');
 const { importClaudeMemory, parseMemory } = await import('../src/claude-memory.ts');
@@ -214,6 +214,60 @@ test('Claude memory import dates a fact by when Claude wrote it (metadata modifi
   const at = async (text: string) => (await db.query(`SELECT valid_at::date::text d FROM facts WHERE fid = $1`, [noteFid(text)])).rows[0]?.d;
   assert.equal(await at('acctestdated: zorbleq ย้ายไปเครื่อง qyxnode แล้ว'), '2026-10-09');
   assert.equal(await at('acctestdated: flimbar ใช้คิว pruxq สำหรับงานกลางคืน'), '2026-10-03');
+});
+
+test('a CRLF text saves as a machine note (body_sha of the body parseNote returns), not as his edit', () => {
+  const rel = saveNote('acctestcrlf: qorvane ใช้ cron\r\nบรรทัดสอง vexlo', { project: PROJECT, reindex: false });
+  const raw = readFileSync(join(MEMORY_VAULT, rel), 'utf8'), { fm, body } = parseNote(raw);
+  assert.ok(!raw.includes('\r'), 'no CR written');
+  assert.equal(writeNote(rel, { importance: '7' }), 'written', 'still machine-owned');
+  assert.equal(parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).body, body);
+  assert.ok(fm.body_sha);
+});
+
+test('backfill re-dates Claude memory facts imported with the run day, only valid_at/created_at, skipping gone/superseded/newer', async () => {
+  const { backfillClaudeMemoryDates } = await import('../scripts/backfill-cmem-dates.ts');
+  const live = join(tmp, 'cm3'), slug = tmp.replace(/[:\\/]/g, '-'), dir = join(live, slug, 'memory');
+  mkdirSync(dir, { recursive: true });
+  const mem = (body: string, extra = '') => `---\nname: acctest-bf\ndescription: d\nmetadata:\n  type: project\n${extra}---\n\n${body}\n`;
+  const T = { mod: 'acctestbf: vonkle ใช้พอร์ต 7311', mtime: 'acctestbf: graspel รันบน qelbox', gone: 'acctestbf: trinmo เลิกใช้แล้ว',
+    sup: 'acctestbf: plordex ย้ายไป zentra', newer: 'acctestbf: wubrik ใช้คิว moxa', crlf: 'acctestbf: snorvik ใช้ cron\r\nทุกคืน' };
+  const day = (d: string) => new Date(`${d}T05:00:00Z`);
+  writeFileSync(join(dir, 'bf-mod.md'), mem(T.mod, '  modified: 2026-10-09T05:00:00.000Z\n'));
+  for (const [f, d] of [['mtime', '2026-10-03'], ['gone', '2026-10-04'], ['sup', '2026-10-05'], ['newer', '2026-10-25'], ['crlf', '2026-10-06']]) {
+    writeFileSync(join(dir, `bf-${f}.md`), mem(T[f as keyof typeof T]));
+    utimesSync(join(dir, `bf-${f}.md`), day(d), day(d));
+  }
+  assert.equal((await importClaudeMemory(db, { dir: live })).saved.length, 6);
+  const rel = async (f: string) => (await db.query(`SELECT v->>'rel' r FROM state WHERE k = $1`, [`cmem:${slug}/bf-${f}.md`])).rows[0].r as string;
+  const run = '2026-10-18T12:00:00.000Z'; // the pre-fix import stamped every note with its run time
+  for (const f of Object.keys(T)) writeNote(await rel(f), { valid_at: run, created_at: run });
+  writeNote(await rel('sup'), { status: 'superseded', superseded_by: 'Facctestbf0', expired_at: run, invalid_at: run });
+  unlinkSync(join(dir, 'bf-gone.md'));
+  // the old writeNote hashed a CRLF body as is → parseNote's body never matched body_sha → the note looked like his edit
+  const crPath = join(MEMORY_VAULT, await rel('crlf')), crNote = parseNote(readFileSync(crPath, 'utf8')), cr = crNote.body.replace(/\n/g, '\r\n');
+  writeFileSync(crPath, renderNote({ ...crNote.fm, body_sha: sha(cr) }, cr));
+  await index();
+  const at = async (f: keyof typeof T) => (await db.query(`SELECT valid_at::date::text v, created_at::date::text c FROM facts WHERE fid = $1`, [noteFid(T[f])])).rows[0];
+  const before = readFileSync(join(MEMORY_VAULT, await rel('mod')), 'utf8');
+
+  const dry = await backfillClaudeMemoryDates(db, { dir: live, dry: true });
+  assert.deepEqual(dry.fixed.map((x) => x.key).filter((k) => k.includes('/bf-')).sort(), [`${slug}/bf-crlf.md`, `${slug}/bf-mod.md`, `${slug}/bf-mtime.md`]);
+  assert.ok(dry.gone >= 1 && dry.superseded >= 1 && dry.notOlder >= 1, JSON.stringify(dry));
+  assert.equal(readFileSync(join(MEMORY_VAULT, await rel('mod')), 'utf8'), before, 'dry run writes nothing');
+  assert.deepEqual(await at('mod'), { v: '2026-10-18', c: '2026-10-18' });
+
+  await backfillClaudeMemoryDates(db, { dir: live }); // writes the notes and indexes the vault itself
+  assert.deepEqual(await at('mod'), { v: '2026-10-09', c: '2026-10-09' });
+  assert.deepEqual(await at('mtime'), { v: '2026-10-03', c: '2026-10-03' });
+  assert.deepEqual(await at('crlf'), { v: '2026-10-06', c: '2026-10-06' });
+  assert.equal((await db.query(`SELECT edited FROM facts WHERE fid = $1`, [noteFid(T.crlf)])).rows[0].edited, false, 'CRLF note: machine-owned again');
+  for (const f of ['gone', 'sup', 'newer'] as const) assert.deepEqual(await at(f), { v: '2026-10-18', c: '2026-10-18' }, f);
+  const after = readFileSync(join(MEMORY_VAULT, await rel('mod')), 'utf8');
+  const diff = (a: string, b: string) => a.split('\n').filter((l) => !b.split('\n').includes(l));
+  assert.deepEqual(diff(after, before), ['valid_at: 2026-10-09T05:00:00.000Z', 'created_at: 2026-10-09T05:00:00.000Z']);
+  assert.deepEqual(diff(before, after), [`valid_at: ${run}`, `created_at: ${run}`]);
+  assert.equal((await backfillClaudeMemoryDates(db, { dir: live, dry: true })).fixed.filter((x) => x.key.includes('/bf-')).length, 0, 'second run: nothing left');
 });
 
 test('CONFLICT spans the project tree like search: parent ↔ sub-folder facts are compared, siblings and catch-alls are not', async () => {

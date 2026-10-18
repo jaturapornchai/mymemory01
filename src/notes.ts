@@ -85,7 +85,8 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
     fm = old.fm;
     cur = old.body;
   }
-  const nextBody = body ?? cur ?? '';
+  // CRLF text (a Windows-written Claude memory file): parseNote reads \n only, so a \r kept here = body_sha never matches = "his edit"
+  const nextBody = (body ?? cur ?? '').replace(/\r\n/g, '\n');
   const next = renderNote({ ...fm, ...meta, body_sha: sha(nextBody) }, nextBody);
   if (cur !== undefined && existsSync(path) && readFileSync(path, 'utf8').replace(/\r\n/g, '\n') === next) return 'unchanged';
   beforeMachineWrite(MEMORY_VAULT, rel); // git history: ลุงจืด's pending edits get their own commit before the batch's first write

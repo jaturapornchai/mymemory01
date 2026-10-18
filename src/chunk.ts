@@ -37,6 +37,26 @@ function pieces(text: string): string[] {
 }
 
 const firstLine = (t: string) => t.replace(/\s+/g, ' ').trim().slice(0, 80);
+const TOUCH_RE = /^(?:[A-Z]: )?\[(?:Edit|Write|NotebookEdit|edit|write)\]\s+(.+)$/gm;
+
+/** Extract normalized relative/basename file paths modified by edit/write tool calls in text (up to 8 per round). */
+export function filesTouched(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(TOUCH_RE)) {
+    const raw = m[1].trim();
+    const toks = raw.split(/\s+/);
+    const paths = toks.length > 1 && !/^[A-Za-z]:[\\/]/.test(raw) && toks.every((t) => /[\\/]|^\S+\.\w{1,8}$/.test(t)) ? toks : [raw];
+    for (const p of paths) {
+      const segs = p.replace(/^['"`]+|['"`]+$/g, '').replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean);
+      const base = segs.at(-1);
+      if (!base || !/[.\w-]/.test(base)) continue;
+      const dir = segs.at(-2);
+      out.add(dir && !/^[a-z]:$/i.test(dir) ? `${dir}/${base}` : base);
+      if (out.size >= 8) return [...out];
+    }
+  }
+  return [...out];
+}
 
 export function chunkTurns(turns: Turn[], projectName: string): Chunk[] {
   const rounds: Turn[][] = [];
@@ -47,11 +67,13 @@ export function chunkTurns(turns: Turn[], projectName: string): Chunk[] {
   const chunks: Chunk[] = [];
   for (const round of rounds) {
     const head = round[0];
-    const ctxHeader = `${projectName} ${head.ts.slice(0, 10)} — ${firstLine(head.text)}`;
+    const baseHeader = `${projectName} ${head.ts.slice(0, 10)} — ${firstLine(head.text)}`;
+    const touched = filesTouched(round.map((t) => t.text).join('\n'));
+    const ctxHeader = touched.length ? `${baseHeader} [files: ${touched.join(' ')}]` : baseHeader;
     let buf = '', from = head, to = head;
     const emit = () => {
       if (!buf) return;
-      const id = createHash('sha256').update(`${CHUNKER_VER}\0${ctxHeader}\0${buf}`).digest('hex').slice(0, 16);
+      const id = createHash('sha256').update(`${CHUNKER_VER}\0${baseHeader}\0${buf}`).digest('hex').slice(0, 16);
       chunks.push({ id, turnUuid: from.uuid, seqFrom: from.seq, seqTo: to.seq, ts: from.ts, ctxHeader, text: buf });
       buf = '';
     };
@@ -70,3 +92,4 @@ export function chunkTurns(turns: Turn[], projectName: string): Chunk[] {
   }
   return chunks;
 }
+

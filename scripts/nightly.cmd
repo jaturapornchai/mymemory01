@@ -10,4 +10,3 @@ rem lint --fix = auto-retire machine dups/expired/replaced, then write report to
 "C:\Program Files\nodejs\node.exe" --no-warnings src\cli.ts lint --fix >> logs\nightly.log 2>&1 || echo lint failed >> logs\nightly.log
 if exist deploy\memory-hub-brain\.vercel "C:\Program Files\nodejs\node.exe" --no-warnings src\cli.ts publish >> logs\nightly.log 2>&1
 rem sem = the local Gemma (llama-server :8080) judges new top-cosine pairs into synapses of kind sem; skipped when it is not up
-"C:\Program Files\nodejs\node.exe" --no-warnings src\cli.ts sem >> logs\nightly.log 2>&1

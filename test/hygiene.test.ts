@@ -15,7 +15,7 @@ process.env.MEMHUB_VAULTS = '';
 process.env.MEMHUB_NO_REINDEX = '1';
 process.env.MEMORY_HUB_INTERNAL = '1';
 const { connect, ROOT } = await import('../src/db.ts');
-const { indexFile, forget } = await import('../src/importer.ts');
+const { indexFile, forget, requeueUnredacted } = await import('../src/importer.ts');
 const { consolidate } = await import('../src/dream.ts');
 const { md5, MEMORY_VAULT, parseNote, renderNote, writeNote } = await import('../src/notes.ts');
 const { indexVault, resolveLinks } = await import('../src/obsidian.ts');
@@ -134,7 +134,7 @@ test('lint & fixLint: expired, duplicate pair, orphan, broken link, replaced —
   assert.deepEqual(r.broken.map((x) => x.dst_name), ['no such note']);
 
   const dry = await runLint(db, { dry: true, now: NOW });
-  assert.match(dry, /^## 2026-10-04\nเลยวันหมดอายุ 1 · อาจซ้ำ 1 คู่ · แชตต้นทางหายหมด 1 · ลิงก์เสีย 1 · หลักฐานไม่ตรง \d+ · อาจขัดกัน \d+ · บอกว่าแทนแล้วแต่ของเก่ายัง active 0\n/);
+  assert.match(dry, /^## 2026-10-04\nเลยวันหมดอายุ 1 · อาจซ้ำ 1 คู่ · แชตต้นทางหายหมด 1 · ลิงก์เสีย 1 · หลักฐานไม่ตรง \d+ · อาจขัดกัน \d+ · บอกว่าแทนแล้วแต่ของเก่ายัง active 0 · CONFLICT 0 คู่ · STALE 0\n/);
   assert.match(dry, /\[\[F0000f01 twin one\]\] ≈ \[\[F0000f02 twin two\]\] · 1\.000/);
   assert.match(dry, /\[\[F0000f04 links\]\] → `no such note`/);
   assert.doesNotMatch(dry, /F0000f05|secret|from a mail/);
@@ -161,6 +161,21 @@ test('lint & fixLint: expired, duplicate pair, orphan, broken link, replaced —
   const mine = read(LINT_REL);
   assert.match(await runLint(db, { now: new Date('2026-10-06T01:00:00Z') }), /edited by ลุงจืด: left alone[\s\S]*## 2026-10-06/);
   assert.equal(read(LINT_REL), mine);
+
+  // An active rule that explicitly states "แทน F000000e1" auto-retires an unedited dream-written rule and links it via supersedes::
+  note('facts/demo/F000000e1 old rule.md', 'F000000e1', ['bbbb-u0'], { kind: 'rule' }, 'old dream rule');
+  note('facts/demo/F000000e2 new rule.md', 'F000000e2', ['bbbb-u0'], { kind: 'rule' }, 'new dream rule (แทน F000000e1)');
+  commitBatch(MEMORY_VAULT, 'dream r3');
+  await indexVault(db, MEMORY_VAULT);
+  const repOut = await runLint(db, { dry: true, fix: true, now: NOW });
+  assert.match(repOut, /^fixed: -0 expired, -1 replaced, -0 dups\n/);
+  assert.equal(parseNote(read('facts/demo/F000000e1 old rule.md')).fm.status, 'superseded');
+  assert.equal(parseNote(read('facts/demo/F000000e1 old rule.md')).fm.superseded_by, 'F000000e2');
+  assert.match(parseNote(read('facts/demo/F000000e2 new rule.md')).body, /- supersedes:: \[\[F000000e1 old rule\]\]/);
+  rmSync(file('facts/demo/F000000e1 old rule.md'));
+  rmSync(file('facts/demo/F000000e2 new rule.md'));
+  commitBatch(MEMORY_VAULT, 'cleanup r3');
+  await indexVault(db, MEMORY_VAULT);
 });
 
 test('forget --project: every chat under the path, its facts with it (edited one kept)', async () => {
@@ -196,4 +211,17 @@ test('prunePins: a source deleted outside forget (a removed note, a moved file) 
     assert.deepEqual(Object.keys((await db.query(`SELECT v FROM state WHERE k = $1`, [k])).rows[0].v).sort(), [...kept].sort(), k);
   }
   assert.equal(await prunePins(db), 0, 'nothing left to prune: no write');
+});
+
+test('requeueUnredacted: a row stored before a new redact rule is re-queued once, and the next index pass re-imports it clean', async () => {
+  const C = 'cccc3333-0000-0000-0000-000000000000', pw = 'Qx7#' + 'mLp2Zr9', said = `ssh ok, DB_PASS=${pw} ใช้ได้`; // pragma: allowlist secret
+  const path = session(C, 'D:\\keep', [said]);
+  await indexFile(db, path);
+  await db.query('UPDATE turns SET text_redacted = $2 WHERE session_id = $1', [C, said]); // as an older rule set stored it
+  await db.query("DELETE FROM state WHERE k = 'redact'");
+  assert.equal(await requeueUnredacted(db), 1);
+  assert.equal(await requeueUnredacted(db), 'unchanged', 'same redact.ts: no second scan');
+  assert.equal(await indexFile(db, path), 'indexed');
+  const t = (await db.query('SELECT text_redacted FROM turns WHERE session_id = $1', [C])).rows[0].text_redacted;
+  assert.ok(!t.includes(pw) && t.includes('[REDACTED:kv]'), t);
 });

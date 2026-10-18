@@ -18,7 +18,7 @@ const server = createServer((req, res: ServerResponse) => {
 await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
 process.env.OLLAMA_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 process.env.MEMHUB_EMBED_MODEL = 'bge-m3';
-const { embedQuery } = await import('../src/embed.ts');
+const { embedQuery, ensureOllama } = await import('../src/embed.ts');
 after(() => { server.closeAllConnections(); server.close(); });
 const timed = async (waitMs: number) => { const t0 = performance.now(); const v = await embedQuery('q', waitMs); return { v, ms: performance.now() - t0 }; };
 
@@ -50,3 +50,21 @@ test('embedder error → keyword-only right away', async () => {
   assert.equal(v, null);
   assert.ok(ms < 250, `took ${ms} ms`);
 });
+
+test('ensureOllama starts offline daemon once and waits for /api/ps', async () => {
+  let started = 0, up = false;
+  const lazy = createServer((req, res) => {
+    if (!up) { req.socket.destroy(); return; }
+    res.end(JSON.stringify({ models: [] }));
+  });
+  await new Promise<void>((r) => lazy.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(lazy.address() as AddressInfo).port}`;
+  try {
+    const ok = await ensureOllama(url, () => { started++; setTimeout(() => { up = true; }, 100); });
+    assert.equal(ok, true);
+    assert.equal(started, 1);
+    assert.equal(await ensureOllama(url, () => { started++; }), true);
+    assert.equal(started, 1, 'already online: start() not called again');
+  } finally { lazy.closeAllConnections(); lazy.close(); }
+});
+

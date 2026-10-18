@@ -1,4 +1,5 @@
 // Local embeddings via Ollama (never a remote API: embeddings can be inverted back to text).
+import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type pg from 'pg';
 
@@ -8,6 +9,25 @@ export const EMBED_MODEL = process.env.MEMHUB_EMBED_MODEL ?? 'bge-m3';
 // the machine-wide ephemeral port range runs out (every app's outbound connections fail).
 const RATE = Number(process.env.MEMHUB_EMBED_RATE) || 10;
 const KEEP_ALIVE = '2h'; // ~0.7 GB VRAM while loaded; a cold load costs seconds on the first query
+
+/** Start `ollama serve` in the background if `url/api/ps` is unreachable, then wait up to ~3 s for it to listen. */
+export async function ensureOllama(url = OLLAMA, start?: () => void): Promise<boolean> {
+  const ping = () => fetch(`${url}/api/ps`, { signal: AbortSignal.timeout(400) }).then((r) => r.ok, () => false);
+  if (await ping()) return true;
+  try {
+    if (start) start();
+    else {
+      const p = spawn('ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true });
+      p.on('error', () => {});
+      p.unref();
+    }
+  } catch { return false; }
+  for (let i = 0; i < 20; i++) {
+    await sleep(250);
+    if (await ping()) return true;
+  }
+  return false;
+}
 
 export async function embed(texts: string[], timeoutMs = 120_000, cancel?: AbortSignal): Promise<number[][]> {
   const r = await fetch(`${OLLAMA}/api/embed`, {
@@ -50,7 +70,9 @@ async function resident(): Promise<boolean> {
 
 /** Fire-and-forget model load so the first real query doesn't pay the cold start. */
 export function warmUp() {
-  embed(['warm-up'], 60_000).catch(() => {});
+  embed(['warm-up'], 60_000).catch(async () => {
+    if (!process.env.OLLAMA_URL && !process.env.MEMORY_HUB_INTERNAL && await ensureOllama()) embed(['warm-up'], 60_000).catch(() => {});
+  });
 }
 
 /** Embed every chunk that lacks a vector for the current model.
@@ -70,6 +92,7 @@ export async function backfill(db: pg.Pool, batch = 8, log = console.log) {
     for (let tries = 1; ; tries++) {
       try { vecs = await embed(rows.map((r) => `${r.ctx_header}\n${r.text}`)); break; }
       catch (e) {
+        if (tries === 1 && /fetch failed|ECONNREFUSED/i.test(String(e)) && !process.env.OLLAMA_URL && !process.env.MEMORY_HUB_INTERNAL && await ensureOllama()) continue;
         // Ollama opens a new socket to its runner per tokenize call; bulk backfills exhaust Windows' ports (TIME_WAIT 2 min)
         if (tries >= 10 || !/socket address|connectex|ECONNRESET|ECONNREFUSED/i.test(String(e))) throw e;
         log(`embed: ${(e as Error).message.slice(0, 80)}… retry ${tries}/9 in 60 s`);
@@ -89,3 +112,4 @@ export async function backfill(db: pg.Pool, batch = 8, log = console.log) {
   }
   return done;
 }
+

@@ -1,7 +1,8 @@
 // memory-hub serves every AI client (ลุงจืด, 2026-10-02: "memory hub ให้กับ ai model ทุกตัว แต่ claude เป็นตัวหลัก").
 // MEMHUB_ANTHROPIC_ONLY=1 restores the stricter rule: no memory for a Claude Code session whose model backend is not
 // Anthropic (ANTHROPIC_BASE_URL → e.g. a GLM/z.ai proxy; MCP servers and hooks inherit that env). Indexing stays local.
-const ANTHROPIC = /^(?:https?:\/\/)?(?:api\.anthropic\.com|localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i;
+// A localhost proxy (claude-code-router, LiteLLM…) usually fronts another model: refused like privateOk (MEMHUB_ALLOW_BACKEND opts one in).
+const ANTHROPIC = /^(?:https?:\/\/)?api\.anthropic\.com(?::\d+)?(?:\/|$)/i;
 
 /** Host of a non-Anthropic backend to refuse (only with MEMHUB_ANTHROPIC_ONLY=1), else null. */
 export function offsiteBackend(env: NodeJS.ProcessEnv = process.env): string | null {

@@ -212,7 +212,7 @@ function graphOf(db: pg.Pool): Promise<Graph> {
 }
 
 export type Seed = { chunkId: string; a: number; sourceId?: number };
-export type AssocFilters = { project?: string; since?: string; until?: string; before?: Date; own?: { since: Date; tool: string; project: string } };
+export type AssocFilters = { project?: string; since?: string; until?: string; asOf?: string; kind?: string; before?: Date; own?: { since: Date; tool: string; project: string } };
 export type AssocChunk = { id: string; source_id: string; turn_uuid: string; ts: Date | null; project: string; session_id: string; text: string;
   tool: string; src_kind: string; status: string | null; fid: string | null; kind: string | null; fact_project: string | null;
   superseded_by: string | null; review_target: string | null };
@@ -267,21 +267,27 @@ export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[];
   const top = [...act].filter(([id, x]) => !shown.has(id) && x.a >= theta).sort((p, q) => q[1].a - p[1].a || p[0] - q[0]).slice(0, limit * 3);
   if (!top.length) return [];
   const { since, until } = dateRange(f.since, f.until);
+  const asOf = f.asOf ? dateRange(undefined, f.asOf, 'as_of').until : null;
   const fetchLimit = o.currentProject ? limit * 3 : limit;
   const rows = (await db.query(`
-    SELECT o.ord, c.id, c.source_id, c.turn_uuid, c.ts, c.project, c.session_id, c.text, s.tool, s.kind src_kind, s.status,
-           fa.fid, fa.kind, fa.project fact_project, fa.superseded_by, fa.review_target, 1 - (c.embedding <=> $12::halfvec) sim
+    SELECT o.ord, c.id, c.source_id, c.turn_uuid, c.ts, c.project, c.session_id, c.text, s.tool, s.kind src_kind,
+           CASE WHEN $14::timestamptz IS NOT NULL AND s.status = 'superseded' THEN 'active' ELSE s.status END AS status,
+           fa.fid, fa.kind, fa.project fact_project, CASE WHEN $14::timestamptz IS NOT NULL THEN NULL ELSE fa.superseded_by END AS superseded_by,
+           fa.review_target, 1 - (c.embedding <=> $12::halfvec) sim
     FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY o(src, via, ord) JOIN sources s ON s.id = o.src LEFT JOIN facts fa ON fa.source_id = o.src
     CROSS JOIN LATERAL (
       SELECT c.* FROM chunks c WHERE c.source_id = o.src
         AND ($3::text IS NULL OR c.project LIKE '%' || $3 || '%' OR o.src IN (SELECT source_id FROM facts WHERE project LIKE '%' || $3 || '%' OR scope = 'global'))
         AND ($4::timestamptz IS NULL OR c.ts >= $4) AND ($5::timestamptz IS NULL OR c.ts < $5) AND ($6::timestamptz IS NULL OR c.ts < $6)
+        AND ($14::timestamptz IS NULL OR c.ts < $14 OR fa.fid IS NOT NULL)
         AND ($7::timestamptz IS NULL OR c.ts < $7 OR c.project IS DISTINCT FROM $8 OR s.tool <> $9)
       ORDER BY c.embedding <=> coalesce($12::halfvec, (SELECT embedding FROM chunks WHERE id = o.via)) NULLS LAST, c.seq_from, c.id LIMIT 1) c
     WHERE coalesce(s.hide_as, s.tool) <> ALL($10::text[]) AND s.status IS DISTINCT FROM 'rejected'
+      AND ($13::text IS NULL OR ($13 = 'chat' AND s.tool <> 'obsidian') OR ($13 = 'note' AND s.tool = 'obsidian' AND fa.fid IS NULL) OR fa.kind = $13)
+      AND ($14::timestamptz IS NULL OR fa.fid IS NULL OR (fa.valid_at < $14 AND (fa.invalid_at IS NULL OR fa.invalid_at > $14) AND (fa.expired_at IS NULL OR fa.expired_at > $14) AND NOT (s.status = 'superseded' AND fa.invalid_at IS NULL AND fa.expired_at IS NULL)))
     ORDER BY o.ord LIMIT $11`,
   [top.map(([id]) => id), top.map(([, x]) => x.viaChunk), f.project?.toLowerCase() || null, since, until, f.before ?? null,
-    f.own?.since ?? null, f.own?.project ?? null, f.own?.tool ?? null, o.hide, fetchLimit, o.qvec ?? null])).rows;
+    f.own?.since ?? null, f.own?.project ?? null, f.own?.tool ?? null, o.hide, fetchLimit, o.qvec ?? null, f.kind ?? null, asOf])).rows;
   const out = rows.map(({ ord, sim, ...chunk }) => {
     const x = top[Number(ord) - 1][1];
     const scale = isOtherProject(chunk, f.project ? undefined : o.currentProject, o.query) ? RANK.otherProject : 1;

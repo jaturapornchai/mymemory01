@@ -45,6 +45,14 @@ const stripReminders = (t: string) => t.replace(/<system-reminder>[\s\S]*?<\/sys
 
 // memory-hub's own tools (any MCP server name): their replies are never indexed, only scanned (importer: Claude-only hits)
 const HUB_TOOL = /__memory_(?:search|get|related|timeline)$/;
+// claude.ai Gmail / Drive / Calendar reads (server named by a uuid, or claude_ai_* in the CLI): Google data is Claude-only
+const GOOGLE_READS = 'search_threads|get_thread|get_message|list_drafts|get_draft|search_files|read_file_content|download_file_content|get_file_metadata|list_recent_files|list_events|get_event|search_events';
+const GOOGLE_TOOL = new RegExp(`^mcp__(?:claude_ai_\\w+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})__(?:${GOOGLE_READS})$`);
+const MAY_HUB = new RegExp(`__memory_|__(?:${GOOGLE_READS})"`);
+/** pushed onto hub when the chat read Google data itself: importer hides the session as 'google'. */
+export const GOOGLE_HIT = '\0google';
+/** cheap pre-check on raw transcript text: could parseClaude collect a hub? */
+export const mayHub = (raw: string) => MAY_HUB.test(raw);
 
 /** Parse one transcript file's text. `toolNames` persists across calls for incremental (offset) parsing.
  *  hub: collects memory-hub tool inputs and replies (ids it was given / shown), for importer.indexFile. */
@@ -88,6 +96,7 @@ export function parseClaude(raw: string, toolNames = new Map<string, string>(), 
         else if (b?.type === 'tool_use') {
           if (typeof b.id === 'string') toolNames.set(b.id, String(b.name));
           if (HUB_TOOL.test(String(b.name))) hub?.push(JSON.stringify(b.input ?? ''));
+          else if (GOOGLE_TOOL.test(String(b.name))) hub?.push(GOOGLE_HIT);
           const l = toolLine(String(b.name), b.input);
           if (l) parts.push(l);
         }

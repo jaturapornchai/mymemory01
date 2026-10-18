@@ -6,7 +6,7 @@
 import type pg from 'pg';
 import { embedQuery, toVec } from './embed.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
-import { projectName } from './importer.ts';
+import { catchAll, CMD_LINE, projectName, projectTree, sameTree } from './importer.ts';
 import { bigramQuery, normalize, queryTerms, words } from './thai.ts';
 
 export type Hit = {
@@ -18,7 +18,12 @@ export type Hit = {
   tool: string;                            // claude | codex | … | obsidian | github
   ev_of: string[] | null;                  // raw chat: ids of candidate facts distilled from its turns
   evidence?: Hit[];                        // fact: its source chat chunks among the results (shown under it, no slot of their own)
+  flags?: string[]; notes?: string[];      // accuracy.ts flagsFor (memory_search): CONFLICT / STALE / pending fix tags; note + alias lines
+  layer?: Layer; why?: string;             // layers(): what the calling AI may do with it, and the verdict behind a ✗ / a warning
 };
+/** use = ✓ใช้ได้ (a current curated fact of this project tree or global: decide from it), memo = บันทึก (chats, cards, notes,
+ *  repos, pending fixes, other projects: what happened, evidence), old = ✗เลิกใช้ (replaced or outdated: do not follow). */
+export type Layer = 'use' | 'memo' | 'old';
 /** familiarity of a query (metamemory, not used by ranking): cosine of vector hit 1 / 10 / mean of the top 60, the best keyword
  *  chunk's share of the query's IDF, and the IDF share of Latin words no visible chunk has ever held. Only for a query that names a
  *  catalogued project (h = 1): agree = how many of the vector top 10 are also in the words top 60, pun = IDF share of its other
@@ -47,7 +52,9 @@ export type Result = { hits: Hit[]; semantic: boolean; qvec?: string | null; sig
 // own: hide only the caller's own live session — chunks newer than own.since from sources of own.tool in own.project;
 //   other apps and the same app's other projects stay findable (before would hide them too).
 // since/until: ISO dates (dateRange), a hard filter in every leg.
-export type SearchOpts = { project?: string; since?: string; until?: string; limit?: number; currentProject?: string; before?: Date; semantic?: boolean; perSession?: number;
+export const SEARCH_KINDS = ['rule', 'feedback', 'decision', 'preference', 'howto', 'fact', 'card', 'insight', 'chat', 'note'] as const;
+export type SearchKind = (typeof SEARCH_KINDS)[number];
+export type SearchOpts = { project?: string; since?: string; until?: string; asOf?: string; kind?: string; limit?: number; currentProject?: string; before?: Date; semantic?: boolean; perSession?: number;
   own?: { since: Date; tool: string; project: string };
   tier?: number;      // priority boost τ (default RANK.tier); dream's neighbour lookup passes 0 = pure similarity
   now?: Date;         // anchor of relative time in the query (timeWindow); default before ?? now (eval: the frozen clock)
@@ -72,7 +79,7 @@ const PER_SESSION = 3;       // diversity: a long session must not fill every sl
 //     t1 = days since last reference (content time or last recall), tn = days since content time, n = sessions that recalled it
 //   p_imp = 1 for pinned / rule / feedback facts, (importance−1)/9 for other facts, 0 for raw chats/notes/cards
 //   status: superseded ×0.5, pending ×0.8, rejected excluded.  Design + sources: docs/research/phase4-design.md §2
-//   tier (priority order, ลุงจืด 2026-10-02): rule/feedback/pinned/hand-saved +2 · other facts +1 · cards, chats of any app
+//   tier (priority order, ลุงจืด 2026-10-02, cards 2026-10-18): rule/feedback/pinned/hand-saved +2 · other facts +1 · cards +0.5 · chats of any app
 //     and kind, GitHub docs (repo card/commits/issues), Obsidian notes, superseded facts 0 · daily notes −1 (daily.ts: a
 //     digest of chats already indexed; tier 0 let it take slots from the chats it lists).  τ = 0.1 → ×1.21: a chat found by more legs still wins.  Eval (tune split):
 //     boosting cards pushed the exact turn below its session summary; boosting OLD facts put more of them in the top 10;
@@ -98,7 +105,15 @@ export const RANK = {
   foldDup: Number(process.env.MEMHUB_RANK_FOLD_DUP ?? 0.5), // a source chat repeating ≥ this share of its fact (char 5-grams) folds
   inProject: Number(process.env.MEMHUB_RANK_IN_PROJECT ?? 3.0), // currentProject match boost
   otherProject: Number(process.env.MEMHUB_RANK_OTHER_PROJECT ?? 0.35), // non-currentProject penalty (global/personal stay 1.0)
+  opsCmd: Number(process.env.MEMHUB_RANK_OPS_CMD ?? 1.5),   // ops query: howto/rule facts and chats that ran commands
+  opsRepo: Number(process.env.MEMHUB_RANK_OPS_REPO ?? 0.5), // ops query: a GitHub repo card (README, no steps)
 };
+
+// ลุงจืด 2026-10-18: "deploy server ssh systemctl X" ranked X's README repo card over the chats that ran the commands
+const OPS_QUERY = /\b(?:deploy\w*|ssh|scp|rsync|systemctl|service|nginx|docker|pm2|port|env)\b|ดีพลอย|เซิร์ฟเวอร์/i;
+const isRepo = (h: Pick<Hit, 'tool' | 'session_id'>) => h.tool === 'github' && !/#\d+$|:commits$/.test(h.session_id ?? '');
+const opsFactor = (r: Hit) => (isRepo(r) ? RANK.opsRepo
+  : (r.fid && (r.kind === 'howto' || r.kind === 'rule')) || (!r.fid && CMD_LINE.test(r.text)) ? RANK.opsCmd : 1);
 
 /** True if query explicitly names projName (≥ 3 chars) as a token/substring. */
 export function queryNamesProject(query: string | undefined, projName: string): boolean {
@@ -108,12 +123,12 @@ export function queryNamesProject(query: string | undefined, projName: string): 
   return /^[a-z0-9_-]+$/.test(p) ? ql.split(/[^a-z0-9_-]+/).includes(p) : ql.includes(p);
 }
 
-/** True when currentProject is set and hit h belongs to a different code project (not global, general Obsidian note, personal PRIVATE_TOOLS, or explicitly named in query). */
+/** True when currentProject is set and hit h belongs to a different code project (not global, general Obsidian note, personal PRIVATE_TOOLS, same project tree, or explicitly named in query). */
 export function isOtherProject(h: Pick<Hit, 'project' | 'fact_project' | 'fid' | 'tool'>, currentProject?: string, query?: string): boolean {
   if (!currentProject) return false;
   const hp = h.fact_project ?? h.project ?? '';
   if (!hp || (h.fid && !h.fact_project) || (h.tool === 'obsidian' && !h.fid) || PRIVATE_TOOLS.has(h.tool) || hp.startsWith('google/')) return false;
-  if (hp === currentProject) return false;
+  if (sameTree(hp, currentProject)) return false;
   const a = projectName(hp).toLowerCase(), b = projectName(currentProject).toLowerCase();
   if (!a || !b || a === b) return false;
   return !queryNamesProject(query, a);
@@ -143,19 +158,30 @@ export async function hiddenNameMask(db: pg.Pool, hide: string[]): Promise<(s: s
   const re = new RegExp(`\\b(?:${fids.join('|')})\\b[^\\]\\n|…]*`, 'gi');
   return (s) => s.replace(re, '?');
 }
-// hidden sources (PRIVATE_TOOLS for a non-Claude caller) leave every leg, so they never take one of its 60 candidate slots
-const HIDE = (p: string) => `hide AS (${HIDDEN(p)})`;
+// hidden sources (PRIVATE_TOOLS for a non-Claude caller, or sources outside kind / asOf) leave every leg, so they never take one of its 60 candidate slots
+const HIDE = (p: string, kind: string, asOf: string) => `hide AS (
+  ${HIDDEN(p)}
+  UNION ALL SELECT id FROM sources WHERE ${kind}::text IS NOT NULL AND (
+    CASE ${kind}::text
+      WHEN 'chat' THEN tool = 'obsidian'
+      WHEN 'note' THEN tool <> 'obsidian' OR id IN (SELECT source_id FROM facts)
+      ELSE id NOT IN (SELECT source_id FROM facts WHERE kind = ${kind}::text)
+    END)
+  UNION ALL SELECT f.source_id FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${asOf}::timestamptz IS NOT NULL AND (
+    f.valid_at >= ${asOf}::timestamptz OR f.invalid_at <= ${asOf}::timestamptz OR f.expired_at <= ${asOf}::timestamptz
+    OR (s.status = 'superseded' AND f.invalid_at IS NULL AND f.expired_at IS NULL)))`;
 // SearchOpts.own: the caller's live session (newer than since, its project, its app) leaves every leg
 const OWN = (since: string, project: string, tool: string) => `(${since}::timestamptz IS NULL OR ts < ${since}
       OR project IS DISTINCT FROM ${project}::text OR source_id NOT IN (SELECT id FROM sources WHERE tool = ${tool}::text))`;
 const SQL_KEYWORD = `
-WITH ${PF}, ${HIDE('$8')},
+WITH ${PF}, ${HIDE('$8', '$13', '$14')},
 w AS (
   SELECT id, row_number() OVER (ORDER BY s DESC, ts DESC) r, s FROM (
     SELECT id, ts, (SELECT sum(x.idf) FROM unnest($6::tsquery[], $7::float8[]) x(q, idf) WHERE wd @@ x.q) s
     FROM (SELECT id, ts, words || ''::tsvector wd FROM chunks -- words detoasted once per row, not once per query term:
       WHERE $1::text IS NOT NULL AND words @@ $1::tsquery    -- 200 queries: p50/p95/p99 41/155/192 → 29/69/107 ms, same rows
         AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
+        AND ($14::timestamptz IS NULL OR ts < $14 OR source_id IN (SELECT source_id FROM facts))
         AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$10', '$11', '$12')}
       OFFSET 0) c -- OFFSET 0: keeps the subquery (and its one detoast) from being flattened into the scoring
   ) z ORDER BY r LIMIT 60),
@@ -164,15 +190,16 @@ b AS (
   FROM chunks
   WHERE $2::text IS NOT NULL AND bigrams @@ $2::tsquery
     AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
+    AND ($14::timestamptz IS NULL OR ts < $14 OR source_id IN (SELECT source_id FROM facts))
     AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$10', '$11', '$12')}
   ORDER BY r LIMIT 60)
 SELECT 'w' leg, id, r, s FROM w UNION ALL SELECT 'b', id, r, NULL FROM b`; // s: IDF of the query terms a chunk has (signal)
 
 // Vector leg + RRF + priors. The keyword legs come in as (id, rank) arrays in the slots SQL_KEYWORD's own inputs had:
 // $1/$2 words, $8/$9 bigrams; $15 tools to hide (the keyword legs already left them out); $16-$19 timeWindow() boost, $20 the daily-note tier;
-// $21 until: filter only — $7 (before) stays the recency anchor, so a date range never re-ranks by age. $22-$24 own (OWN).
+// $21 until: filter only — $7 (before) stays the recency anchor, so a date range never re-ranks by age. $22-$24 own (OWN); $28 kind, $29 asOf.
 const SQL = `
-WITH ${PF}, ${HIDE('$15')},
+WITH ${PF}, ${HIDE('$15', '$28', '$29')},
 w AS (SELECT * FROM unnest($1::text[], $2::bigint[]) x(id, r)),
 b AS (SELECT * FROM unnest($8::text[], $9::bigint[]) x(id, r)),
 v AS (
@@ -180,7 +207,7 @@ v AS (
     SELECT id, embedding <=> $10::halfvec d FROM chunks
     WHERE $10::text IS NOT NULL AND embedding IS NOT NULL
       AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($7::timestamptz IS NULL OR ts < $7)
-      AND ($21::timestamptz IS NULL OR ts < $21)
+      AND ($21::timestamptz IS NULL OR ts < $21) AND ($29::timestamptz IS NULL OR ts < $29 OR source_id IN (SELECT source_id FROM facts))
       AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$22', '$23', '$24')}
     ORDER BY embedding <=> $10::halfvec LIMIT 60) s),
 f AS (SELECT id, sum(1.0 / (60 + r)) s FROM (SELECT * FROM w UNION ALL SELECT * FROM b UNION ALL SELECT id, r FROM v) x GROUP BY id),
@@ -188,21 +215,27 @@ vs AS (SELECT json_build_object('n', count(*), 'd1', min(d), 'd10', (array_agg(d
          'ag', count(*) FILTER (WHERE r <= 10 AND id IN (SELECT id FROM w))) j FROM v), -- ag: signal.agree, the vector top 10 also in the words top 60
 u AS (SELECT c.id, count(DISTINCT a.session) n, max(a.ts) last  -- recalls keyed by turn (stable across re-chunking)
       FROM f JOIN chunks c USING (id) JOIN access_log a ON a.turn_uuid = c.turn_uuid
-      WHERE a.kind IN ('get', 'related') AND a.ts < coalesce($7, $22::timestamptz, now()) GROUP BY c.id), -- own: not this session's own recalls
+      WHERE a.kind IN ('get', 'related') AND a.ts < coalesce($7, $22::timestamptz, $29::timestamptz, now()) GROUP BY c.id), -- own: not this session's own recalls
 x AS (
-  SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header AS header, c.text, c.source_id, c.seq_from, c.seq_to, s.status, s.tool,
-         s.kind src_kind, coalesce(u.n, 0)::int uses, u.last, fa.fid, fa.kind, fa.project fact_project, fa.superseded_by, fa.review_target,
+  SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header AS header, c.text, c.source_id, c.seq_from, c.seq_to,
+         CASE WHEN $29::timestamptz IS NOT NULL AND s.status = 'superseded' THEN 'active' ELSE s.status END AS status, s.tool,
+         s.kind src_kind, coalesce(u.n, 0)::int uses, u.last, fa.fid, fa.kind, fa.project fact_project,
+         CASE WHEN $29::timestamptz IS NOT NULL THEN NULL ELSE fa.superseded_by END AS superseded_by, fa.review_target,
          fa.source_uuids, f.s rrf,
-         CASE WHEN s.kind = 'daily' OR (s.tool = 'obsidian' AND s.session_id LIKE '%/hubs/%') THEN $20::float8 WHEN fa.fid IS NULL OR fa.kind = 'card' OR s.status = 'superseded' THEN 0
+         CASE WHEN s.kind = 'daily' OR (s.tool = 'obsidian' AND s.session_id LIKE '%/hubs/%') THEN $20::float8
+              WHEN fa.fid IS NULL OR ($29::timestamptz IS NULL AND s.status = 'superseded') THEN 0 WHEN fa.kind = 'card' THEN 0.5
               WHEN fa.pinned OR fa.user_owned OR fa.run IS NULL OR fa.kind IN ('rule', 'feedback') THEN 2 ELSE 1 END tier,
          CASE WHEN $5::text = '' THEN 1
               WHEN c.project = $5 OR fa.project = $5
                 OR proj_basename(coalesce(fa.project, c.project, '')) = proj_basename($5)
-                OR proj_basename(coalesce(fa.project, c.project, '')) = ANY($27::text[]) THEN $25::float8
+                OR proj_basename(coalesce(fa.project, c.project, '')) = ANY($27::text[])
+                OR coalesce(fa.project, c.project, '') = ANY($30::text[]) OR starts_with(coalesce(fa.project, c.project, ''), $31::text || '/') THEN $25::float8 -- sameTree()
+              -- a global fact naming this project (memory_save from an app that sent no cwd: Antigravity, 2026-10-18) is one of it
+              WHEN fa.fid IS NOT NULL AND coalesce(fa.project, '') = '' AND c.words @@ $32::tsquery THEN $25::float8
               WHEN (fa.fid IS NOT NULL AND coalesce(fa.project, '') = '') OR (s.tool = 'obsidian' AND fa.fid IS NULL) OR c.project LIKE 'google/%' THEN 1
               WHEN $3::text IS NULL THEN $26::float8 ELSE 1 END proj,
-         greatest(extract(epoch FROM coalesce($7, now()) - greatest(c.ts, u.last)) / 86400, 1.0 / 24) t1,
-         greatest(extract(epoch FROM coalesce($7, now()) - c.ts) / 86400, 1.0 / 24) tn,
+         greatest(extract(epoch FROM coalesce($7, $29::timestamptz, now()) - greatest(c.ts, u.last)) / 86400, 1.0 / 24) t1,
+         greatest(extract(epoch FROM coalesce($7, $29::timestamptz, now()) - c.ts) / 86400, 1.0 / 24) tn,
          CASE WHEN fa.pinned OR fa.kind IN ('rule', 'feedback') THEN 1
               WHEN fa.kind IN ('decision', 'preference', 'fact', 'howto', 'insight') THEN (coalesce(fa.importance, 5) - 1) / 9.0 ELSE 0 END p_imp
   FROM f JOIN chunks c USING (id) JOIN sources s ON s.id = c.source_id
@@ -221,10 +254,11 @@ ev AS (  -- candidate raw chat → the best candidate active fact distilled from
 z AS (SELECT y.*, greatest(base, (SELECT max(e.base) FROM ev e WHERE e.fact_id = y.id)) * power(1 + $14::float8, tier) score,
              (SELECT array_agg(DISTINCT e.fact_id) FROM ev e WHERE e.raw_id = y.id) ev_of FROM y),
 sup AS (SELECT fx.fid, fx.superseded_by nxt, fx.source_uuids FROM facts fx JOIN sources sx ON sx.id = fx.source_id
-        WHERE sx.status = 'superseded' AND fx.superseded_by IS NOT NULL AND sx.id NOT IN (SELECT id FROM hide))
+        WHERE sx.status = 'superseded' AND fx.superseded_by IS NOT NULL AND sx.id NOT IN (SELECT id FROM hide)
+          AND ($29::timestamptz IS NULL OR coalesce(fx.invalid_at, fx.expired_at) <= $29::timestamptz))
 SELECT y.id, y.turn_uuid, y.ts, y.project, y.session_id, y.header, y.text, y.status, y.src_kind, y.tool, y.uses, y.last, y.fid, y.kind, y.fact_project,
        y.superseded_by, y.review_target, y.score, y.ev_of, (SELECT j FROM vs) vsig,
-       CASE WHEN y.tool <> 'obsidian' THEN (  -- a later-superseded fact never down-ranks its source chats, only annotates them
+       CASE WHEN y.tool <> 'obsidian' THEN (  -- a later-superseded fact annotates its source chats (search() down-ranks them)
          WITH RECURSIVE ch(fid, d) AS (       -- with the current END of each supersede chain (A → B → C: C, never the OLD B)
            SELECT nxt, 1 FROM sup WHERE source_uuids && (
              SELECT array_agg(uuid) FROM turns WHERE source_id = y.source_id AND seq BETWEEN y.seq_from AND y.seq_to)
@@ -238,14 +272,14 @@ const ISO = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[
 /** since/until → SQL bounds, or a clear error (a pg cast error says nothing to the calling AI). A value without a zone is
  *  ลุงจืด's day/clock (Asia/Bangkok, like timeWindow, daily and lint), not pg's session zone (UTC): he works past midnight.
  *  A date-only until is inclusive: ts < the next local midnight. Date part only for since ≤ until. */
-export function dateRange(since?: string, until?: string): { since: string | null; until: string | null } {
-  for (const [k, x] of [['since', since], ['until', until]]) {
+export function dateRange(since?: string, until?: string, untilName = 'until'): { since: string | null; until: string | null } {
+  for (const [k, x] of [['since', since], [untilName, until]]) {
     const d = x?.slice(0, 10) ?? '';
     if (x && (x.length > 30 || !ISO.test(x) || Number.isNaN(Date.parse(x)) || new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) !== d)) {
       throw new Error(`${k} must be an ISO date like 2026-09-01 (got ${JSON.stringify(x.slice(0, 30))})`);
     }
   }
-  if (since && until && since.slice(0, 10) > until.slice(0, 10)) throw new Error(`since ${since} is after until ${until}`);
+  if (since && until && since.slice(0, 10) > until.slice(0, 10)) throw new Error(`since ${since} is after ${untilName} ${until}`);
   const end = until && until.length === 10 ? new Date(Date.parse(`${until}T00:00:00Z`) + 864e5).toISOString().slice(0, 10) : until;
   const local = (x?: string) => !x ? null : /(?:Z|[+-]\d{2}:?\d{2})$/.test(x.slice(10)) ? x : `${x.length === 10 ? `${x}T00:00:00` : x}+07:00`;
   return { since: local(since), until: local(end) };
@@ -285,9 +319,14 @@ async function projectPun(db: pg.Pool, cat: Promise<Named[]> | null, query: stri
 
 export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Promise<Result> {
   const { since, until } = dateRange(o.since, o.until); // first: bad input fails before the embedder or the DB is asked
+  const asOf = o.asOf ? dateRange(undefined, o.asOf, 'as_of').until : null;
+  if (o.kind !== undefined && !(SEARCH_KINDS as readonly string[]).includes(o.kind)) {
+    throw new Error(`kind must be one of ${SEARCH_KINDS.join(', ')} (got ${JSON.stringify(o.kind)})`);
+  }
+  const kind = o.kind ?? null;
   const limit = Math.min(Math.max(o.limit ?? 6, 1), 20); // MCP schema caps callers at 8; eval uses up to 20
   // tier 0 = dream's similarity-only neighbour lookup: no time boost, terms untouched
-  const tw = o.tier === 0 ? { recent: false, rest: query } : timeWindow(query, o.now ?? o.before ?? new Date());
+  const tw = o.tier === 0 ? { recent: false, rest: query } : timeWindow(query, o.now ?? o.before ?? (asOf ? new Date(asOf) : new Date()));
   let kq = tw.rest, terms = queryTerms(kq);
   if (!terms.length) terms = queryTerms((kq = query)); // only a time phrase ('เมื่อวานทำอะไร'): keep its words, as before
   const vec = o.semantic === false ? null : embedQuery(query, EMBED_TIMEOUT_MS).then((e) => e && toVec(e));
@@ -326,14 +365,16 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   const hide = o.showPrivate ? [] : [...PRIVATE_TOOLS];
   const own = [o.own?.since ?? null, o.own?.project ?? null, o.own?.tool ?? null];
   const [legs, v, pj] = await Promise.all([db.query(SQL_KEYWORD, [wq, bigramQuery(kq), project, since, before,
-    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until, ...own]), vec, projectPun(db, cat, query, scored, hide, before)]);
+    scored.map((t) => t.lit), scored.map((t) => t.idf), hide, until, ...own, kind, asOf]), vec, projectPun(db, cat, query, scored, hide, before)]);
   const w = legs.rows.filter((r) => r.leg === 'w'), b = legs.rows.filter((r) => r.leg === 'b');
   const qProjTokens = query.toLowerCase().split(/[^a-z0-9_\u0E00-\u0E7F-]+/).filter((t) => t.length >= 3);
   const rows = (await db.query(SQL, [
     w.map((r) => r.id), w.map((r) => r.r), project, since, o.currentProject ?? '', Math.max(limit, 8) * 3, // ≥ 24 rows: same curated slot at every limit
     before, b.map((r) => r.id), b.map((r) => r.r), v,
     RANK.beta, RANK.superseded, RANK.pending, o.tier ?? RANK.tier, hide, tw.from ?? null, tw.to ?? null, tw.from ? T_WIN : 0, tw.recent ? T_REC : 0, RANK.daily, until, ...own,
-    RANK.inProject, RANK.otherProject, qProjTokens,
+    RANK.inProject, RANK.otherProject, qProjTokens, kind, asOf,
+    o.currentProject ? projectTree(o.currentProject) : [], o.currentProject && !catchAll(o.currentProject) ? o.currentProject : null,
+    nameQuery(o.currentProject),
   ])).rows;
   // Familiarity, apart from rank (RRF is rank-only: an off-topic query scores like a real match): how close the nearest
   // chunks are, and the share of the query's IDF the best keyword chunk carries. Ranking never reads it.
@@ -343,6 +384,10 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     // each term votes "never seen" with its IDF, normalized by the query's total (FlyWire: weight = share of the target's input)
     unseen: idf ? scored.filter((t) => st.unseen.includes(t.key)).reduce((a, t) => a + t.idf, 0) / idf : 0, agree: vs?.ag ?? 0, ...pj };
   for (const r of rows) delete r.vsig;
+  // ลุงจืด 2026-10-18: a chat whose decision a later fact replaced ranks like an OLD fact (×superseded); stable sort keeps the SQL ties
+  for (const r of rows) if (r.changed_to && !r.fid) r.score = Number(r.score) * RANK.superseded;
+  if (o.tier !== 0 && OPS_QUERY.test(query)) for (const r of rows) r.score = Number(r.score) * opsFactor(r);
+  rows.sort((a, b) => Number(b.score) - Number(a.score));
   const ci = rows.slice(0, 24).findIndex((r) => r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active'
     && !isOtherProject(r, project ? undefined : o.currentProject, query));
   if (ci >= RANK.slot && Number(rows[ci].score) >= RANK.slotRatio * Number(rows[0].score)) rows.splice(RANK.slot - 1, 0, ...rows.splice(ci, 1));
@@ -352,6 +397,8 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   for (const r of rows) {
     // dedupe: a fact ranks at or above its own source chats (tier ≥ 1 > chat tiers) → attach them to it instead of a slot,
     // except a chat that would get a slot anyway and mostly says something else (judge-03: folding cut half the answer)
+    // a long fact is several chunks: one slot (it prints from its head; memory_get prints it whole), not 3 of the same id
+    if (r.fid && hits.some((h) => h.fid === r.fid)) { why?.set(r.id, `dup:${r.fid}`); continue; }
     const fact = r.ev_of && hits.find((h) => r.ev_of.includes(h.id));
     const n = perSession.get(r.session_id) ?? 0;
     const room = hits.length < limit && n < (o.perSession ?? PER_SESSION);
@@ -362,12 +409,100 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
     perSession.set(r.session_id, n + 1);
     hits.push({ ...r, score: Number(r.score) });
   }
+  if (o.tier !== 0) await layers(db, hits, query, project ? undefined : o.currentProject, hide,
+    PAST.test(query) || !!(asOf || o.since || o.until || tw.from));
   const explain: Explain | undefined = o.explain ? { corpus: n, unseen: st.unseen, fused: rows.length,
     rows: rows.map((r) => ({ id: r.id, score: Number(r.score), why: why!.get(r.id) ?? 'hit' })),
     time: tw.from || tw.recent ? { from: tw.from?.toISOString() ?? null, to: tw.to?.toISOString() ?? null, recent: tw.recent } : null,
     terms: scored.map((t) => ({ key: t.key, df: t.df, used: cand.includes(t) })),
     kw: w.map((r) => [r.id, Number(r.r)]), bi: b.map((r) => [r.id, Number(r.r)]) } : undefined;
   return { hits, semantic: v !== null, qvec: v, signal, explain };
+}
+
+/** tsquery of the current project's folder name (≥ 4 chars, not a catch-all cwd), or null. */
+function nameQuery(p?: string): string | null {
+  const t = p && !catchAll(p) ? queryTerms(projectName(p)) : [];
+  return t.length && t.map((x) => x.key).join('').length >= 4 ? t.map((x) => x.lit).join(' & ') : null;
+}
+
+// a question about the past ("เคยใช้อะไร", as_of, a date range, "เมื่อวาน"): the record is the answer → no reordering
+const PAST = /เคย|ครั้งก่อน|ครั้งที่แล้ว|ก่อนหน้านี้|ประวัติ|เดิมที|\b(?:last time|used to|previously|history)\b/i;
+export const GAP_DAYS = 7;
+/** he said it: a memory_save note (only obs: uuids) or a cited turn of his (the rest = AI-only, as hit lines label it). */
+export const SAID = (f: string) => `(NOT EXISTS (SELECT 1 FROM unnest(${f}.source_uuids) x WHERE x NOT LIKE 'obs:%')
+  OR EXISTS (SELECT 1 FROM unnest(${f}.source_uuids) u(uuid) JOIN turns t ON t.uuid = u.uuid WHERE t.role = 'user'))`;
+/** his words for a verdict: SAID, or his own fact (user_owned: a rule/feedback, pinned, edited). */
+export const HIS = (f: string) => `(${f}.user_owned OR ${SAID(f)})`;
+const SQL_VERDICT = `
+SELECT fa.fid, fa.valid_at, ${HIS('fa')} his,
+  coalesce((SELECT json_agg(json_build_object('b', fb.fid, 't', fb.valid_at, 'on', st.v->'on'->>(w.i::int - 1), 'his', ${HIS('fb')}))
+    FROM state st CROSS JOIN LATERAL jsonb_array_elements_text(st.v->'with') WITH ORDINALITY w(o, i)
+    JOIN facts fb ON fb.fid = w.o JOIN sources sb ON sb.id = fb.source_id
+    WHERE st.k = 'conflict:' || fa.fid AND coalesce(sb.status, 'active') = 'active' AND coalesce(sb.hide_as, sb.tool) <> ALL($2::text[])), '[]') newer
+FROM facts fa WHERE fa.fid = ANY($1::text[])`;
+
+/** ลุงจืด 2026-10-18 "ต้องสื่อสารกับ AI ที่เรียก MCP ว่าตัวไหนใช้ ไม่ใช้ หรือเป็น memo": each hit's Layer, and the hits already
+ *  chosen listed ✓ → บันทึก → ✗ (stable within each) unless `keep` (a question about the past). ✗ also: a chat whose decision a
+ *  later fact replaced; the older side of a CONFLICT whose other side is his words and > 7 days newer (AI-only newer: a note,
+ *  no ✗); an older hit naming what a current fact of his says เลิกใช้ (AI-only fact: a note). One query, only when ✓ facts. */
+async function layers(db: pg.Pool, hits: Hit[], query: string, currentProject: string | undefined, hide: string[], keep: boolean) {
+  for (const h of hits) h.layer = layerOf(h, currentProject, query);
+  const cur = hits.filter((h) => h.layer === 'use');
+  const info = new Map(cur.length ? (await db.query(SQL_VERDICT, [cur.map((h) => h.fid), hide])).rows.map((r) => [r.fid as string, r]) : []);
+  const when = (h: Hit) => new Date(info.get(h.fid!)?.valid_at ?? h.ts ?? 0).getTime();
+  for (const h of cur) for (const n of info.get(h.fid!)?.newer ?? []) {
+    const exact = (new Date(n.t).getTime() - when(h)) / 864e5, gap = Math.round(exact); // compare exact: 7 d 33 min is over 7 days
+    if (exact <= GAP_DAYS || h.why) continue;
+    if (n.his) { h.layer = 'old'; h.why = `น่าจะเลิกใช้: [${n.b}] ${day(new Date(n.t))} ใหม่กว่า ${gap} วัน (คำลุงจืด) ขัดกันเรื่อง ${n.on}`; }
+    else h.why = `ขัดกับ [${n.b}] ${day(new Date(n.t))} ที่ใหม่กว่า ${gap} วัน แต่เป็น AI-only: ยังใช้ได้ ถามลุงจืดก่อนเลือก`;
+  }
+  const own = projectName(currentProject ?? '').toLowerCase();
+  for (const f of cur) {
+    if (f.layer !== 'use') continue;
+    const his = info.get(f.fid!)?.his, at = when(f);
+    for (const name of deprecatedNames(f.text).filter((n) => n !== own))
+      for (const h of hits) if (h !== f && !h.why && h.layer !== 'old' && when(h) < at && h.text.toLowerCase().includes(name)) {
+        if (his) { h.layer = 'old'; h.why = `น่าจะเลิกใช้: [${f.fid}] ${day(new Date(at))} บอกว่า ${name} เลิกใช้แล้ว`; }
+        else h.why = `ตรวจก่อนใช้: [${f.fid}] ${day(new Date(at))} (AI-only) บอกว่า ${name} เลิกใช้แล้ว`;
+      }
+  }
+  // ✓ goes first: a rule / howto / decision always (ลุงจืด: "always shown on top"); another kind only when it answers the
+  // query: close to the best hit (the curated slot's bar) and holding ≥ half the query words. A fact matching 1 of 4 stays
+  // where its score put it, among the records, still labelled ✓
+  const top = Math.max(...hits.map((h) => Number(h.score) || 0)), terms = queryTerms(query).map((t) => t.key);
+  const answers = (h: Hit) => LEAD.has(h.kind!) || (Number(h.score) >= RANK.slotRatio * top
+    && ((low) => terms.filter((k) => low.includes(k)).length * 2 >= terms.length)(normalize(h.text)));
+  const rank = (h: Hit) => (h.layer === 'use' && !answers(h) ? ORDER.memo : ORDER[h.layer!]);
+  if (!keep) hits.sort((a, b) => rank(a) - rank(b));
+}
+const ORDER: Record<Layer, number> = { use: 0, memo: 1, old: 2 };
+const LEAD = new Set(['rule', 'howto', 'decision']);
+export const LABEL: Record<Layer, string> = { use: '✓ใช้ได้', memo: 'บันทึก', old: '✗เลิกใช้' };
+/** The layer from the hit alone: ✗ replaced (superseded fact, chat whose decision later changed), ✓ a current fact or
+ *  rule of this project or global (not a session card / insight / one under review), บันทึก the rest. */
+export const layerOf = (h: Hit, currentProject?: string, query?: string): Layer => h.status === 'superseded' || (h.changed_to && !h.fid) ? 'old'
+  : h.fid && h.kind !== 'card' && h.kind !== 'insight' && (h.status ?? 'active') === 'active' && !isOtherProject(h, currentProject, query) ? 'use' : 'memo';
+
+const NAME = /[a-z0-9][\w.:/-]*[a-z0-9]/gi;
+// only a name that points at one thing: a domain / host / file / package.module (a dot, a letter), an IPv4, :port allowed.
+// Plain words were 150 of the 160 names read from 2,436 live facts (claude, mongodb, setup, cache…): "เลิกใช้ mongodb" in one
+// project would ✗ every older hit naming it (2026-10-18)
+const IDENT = /^(?:(?=[^.]*[a-z])[a-z0-9-]+(?:\.[a-z0-9-]+)+|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/i;
+/** What a fact says is no longer used: the name at "X เลิกใช้แล้ว" / "เลิกใช้ X" / "ไม่ใช้ X แล้ว" / "X ไม่ใช้แล้ว" / "ใช้ A แทน X" /
+ *  "X deprecated" on the cue's own line (the token next to the cue), when it is an IDENT. Thai-only names are not read. */
+export function deprecatedNames(text: string): string[] {
+  const out = new Set<string>();
+  const add = (n?: string) => { if (n && IDENT.test(n)) out.add(n.toLowerCase()); };
+  const names = (s: string) => [...s.matchAll(NAME)].map((m) => m[0]);
+  for (const line of text.split('\n')) {
+    for (const m of line.matchAll(/ไม่ใช้\s*`?([a-z0-9][\w.:/-]*[a-z0-9])`?\s*(?:อีก)?(?:ต่อไป)?แล้ว/gi)) add(m[1]);
+    for (const m of line.matchAll(/เลิกใช้|ไม่ใช้แล้ว|deprecated|แทน(?:ที่)?/gi)) {
+      const before = names(line.slice(Math.max(0, m.index - 40), m.index)).at(-1), rest = line.slice(m.index + m[0].length);
+      const next = /^\s*[`'"(]?([a-z0-9][\w.:/-]*[a-z0-9])/i.exec(rest)?.[1];
+      add(/^แทน/.test(m[0]) ? names(rest.slice(0, 40))[0] : /^ไม่ใช้แล้ว$/.test(m[0]) ? before : (next ?? before));
+    }
+  }
+  return [...out];
 }
 
 // Relative time → a soft boost on the fused rows (never a filter): ts in the window ×(1 + T_WIN); recency words ×(1 + T_REC·(1 −
@@ -452,11 +587,44 @@ export function snippet(text: string, query: string, max = 400): string {
   const low = normalize(flat);
   const terms = words(query).sort((a, b) => b.length - a.length);
   const at = terms.map((t) => low.indexOf(t)).find((i) => i >= 0) ?? 0;
-  const start = Math.max(0, Math.min(at - Math.floor(max / 4), flat.length - max));
-  return (start > 0 ? '…' : '') + flat.slice(start, start + max) + (start + max < flat.length ? '…' : '');
+  const [s, e] = keepCmd(text, flat.length, at, Math.max(0, Math.min(at - Math.floor(max / 4), flat.length - max)), max);
+  return (s > 0 ? '…' : '') + flat.slice(s, e) + (e < flat.length ? '…' : '');
 }
 
-export const day = (d: Date | null) => (d ? new Date(d).toISOString().slice(0, 10) : '????-??-??');
+// ลุงจืด 2026-10-18: a recalled `[shell] ssh … && systemctl restart …` cut mid-command is useless to re-run
+const CMD_MAX = 350;
+const TURN_HEAD = /^(?:[A-Z]: |\[[A-Za-z][\w -]*\] )/;
+/** The window [s, e) of the flattened text around flat offset `at` (from `start`, `max` long), moved to hold the whole command
+ *  at `at` when it is ≤ CMD_MAX chars (widened to it when longer than max): a shell tool-call line with its continuation lines
+ *  (a multi-line command, up to the next turn / tool line) or one line inside a ``` fence. */
+export function keepCmd(text: string, flatLen: number, at: number, start: number, max: number): [number, number] {
+  const units: [number, number][] = []; // flat offsets: the text's non-empty lines, each whitespace-collapsed, joined by ' '
+  let pos = 0, fence = false, cmd = false;
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    const s = pos, e = s + line.length, ticks = /^(?:[A-Z]: )?```/.test(line);
+    pos = e + 1;
+    if (fence && !ticks) units.push([s, e]);
+    else if (CMD_LINE.test(line)) { units.push([s, e]); cmd = true; continue; }
+    else if (cmd && !ticks && !TURN_HEAD.test(line)) { units[units.length - 1][1] = e; continue; }
+    cmd = false;
+    if (ticks) fence = !fence;
+  }
+  const unit = units.find(([s, e]) => s <= at && at < e && e - s <= CMD_MAX);
+  if (unit && unit[1] - unit[0] > max) return unit;
+  let s = unit ? Math.max(0, Math.min(unit[0] < start ? unit[0] : unit[1] > start + max ? unit[1] - max : start, flatLen - max)) : start, e = s + max;
+  // another command cut by the window's edge: dropped whole (its first half reads as a complete command); the anchor stays,
+  // and the room a dropped command at the end frees shows what came before
+  const short = units.filter(([u0, u1]) => u1 - u0 <= CMD_MAX);
+  for (const [u0, u1] of short) if (u0 < e && e < u1 && u0 > at) e = u0 - 1;
+  s = Math.max(0, Math.min(s, e - max));
+  for (const [u0, u1] of short) if (u0 < s && s < u1 && u1 < at) s = u1 + 1;
+  return [s, e];
+}
+
+/** YYYY-MM-DD in Thai time (UTC+7): a turn at 02:00 his time is that day, not yesterday (UTC). */
+export const day = (d: Date | null) => (d ? new Date(d).toLocaleDateString('sv-SE', { timeZone: 'Asia/Bangkok' }) : '????-??-??');
 /** Compact age: 5h, 19d, 7mo, 1.5y. */
 export function age(d: Date | null, now = Date.now()): string {
   if (!d) return '?';
@@ -469,7 +637,7 @@ export function age(d: Date | null, now = Date.now()): string {
 /** What a Claude-only hit is: google = Gmail thread (gmail:<id>, google/gmail) / Google Sheets (gsheet:) / Google Docs. */
 export const privateLabel = (h: Pick<Hit, 'tool' | 'project' | 'session_id'>) => h.tool === 'google-timeline' ? 'Google Maps timeline'
   : ((k) => (/gmail/.test(k) ? 'Gmail' : /sheet/.test(k) ? 'Google Sheets' : 'Google Docs'))(`${h.project} ${h.session_id.split(':')[0]}`);
-/** `[id] 2026-09-12 19d proj-a | decision cur | src claude:1a2b3c4d#42 | used 7x, last 2d` — old vs new, where it came from
+/** `[id] 2026-09-12 19d proj-a | ✓ใช้ได้ decision | src claude:1a2b3c4d#42 | used 7x, last 2d` — old vs new, where it came from
  *  (origins(); omitted when not given) and how often it was recalled. */
 export function hitLine(h: Hit, now = Date.now(), o?: Origin): string {
   const proj = projectName(h.fact_project ?? h.project ?? '') || 'global';
@@ -478,11 +646,12 @@ export function hitLine(h: Hit, now = Date.now(), o?: Origin): string {
     : h.src_kind === 'subagent' || h.src_kind === 'headless' ? `${h.src_kind} chat` : 'chat';
   if (h.status === 'superseded') what += ` OLD -> [${h.superseded_by ?? '?'}]`;
   else if (h.status === 'pending') what += ` PENDING-REVIEW vs [${h.review_target ?? '?'}]`;
-  else if (h.kind && h.kind !== 'card' && h.kind !== 'insight') what += ' cur';
-  if (h.changed_to) what += ` (decision here later changed -> [${h.changed_to.join('] [')}])`;
-  const parts = [`[${h.fid && h.kind !== 'card' ? h.fid : h.id}] ${day(h.ts)} ${age(h.ts, now)} ${proj}`, what];
+  if (h.changed_to) what += ` (superseded by [${h.changed_to.join('] [')}]: decision here later changed)`;
+  const parts = [`[${h.fid && h.kind !== 'card' ? h.fid : h.id}] ${day(h.ts)} ${age(h.ts, now)} ${proj}`, `${LABEL[h.layer ?? layerOf(h)]} ${what}`];
+  if (h.why) parts.push(h.why);
   if (o) parts.push(originText(o));
   if (h.uses > 0) parts.push(`used ${h.uses}x, last ${age(h.last, now)}`);
+  if (h.flags?.length) parts.push(h.flags.join(' · '));
   return parts.join(' | ');
 }
 

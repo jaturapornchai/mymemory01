@@ -7,11 +7,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { connect } from './db.ts';
-import { embed, toVec, warmUp } from './embed.ts';
+import { warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
-import { canonicalProject, clean, normProject, projectName } from './importer.ts';
-import { fmStr, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
-import { day, HIDDEN, hitLine, isOtherProject, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
+import { canonicalProject, clean, normProject, projectName, resolveProjectChain } from './importer.ts';
+import { redact } from './redact.ts';
+import { aliasRe, conflictPairs, factTexts, type Flags, flagsFor, identityOf, locations, nearFacts, userSaid } from './accuracy.ts';
+import { fmStr, isEdited, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
+import { day, HIDDEN, hitLine, isOtherProject, keepCmd, LABEL, layerOf, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, SEARCH_KINDS, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
@@ -52,7 +54,8 @@ function logAccess(kind: 'search' | 'get' | 'related', rows: { id: string; turn_
   ).catch(() => {});
 }
 
-const text = (t: string) => ({ content: [{ type: 'text' as const, text: t }] });
+// every tool reply passes here: rows indexed before a redact rule existed (or a sync that has not re-imported them yet) never leave raw
+export const text = (t: string) => ({ content: [{ type: 'text' as const, text: redact(t).text }] });
 const OFFSITE = `memory-hub is off in this session: its model backend (${offsite}) is not Anthropic and MEMHUB_ANTHROPIC_ONLY=1 is set.`;
 /** Which AI app is calling (MCP clientInfo.name: claude-code, codex-mcp-client, gemini-cli-mcp-client, …). */
 const client = () => server.server.getClientVersion()?.name ?? 'unknown';
@@ -66,24 +69,6 @@ const FID = /^[FSI][0-9a-f]{8}$/;
 const run = promisify(execFile);
 /** SQL on facts f / sources s: a fact this caller may see: not a hidden tool's note, not dreamed from a hidden chat (lint.ts PUBLIC_FACT). */
 const factVisible = (p: string) => `coalesce(s.hide_as, s.tool) <> ALL(${p}::text[]) AND NOT EXISTS (SELECT 1 FROM sources h WHERE h.session_id = ANY(f.session_ids) AND coalesce(h.hide_as, h.tool) = ANY(${p}::text[]))`;
-
-/** memory_save hint: ≤2 active facts of the same kind in this project (or global) that say nearly the same: cosine ≥ 0.85, or
- *  ≥ 60 % shared words (embedder down > 1.5 s, or the fact not embedded yet). Never replaces anything itself. */
-async function similar(content: string, kind: string, project: string, hide: string[], skip: string[]) {
-  const vec = await embed([content], 1500).then((e) => toVec(e[0]), () => null);
-  const rows = (await db.query(
-    `SELECT f.fid, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1) txt,
-            1 - ((SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) <=> $5::halfvec) sim
-     FROM facts f JOIN sources s ON s.id = f.source_id
-     WHERE f.kind = $1 AND (f.project = $2 OR f.scope = 'global') AND coalesce(s.status, 'active') = 'active' AND f.fid <> ALL($3)
-       AND ${factVisible('$4')} ORDER BY sim DESC NULLS LAST, f.created_at DESC LIMIT 300`, [kind, project, skip, hide, vec])).rows;
-  const bag = (t: string) => new Set(words(t));
-  const mine = bag(content);
-  const overlap = (t: string) => { const b = bag(t); let n = 0; for (const w of b) if (mine.has(w)) n++; return n / Math.max(1, new Set([...mine, ...b]).size); };
-  return rows.map((r) => ({ fid: r.fid as string, sim: r.sim as number | null, txt: String(r.txt ?? '').replace(/^# [^\n]*\n/, '').split('\n\n- ')[0] }))
-    .filter((r) => (r.sim ?? 0) >= 0.85 || overlap(r.txt) >= 0.6).slice(0, 2)
-    .map((r) => ({ fid: r.fid, txt: r.txt.replace(/\s+/g, ' ').trim().slice(0, 60) }));
-}
 
 /** Chunk for a search id (hex prefix) or a fact id (F/S/I + 8 hex); not one of the hidden tools' sources. */
 async function chunkOf(id: string, hide: string[]) {
@@ -114,7 +99,10 @@ server.registerTool(
       'Search ลุงจืด\'s past AI sessions (Claude Code, Codex, Gemini, Antigravity, ZCode, LM Studio), notes, GitHub (repos, commits, issues/PRs) and facts (Thai+English+code). Use when he refers to the past ("เคย", ' +
       '"ครั้งก่อน", "last time"), before R0/R1 actions, when unsure of a project fact, or for an earlier command/login/deploy step (past tool calls are indexed: ' +
       'search here, not old transcript files); since+until = a date range. ≤8 snippets with ids, age, use count; ' +
-      'OLD = superseded. Priority order: curated rules/facts first, raw chats are evidence (↳ = the chat a fact came from); ' +
+      'Line 1 = now (Thai time): judge each date against it. Each hit is labelled for you: ✓ใช้ได้ = a current curated rule/fact, act on it; ' +
+      'บันทึก = a record (chat, note, session card, other project): evidence, check it against ✓ before acting; ✗เลิกใช้ = replaced or ' +
+      'outdated (OLD -> its replacement, or the reason after it): do not follow it. Listed ✓ → บันทึก → ✗ (a question about the past keeps rank order); ' +
+      '⚠CONFLICT = two facts disagree: the dates say which is newer, ask him if unsure. ↳ = the chat a fact came from; ' +
       'src = where a hit came from, cite it when you rely on it (app:session#turn, github:repo@sha, note:path; a fact: its source turn + date, ' +
       '×N = sessions behind it, AI-only = no turn of his says it, memory_save = he said remember); ' +
       'memory_get(id) only when a snippet is not enough (each get ≈1-3k tokens; full snippets usually answer). detail:"brief" = one line ' +
@@ -123,19 +111,21 @@ server.registerTool(
     inputSchema: {
       query: z.string().min(1).max(300).describe('keywords or a short question, Thai or English'),
       project: z.string().max(200).optional().describe('filter: substring of project path, e.g. "proj-a"'),
+      kind: z.enum(SEARCH_KINDS).optional().describe('filter: rule | feedback | decision | preference | howto | fact | card | insight | chat | note'),
       since: z.string().max(30).optional().describe('ISO date, e.g. 2026-09-01'),
       until: z.string().max(30).optional().describe('ISO date, inclusive'),
+      as_of: z.string().max(30).optional().describe('point-in-time ISO date: only knowledge valid at that time (facts superseded later appear active)'),
       limit: z.number().int().min(1).max(15).optional().describe('default 6, at most 8 hits are returned'),
       detail: z.enum(['brief', 'full']).optional().describe('default full'),
     },
     annotations: { readOnlyHint: true },
   },
-  async ({ query, project, since, until, limit, detail }) => {
+  async ({ query, project, kind, since, until, as_of, limit, detail }) => {
     const t0 = performance.now();
     const no = off(); if (no) return text(no);
     const brief = detail === 'brief';
     const n = limit && Math.min(limit, 8); // ≤ 8 hits in both modes; default = search()'s 6
-    const filters = { project, since, until, ...freshness() };
+    const filters = { project, kind, since, until, asOf: as_of, ...freshness() };
     const curProj = await getProject();
     const scopeProj = project ? undefined : curProj;
     const res = await search(db, query, { ...filters, limit: n, currentProject: curProj, now: new Date(), showPrivate: privateOk(client()) });
@@ -147,14 +137,29 @@ server.registerTool(
       ? compete(res.hits, await proposals(db, res.hits, res.qvec, { hide: hidden(), filters, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), pool: Number(process.env.MEMHUB_COMPETE_POOL ?? 16), currentProject: scopeProj, query })
         .catch(() => ({ props: [], sims: new Map<string, number>() })), { n, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), bonus: Number(process.env.MEMHUB_COMPETE_BONUS ?? 0.3), currentProject: scopeProj, query })
       : res.hits;
+    // an old name of this project in the query ("BC Ai" in a renamed repo) = what the repo is comes first, whatever ranked
+    const [id, loc] = await Promise.all([curProj ? resolveProjectChain(db, curProj).then((c) => identityOf(db, c, hidden())).catch(() => null) : null,
+      locations(db, query, hidden()).catch(() => '')]);
+    if (id?.fid && !kind && id.aliases.some((a) => aliasRe(a).test(query))) {
+      const at = hits.findIndex((h) => h.fid === id.fid && h.kind !== 'card');
+      const top = at >= 0 ? hits.splice(at, 1)[0] : (await db.query(`SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header header, c.text,
+          s.status, s.tool, s.kind src_kind, 0 uses, NULL::timestamptz last, f.fid, f.kind, f.project fact_project, f.superseded_by, f.review_target,
+          NULL::text[] changed_to, NULL::text[] ev_of FROM facts f JOIN chunks c ON c.source_id = f.source_id JOIN sources s ON s.id = f.source_id
+          WHERE f.fid = $1 ORDER BY c.seq_from, c.id LIMIT 1`, [id.fid])).rows[0];
+      if (top) { hits.unshift({ ...top, score: hits[0]?.score ?? 1 }); if (at < 0 && hits.length > (n ?? 6)) hits.pop(); }
+    }
     const ids = hits.map((h) => h.id); // origins after ranking: a citation never moves a hit; a failed lookup only drops the src parts
-    const [og, cost, mask] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined,
-      hiddenNameMask(db, hidden())]);
+    const [og, cost, mask, flags] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined,
+      hiddenNameMask(db, hidden()), flagsFor(db, hits.map((h) => ({ key: h.id, fid: h.kind !== 'card' ? h.fid : null, turn: h.turn_uuid,
+        project: h.fact_project || h.project, ts: h.ts, text: h.text })), hidden()).catch(() => new Map<string, Flags>())]);
+    for (const h of hits) { const f = flags.get(h.id); if (f) { h.flags = f.tags; h.notes = f.lines; } }
     // mask before passage(): its window may start inside a hidden note's [[id title]], after the id the output mask needs
     for (const h of hits) for (const x of [h, ...(h.evidence ?? [])]) x.text = mask(x.text);
     const parts = [brief ? briefText(hits, query, semantic, cost!, og, scopeProj) : searchText(hits, query, semantic, og, scopeProj)];
     // metamemory "ไม่รู้": measured unfiltered and with a project filter (holdout: 0.6 % wrong); a date range never was
-    if (hits.length && !since && !until && unfamiliar(res.signal)) parts.unshift(UNFAMILIAR_HEAD);
+    if (hits.length && !loc && !since && !until && !as_of && !kind && unfamiliar(res.signal)) parts.unshift(UNFAMILIAR_HEAD);
+    if (loc) parts.unshift(loc); // "X อยู่ไหน": the paths/repos tool calls named, before the hits
+    parts.unshift(nowLine()); // ลุงจืด 2026-10-18 "ควรมีวัน เวลา ai จะได้เข้าใจ": ages and dates are read against it
     const linked = process.env.MEMHUB_ASSOC === '1' && hits.length ? await associate(db, hits.slice(0, 3).map((h) => ({ chunkId: h.id, a: h.score / hits[0].score })),
       { hide: hidden(), exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters, currentProject: scopeProj, query }).catch(() => []) : [];
     for (const r of linked) r.chunk.text = mask(r.chunk.text);
@@ -202,11 +207,14 @@ const factBody = (t: string) => t.replace(/^D: # [FSI][0-9a-f]{8}[^\n]*\n?/, '')
 export const UNFAMILIAR_HEAD = 'ไม่รู้ (not in memory): nothing stored matches this query. Tell the user memory has no record of it; do not answer from ' +
   'the near misses below unless one clearly is the thing asked.';
 
+/** memory_search's first line: the calling model's clock may be off or absent, and every date shown is Thai time. */
+export const nowLine = (d = new Date()) => `ตอนนี้ ${d.toLocaleString('sv-SE', { timeZone: 'Asia/Bangkok' }).slice(0, 16)} (เวลาไทย)`;
+
 /** memory_search reply text — exported so scripts/eval.ts measures exactly what the calling model reads. */
 export function searchText(hits: Hit[], query: string, semantic: boolean, og?: Map<string, Origin>, currentProject?: string): string {
   if (!hits.length) return semantic ? 'no matches' : 'no matches (keyword-only: embedder busy)';
   const max = budgets(hits.length);
-  return (semantic ? '' : '(keyword-only: embedder busy)\n') + hits.map((h, i) => hitText(h, query, max[i], og?.get(h.id), currentProject)).join('\n\n');
+  return (semantic ? '' : '(keyword-only: embedder busy)\n') + hits.map((h, i) => hitText(h, query, max[i], og?.get(h.id), currentProject) + notes(h)).join('\n\n');
 }
 
 /** Chars per result: 400 each, but rank 1 +300 and rank 2 +100, paid evenly by ranks ≥ 3 (≥ 200 each); total unchanged.
@@ -231,13 +239,14 @@ function passage(text: string, query: string, max: number): string {
   const low = normalize(flat), occ: { i: number; k: string }[] = [];
   for (const { key: k } of queryTerms(query)) for (let i = low.indexOf(k); i >= 0; i = low.indexOf(k, i + 1)) occ.push({ i, k });
   const anchor = words(query).sort((a, b) => b.length - a.length).find((t) => low.includes(t));
-  let best = 0, most = -1;
+  let best = 0, most = -1, bestAt = 0;
   for (let i = anchor ? low.indexOf(anchor) : -1; i >= 0; i = low.indexOf(anchor!, i + 1)) {
     const s = Math.max(0, Math.min(i - Math.floor(max / 4), flat.length - max));
     const n = new Set(occ.filter((p) => p.i >= s && p.i + p.k.length <= s + max).map((p) => p.k)).size;
-    if (n > most) { most = n; best = s; }
+    if (n > most) { most = n; best = s; bestAt = i; }
   }
-  return (best > 0 ? '…' : '') + flat.slice(best, best + max) + (best + max < flat.length ? '…' : '');
+  const [s, e] = keepCmd(text, flat.length, bestAt, best, max);
+  return (s > 0 ? '…' : '') + flat.slice(s, e) + (e < flat.length ? '…' : '');
 }
 
 /** One result: line + passage (a fact from its head), then its best source chat (↳) in the rest of its `max` chars.
@@ -253,7 +262,7 @@ export function hitText(h: Hit, query: string, max = 400, o?: Origin, currentPro
   if (!e) return `${hitLine(h, undefined, o)}\n${passage(text, q, max)}`;
   // a source chat whose decision a later fact replaced keeps the warning it has as a result of its own (not when that fact is h)
   const later = e.changed_to?.filter((f) => f !== h.fid) ?? [];
-  const ev = `\n↳ source chat [${e.id}] ${day(e.ts)}${later.length ? ` (later changed -> [${later.join('] [')}])` : ''}` +
+  const ev = `\n↳ source chat [${e.id}] ${day(e.ts)}${later.length ? ` (superseded by [${later.join('] [')}]: later changed)` : ''}` +
     `${more.length ? ` +${more.length} more` : ''}: `;
   // the ↳ header is sized first, so a long one (changed_to ids, +N) shortens the fact, not the total: body + ev + chat ≤ max
   const body = passage(text, q, Math.max(60, Math.min(Math.round((FACT_EV_CHARS * max) / 400), max - ev.length - 60)));
@@ -267,21 +276,24 @@ const BRIEF_HEAD = 'brief: ≈t = est. tokens of memory_get(id); memory_get view
 /** memory_search detail:"brief" text. cost = getTokens() of the hits' chunk ids. */
 export function briefText(hits: Hit[], query: string, semantic: boolean, cost: Map<string, number>, og?: Map<string, Origin>, currentProject?: string): string {
   if (!hits.length) return searchText(hits, query, semantic);
-  return (semantic ? '' : '(keyword-only: embedder busy)\n') + `${BRIEF_HEAD}\n` + hits.map((h) => briefLine(h, query, cost, og?.get(h.id), currentProject)).join('\n');
+  return (semantic ? '' : '(keyword-only: embedder busy)\n') + `${BRIEF_HEAD}\n` + hits.map((h) => briefLine(h, query, cost, og?.get(h.id), currentProject) + notes(h)).join('\n');
 }
+/** flagsFor lines under a hit: the fact it contradicts, his note, the old-name note (a passage cap never cuts them). */
+const notes = (h: Hit) => (h.notes?.length ? `\n${h.notes.join('\n')}` : '');
 
 /** `[id] 2026-09-12 proj-a codex subagent src codex:1a2b3c4d#7 ≈850t ↳[source chat id]: gist` — OLD / PENDING / changed
  *  warnings kept from hitLine; src only when given (origins()). */
 export function briefLine(h: Hit, query: string, cost: Map<string, number>, o?: Origin, currentProject?: string): string {
   const fact = h.fid && h.kind !== 'card', what = whatOf(h);
   const flag = h.status === 'superseded' ? ` OLD -> [${h.superseded_by ?? '?'}]` : h.status === 'pending' ? ` PENDING vs [${h.review_target ?? '?'}]`
-    : h.changed_to ? ` (later changed -> [${h.changed_to.join('] [')}])` : '';
+    : h.changed_to ? ` (superseded by [${h.changed_to.join('] [')}])` : '';
+  const tags = h.flags?.length ? ` [${h.flags.join(' · ')}]` : '';
   const ev = h.evidence?.length ? ` ↳[${h.evidence[0].id}]${h.evidence.length > 1 ? `+${h.evidence.length - 1}` : ''}` : '';
   // brief = cheap: the src tag names the app/kind of a raw hit (what is dropped) and a fact's tag goes without date / ×N
   const src = o ? ` src ${o.tag}${o.ai ? ' AI-only' : ''}` : '';
   const proj = projectName(h.fact_project ?? h.project ?? '') || 'global';
   const outTag = isOtherProject(h, currentProject, query) ? `นอกโปรเจกต์ (เคยคุยใน "${proj}"): ` : '';
-  const head = `[${idOf(h)}] ${day(h.ts)} ${proj}${o && !h.kind ? '' : ` ${what}`}${flag}${src}` +
+  const head = `[${idOf(h)}] ${day(h.ts)} ${proj} ${LABEL[h.layer ?? layerOf(h)]}${o && !h.kind ? '' : ` ${what}`}${flag}${h.why ? ` (${h.why})` : ''}${tags}${src}` +
     ` ≈${cost.get(h.id) ?? '?'}t${ev}: ${outTag}`;
   return (head + passage(fact ? factBody(h.text) : h.text, fact ? '' : query, 100)).slice(0, BRIEF_LINE);
 }
@@ -406,7 +418,9 @@ server.registerTool(
       'He says a memory is wrong → save the corrected text with replaces:[old fid] (from memory_search / session start): the old ' +
       'one is marked OLD at once; his own notes go to his review queue instead. He says "อย่าพูดถึงอีก"/stop bringing it up → ' +
       'mute:[fid] (content not needed): never shown at session start again, still searchable; mute:["-<fid>"] = unmute. ' +
-      'The reply lists very similar existing facts: pass replaces only when he means to replace one.',
+      'A near-duplicate of an existing fact is NOT saved: the reply names it — merge into it with replaces:[fid] (the merged text), ' +
+      'or send confirm_new:true if it is really a new claim. He typed the correction himself in this chat → pass his words as ' +
+      'user_quote: replaces then takes effect at once, even on his own notes (no review queue).',
     inputSchema: {
       content: z.string().min(1).max(4000).optional().describe('the fact/decision/rule, self-contained, in his language (omit only for a mute-only call)'),
       title: z.string().max(80).optional().describe('short note title'),
@@ -414,19 +428,33 @@ server.registerTool(
       global: z.boolean().optional().describe('applies to all projects (default: this project)'),
       replaces: z.array(z.string().regex(FID)).max(10).optional().describe('fids this corrects: they stop counting as current'),
       mute: z.array(z.string().regex(/^-?[FSI][0-9a-f]{8}$/)).max(20).optional().describe('fids to keep out of session start; "-<fid>" = unmute'),
+      user_quote: z.string().max(500).optional().describe("his exact words in this chat that ask for the change (verified against the chat log)"),
+      confirm_new: z.boolean().optional().describe('save even though a near-duplicate exists (it is a different claim)'),
     },
   },
-  async ({ content, title, kind, global, replaces = [], mute = [] }) => {
+  async ({ content, title, kind, global, replaces = [], mute = [], user_quote, confirm_new }) => {
     const no = off(); if (no) return text(no);
-    if (!content && !mute.length) return text('nothing to do: give content (and/or mute)');
+    // zod drops unknown keys: {text: …} arrives as nothing at all, so name the real ones
+    if (!content && !mute.length) return text('nothing to do: memory_save takes content (the text to remember — not text/fact/note/memory), ' +
+      'plus optional title, kind, global, replaces, mute, user_quote, confirm_new');
     const hide = hidden();
     const want = [...new Set([...replaces, ...mute.map((m) => m.replace(/^-/, ''))])];
     const seen = new Map(want.length ? (await db.query( // a fid this app may not see (Claude-only) = not found, as in memory_get
       `SELECT f.fid, f.user_owned OR f.edited his, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE f.fid = ANY($1) AND ${factVisible('$2')}`, [want, hide])).rows.map((r) => [r.fid, r]) : []);
     const out: string[] = [];
-    if (content) {
-      const fid = noteFid(content), vault = MEMORY_VAULT.replace(/\\/g, '/') + '/';
+    const proj = content ? await getProject() : '';
+    const isGlobal = !proj || (global ?? isGlobalFact(content ?? '', title)); // no cwd: a project fact has nowhere to go
+    const body = clean(content ?? '').trim(), fid = noteFid(content ?? '');
+    // a near-duplicate waits for the caller to say which: replaces (merge into it) or confirm_new (a different claim)
+    const near = content && !replaces.length && !confirm_new ? await nearFacts(db, body, isGlobal ? '' : proj, hide, [fid], { n: 3 }) : [];
+    if (near.length) out.push(`ยังไม่บันทึก: มีความจำที่คล้ายกันอยู่แล้ว`, ...near.map((x) => `คล้าย [${x.fid}] ${x.txt} — ใช้ replaces:[${x.fid}] เพื่อแทน/รวม?`),
+      'ถ้าเป็นเรื่องใหม่จริง ส่งซ้ำพร้อม confirm_new:true');
+    // he typed it himself (checked against the chat log, not taken on the caller's word) = his correction takes effect now
+    const said = !!(content && !near.length && user_quote && replaces.length) && await userSaid(db, user_quote!);
+    if (user_quote && replaces.length && !near.length && !said) out.push('user_quote: ไม่พบข้อความนี้ในแชทที่ลุงจืดพิมพ์ (2 วันล่าสุด / แชทที่เปิดอยู่) — ใช้ flow รออนุมัติตามเดิม');
+    if (content && !near.length) {
+      const vault = MEMORY_VAULT.replace(/\\/g, '/') + '/';
       const sup: { fid: string; rel: string }[] = [], review: string[] = [], old: string[] = [];
       for (const r of replaces.map((x) => seen.get(x)).filter((r) => r && r.fid !== fid)) {
         const path = String(r.path).replace(/\\/g, '/');
@@ -436,11 +464,14 @@ server.registerTool(
         if (st && st !== 'active') { old.push(`[${r.fid}] ${st}`); continue; }
         // the machine rewrites only its own notes; his (the dream's isHis, read from the file: a pin/edit not indexed yet
         // counts; other vaults) go to the existing review path
-        if (!r.his && n && !isHis(n.fm, n.body)) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
+        // his user_quote reaches his notes too, but never one he edited by hand (writeNote keeps those)
+        if (n && ((!r.his && !isHis(n.fm, n.body)) || (said && !isEdited(n.fm, n.body)))) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
       }
-      const proj = await getProject();
-      const isGlobal = global ?? (!proj || isGlobalFact(content, title));
-      const rel = saveNote(content, { title, kind, global: isGlobal, project: proj, client: client(), supersede: sup.map((x) => x.rel), review: review[0] });
+      const now = new Date();
+      const rel = saveNote(content, { title, kind, global: isGlobal, project: proj, client: client(), now, supersede: sup.map((x) => x.rel), review: review[0],
+        ...(said ? { activate: !review.length, extra: { user_quote: user_quote!.slice(0, 300), quoted_at: now.toISOString() }, reindex: false } : {}) });
+      if (said && !process.env.MEMHUB_NO_REINDEX) await run(process.execPath, [join(import.meta.dirname, 'cli.ts'), 'index-vault', MEMORY_VAULT],
+        { env: { ...process.env, MEMORY_HUB_INTERNAL: '1' }, windowsHide: true, timeout: 120_000 }); // rw child; a search right after sees the new note
       // saveNote decides: pending (his note to review) supersedes nothing yet; the same text already active stays active
       const pending = fmStr(parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.status) === 'pending';
       const ids = (xs: string[]) => xs.map((x) => `[${x}]`).join(' ');
@@ -451,8 +482,16 @@ server.registerTool(
         : `[${review[0]}] เป็นโน้ตของลุงจืด: ไม่แก้ไฟล์ให้ — โน้ตใหม่เป็น pending รอลุงจืดอนุมัติ (คิว hubs/_review.md อัปเดตตอนกลางคืน; ตั้ง status: active = แทน [${review[0]}])` +
         (review.length > 1 ? `; ยังไม่ได้เสนอแทน ${ids(review.slice(1))}: เสนอได้ทีละโน้ต` : ''));
       if (old.length) out.push(`already OLD, left as is: ${old.join(' · ')}`);
-      for (const x of await similar(clean(content).trim(), kind ?? 'fact', isGlobal ? '' : proj, hide, [fid, ...replaces]))
-        out.push(`คล้าย [${x.fid}] ${x.txt} — ส่ง replaces:[${x.fid}] ถ้าจะแทน`);
+      if (said) out.push(`user_quote ตรงกับที่ลุงจืดพิมพ์: มีผลทันที${sup.length ? '' : ' (ไม่มีโน้ตที่แทนได้)'}`);
+      // a contradiction with a current fact of the same subject (accuracy.ts): flag both now, the nightly lint recomputes them
+      const facts = (await factTexts(db, hide, isGlobal ? null : proj)).filter((f) => f.fid !== fid && !replaces.includes(f.fid));
+      const pairs = conflictPairs([...facts, { fid, project: isGlobal ? '' : proj, kind: kind ?? 'fact', text: body }], fid);
+      const other = (p: { a: string; b: string }) => (p.a === fid ? p.b : p.a);
+      if (pairs.length) {
+        out.push(`⚠ CONFLICT: ขัดกับ ${pairs.map((p) => `[${other(p)}] เรื่อง ${p.name}`).join(' · ')} — ถ้าตัวเก่าผิด ส่ง replaces:[…] พร้อม user_quote; ติดธงทั้งคู่แล้ว (hubs/_review.md)`);
+        await run(process.execPath, [join(import.meta.dirname, 'cli.ts'), 'conflict', fid, ...pairs.map((p) => `${other(p)}:${p.name}`)],
+          { env: { ...process.env, MEMORY_HUB_INTERNAL: '1' }, windowsHide: true, timeout: 20_000 });
+      }
     }
     const lost = want.filter((x) => !seen.has(x));
     if (lost.length) out.push(`not found: ${lost.join(' ')}`);

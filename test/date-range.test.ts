@@ -173,3 +173,40 @@ test('cli retokenize rewrites only rows whose tokens changed (Thai digits fold t
     else assert.deepEqual(now.get(x.id), x, `${x.id} untouched (same tuple)`);
   }
 });
+
+test('kind filter and asOf point-in-time temporal query (resurrects later-superseded facts as active at asOf)', async () => {
+  await guard();
+  writeNote('facts/demo/Fe0000010.md', {
+    memhub: 'fact', id: 'Fe0000010', kind: 'rule', scope: 'project', project: 'd:/demo', status: 'superseded',
+    superseded_by: 'Fe0000011', importance: '8', valid_at: '2026-09-10T05:00:00Z', created_at: '2026-09-10T05:00:00Z',
+    expired_at: '2026-09-20T05:00:00Z', source_uuids: ['dr0-u'], md5: md5('Fe0000010'), run: 'r1',
+  }, `${WORD} กฎเดิมก่อนเปลี่ยน\n`);
+  writeNote('facts/demo/Fe0000011.md', {
+    memhub: 'fact', id: 'Fe0000011', kind: 'rule', scope: 'project', project: 'd:/demo', status: 'active',
+    importance: '8', valid_at: '2026-09-20T05:00:00Z', created_at: '2026-09-20T05:00:00Z',
+    source_uuids: ['dr3-u'], md5: md5('Fe0000011'), run: 'r1',
+  }, `${WORD} กฎใหม่หลังเปลี่ยน\n`);
+  await indexVault(db, MEMORY_VAULT);
+  await db.query(`UPDATE chunks SET embedding = $1::halfvec`, [FAKE_VEC]);
+  await refreshTermDf(db);
+
+  // kind filter: only 'rule' facts come back
+  const rulesNow = await search(spy().db, WORD, { semantic: false, kind: 'rule', limit: 8 });
+  assert.deepEqual(rulesNow.hits.map((h) => [h.fid, h.status, h.superseded_by]), [
+    ['Fe0000011', 'active', null],
+    ['Fe0000010', 'superseded', 'Fe0000011'],
+  ]);
+
+  // kind='chat': only raw chats come back (no facts)
+  const chatsOnly = await search(spy().db, WORD, { semantic: false, kind: 'chat', limit: 8 });
+  assert.ok(chatsOnly.hits.length > 0 && chatsOnly.hits.every((h) => h.fid === null && h.tool !== 'obsidian'));
+
+  // asOf = 2026-09-15 (before Fe0000011 replaced Fe0000010 on 2026-09-20): Fe0000010 is active and Fe0000011 does not exist yet
+  const atMid = await search(spy().db, WORD, { semantic: false, kind: 'rule', asOf: '2026-09-15', limit: 8 });
+  assert.deepEqual(atMid.hits.map((h) => [h.fid, h.status, h.superseded_by]), [['Fe0000010', 'active', null]]);
+
+  // invalid kind or asOf throws a clear error
+  await assert.rejects(() => search(spy().db, WORD, { semantic: false, kind: 'bogus' }), /kind must be one of/);
+  await assert.rejects(() => search(spy().db, WORD, { semantic: false, asOf: 'not-a-date' }), /as_of must be an ISO date/);
+});
+

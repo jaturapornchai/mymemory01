@@ -156,8 +156,11 @@ try {
         const file = args.find((a) => !a.startsWith('--'));
         const force = args.includes('--force');
         const tool = file && imp.toolFor(file);
+        if (!file) console.log('redact requeued', await imp.requeueUnredacted(db)); // before the index pass that re-imports them
         console.log('index', file ? await (tool ? imp.indexToolFile(db, tool, file, force) : imp.indexFile(db, file, force))
           : await imp.indexArchive(db, force), `${Date.now() - t0} ms`);
+        if (!file) console.log('claude memory', await (await import('./claude-memory.ts')).importClaudeMemory(db) // before vaults: indexed this run
+          .then((r) => `saved ${r.saved.length}, dup ${r.dup.length}, gone ${r.gone}, unmapped ${r.unmapped.length}`, (e) => `failed: ${e.message}`));
         if (!file) console.log('vaults', await (await import('./obsidian.ts')).indexVaults(db));
         // a deleted / moved note or re-imported file leaves its brain-map pins behind: one sweep per hour
         if (!file) console.log('pins pruned', await (await import('./layout.ts')).prunePins(db));
@@ -182,9 +185,10 @@ try {
     const imp = await import('./importer.ts');
     const { appendFileSync, readdirSync } = await import('node:fs');
     const live = args[0];
+    if (!live || !existsSync(live)) process.exit(0);
     const subDir = join(live.replace(/\.jsonl$/, ''), 'subagents');
     const files = [live, ...(existsSync(subDir) ? readdirSync(subDir, { recursive: true, encoding: 'utf8' }).map((f) => join(subDir, f)) : [])]
-      .filter((f) => f.endsWith('.jsonl'));
+      .filter((f) => f.endsWith('.jsonl') && existsSync(f));
     try {
       for (const f of files) imp.syncOne(f);
       const arch = files.map(imp.archivePath), hideAs = await imp.sessionHideAs(db, arch); // before any commit: see sessionHideAs
@@ -194,22 +198,59 @@ try {
       appendFileSync(join(ROOT, 'ingest.log'), `${new Date().toISOString()} ${live}: ${(e as Error).message}\n`);
     }
   } else if (cmd === 'retokenize') {
-    // Tokenizer changed → rebuild words/bigrams in place (keeps embeddings; chunk ids don't depend on lexemes).
-    // Only rows whose tokens differ are written: every rewritten row is re-inserted into the GIN and HNSW indexes.
-    const { bigramRuns, bigramTsvector, toTsvector, words } = await import('./thai.ts');
-    let n = 0, changed = 0;
-    for (let last = ''; ;) {
-      const rows = (await db.query('SELECT id, ctx_header, text FROM chunks WHERE id > $1 ORDER BY id LIMIT 1000', [last])).rows;
-      if (!rows.length) break;
-      changed += (await db.query(
-        `UPDATE chunks c SET words = v.w::tsvector, bigrams = v.b::tsvector FROM unnest($1::text[], $2::text[], $3::text[]) v(id, w, b)
-         WHERE c.id = v.id AND (c.words, c.bigrams) IS DISTINCT FROM (v.w::tsvector, v.b::tsvector)`,
-        [rows.map((r) => r.id), rows.map((r) => toTsvector(words(`${r.ctx_header}\n${r.text}`))), rows.map((r) => bigramTsvector(bigramRuns(r.text)))],
-      )).rowCount ?? 0;
-      n += rows.length;
-      last = rows.at(-1).id;
+    // Tokenizer / ctx_header changed → backfill [files: ...] on existing chunks from their round's turns, then rebuild words/bigrams in place.
+    // Only rows whose ctx_header or tokens differ are written: every rewritten row is re-inserted into the GIN and HNSW indexes.
+    const { filesTouched } = await import('./chunk.ts');
+    const { bigramRuns, bigramTsvector } = await import('./thai.ts');
+    const { chunkWords } = await import('./importer.ts');
+    const srcIds = (await db.query(`SELECT DISTINCT source_id FROM turns WHERE text_redacted ~* '(?:^|\\n)\\[(?:edit|write|notebookedit)\\]\\s+'`)).rows.map((r) => r.source_id);
+    const hdrByChunk = new Map<string, string>();
+    for (const sid of srcIds) {
+      const turns = (await db.query(`SELECT seq, role, text_redacted text FROM turns WHERE source_id = $1 ORDER BY seq`, [sid])).rows;
+      const chunks = (await db.query(`SELECT id, seq_from, ctx_header FROM chunks WHERE source_id = $1 ORDER BY seq_from`, [sid])).rows;
+      const rounds: { from: number; to: number; touched: string[] }[] = [];
+      for (const t of turns) {
+        if (!rounds.length || t.role === 'user' || t.role === 'summary' || t.role === 'note') rounds.push({ from: t.seq, to: t.seq, touched: [] });
+        const cur = rounds.at(-1)!;
+        cur.to = t.seq;
+      }
+      for (const r of rounds) {
+        r.touched = filesTouched(turns.filter((t) => t.seq >= r.from && t.seq <= r.to).map((t) => t.text).join('\n'));
+      }
+      for (const c of chunks) {
+        const r = rounds.find((x) => c.seq_from >= x.from && c.seq_from <= x.to);
+        if (!r?.touched.length) continue;
+        const base = String(c.ctx_header).replace(/ \[files: [^\]]*\]$/, '');
+        const next = `${base} [files: ${r.touched.join(' ')}]`;
+        if (next !== c.ctx_header) hdrByChunk.set(c.id, next);
+      }
     }
-    await (await import('./search.ts')).refreshTermDf(db);
+    let n = 0, changed = 0;
+    const lock = await db.connect(); // sync/import's lock: an hourly re-import rewriting these rows mid-pass would be overwritten
+    try {
+      if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext(current_schema() || ':memhub-sync')) ok`)).rows[0].ok)
+        throw new Error('retokenize: a sync/import is running, run it again after that finishes');
+      for (let last = ''; ;) {
+        const rows = (await db.query('SELECT id, ctx_header, text FROM chunks WHERE id > $1 ORDER BY id LIMIT 1000', [last])).rows;
+        if (!rows.length) break;
+        const hdrs = rows.map((r) => hdrByChunk.get(r.id) ?? (r.ctx_header as string));
+        // the vector embeds `${ctx_header}\n${text}` (embed.ts): a new header nulls it, the next sync's backfill re-embeds
+        changed += (await db.query(
+          `UPDATE chunks c SET ctx_header = v.h, words = v.w::tsvector, bigrams = v.b::tsvector,
+             embedding = CASE WHEN c.ctx_header = v.h THEN c.embedding END, model_ver = CASE WHEN c.ctx_header = v.h THEN c.model_ver END
+           FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) v(id, h, w, b)
+           WHERE c.id = v.id AND (c.ctx_header, c.words, c.bigrams) IS DISTINCT FROM (v.h, v.w::tsvector, v.b::tsvector)`,
+          [rows.map((r) => r.id), hdrs, rows.map((r, i) => chunkWords(hdrs[i], r.text)), rows.map((r) => bigramTsvector(bigramRuns(r.text)))],
+        )).rowCount ?? 0;
+        n += rows.length;
+        last = rows.at(-1).id;
+      }
+      await (await import('./search.ts')).refreshTermDf(db);
+      await (await import('./synapse.ts')).rebuildSynapses(db, { structural: true });
+    } finally {
+      await lock.query(`SELECT pg_advisory_unlock(hashtext(current_schema() || ':memhub-sync'))`).catch(() => {});
+      lock.release();
+    }
     console.log('retokenized', n, 'changed', changed);
   } else if (cmd === 'embed') {
     const { backfill } = await import('./embed.ts');
@@ -218,9 +259,9 @@ try {
   } else if (cmd === 'search') {
     const { search, snippet } = await import('./search.ts');
     const take = (k: string) => { const i = args.indexOf(k); return i < 0 ? undefined : args.splice(i, 2)[1]; }; // flag + value leave the query
-    const since = take('--since'), until = take('--until'), q = args.join(' ');
+    const since = take('--since'), until = take('--until'), asOf = take('--as-of'), kind = take('--kind'), project = take('--project'), q = args.join(' ');
     const t0 = performance.now();
-    const { hits, semantic } = await search(db, q, { since, until });
+    const { hits, semantic } = await search(db, q, { since, until, asOf, kind, project });
     const ms = (performance.now() - t0).toFixed(1);
     for (const h of hits) console.log(`[${h.id}] ${h.ts?.toISOString().slice(0, 10)} ${h.project} ${h.score.toFixed(4)}\n  ${snippet(h.text, q, 200)}`);
     console.log(`${hits.length} hits in ${ms} ms${semantic ? '' : ' (keyword-only)'}`);
@@ -269,7 +310,7 @@ try {
     if (args.includes('--consolidate')) {
       await d.consolidate(db);
       const { MEMORY_VAULT } = await import('./notes.ts');
-      (await import('./vault-git.ts')).commitBatch(MEMORY_VAULT, `consolidate ${new Date().toISOString().slice(0, 10)}: approvals + hubs`);
+      (await import('./vault-git.ts')).commitBatch(MEMORY_VAULT, `consolidate ${d.BKK(new Date())}: approvals + hubs`);
       console.log('consolidated');
     }
     else if (runner === 'deepseek' && !args.includes('--force') && d.deepseekPeak(new Date())) {
@@ -277,7 +318,7 @@ try {
       console.log('dream: DeepSeek peak hours (01-04 and 06-10 UTC, Mon-Fri) bill double, skipped');
     }
     else {
-      const run = opt('--run') ?? `${new Date().toISOString().slice(0, 10)}-${runner}`;
+      const run = opt('--run') ?? `${d.BKK(new Date())}-${runner}`;
       const dir = join(ROOT, 'tmp', 'dream', run);
       const lim = opt('--limit'); // --limit 0 = no sessions (it once meant the default 25 and dreamed for real)
       if (lim !== undefined && !/^\d+$/.test(lim)) throw new Error(`dream: --limit needs a whole number, got ${lim}`);
@@ -507,8 +548,42 @@ try {
       ON CONFLICT (k) DO NOTHING`, [on]);
     if (un.length) await db.query(`DELETE FROM state WHERE k = ANY($1::text[])`, [un.map((f) => `mute:${f}`)]);
     console.log(`muted: ${on.join(' ') || '-'} · unmuted: ${un.join(' ') || '-'}`);
+  } else if (cmd === 'conflict') {
+    // conflict <fid> <other>:<name>…: memory_save found a contradiction (accuracy.ts); lint --fix recomputes them nightly
+    const [fid, ...rest] = args, others = rest.map((x) => x.split(':') as [string, string]).filter(([o, n]) => /^[FSI][0-9a-f]{8}$/.test(o) && n);
+    if (!/^[FSI][0-9a-f]{8}$/.test(fid ?? '') || !others.length) throw new Error('usage: conflict <fid> <other-fid>:<name>...');
+    await (await import('./accuracy.ts')).addConflict(db, fid, others);
+    console.log(`conflict: ${fid} ↔ ${others.map((o) => o.join(':')).join(' ')}`);
+  } else if (cmd === 'identity' || cmd === 'alias') {
+    // identity <project> <fid>: the fact SessionStart shows first for that project (B1). alias <project> <old> <new> <since> [fid]
+    // [regex]: the project's old name: older chunks naming it get a note, a query naming it gets the identity fact (B4).
+    const project = (await import('./importer.ts')).normProject(args[0] ?? '');
+    if (!project) throw new Error(`usage: identity <project> <fid> | alias <project> <old> <new> <YYYY-MM-DD> [fid] [regex]`);
+    const cur = (await db.query(`SELECT v FROM state WHERE k = $1`, [`identity:${project}`])).rows[0]?.v ?? { aliases: [] };
+    if (cmd === 'identity') {
+      if (!/^F[0-9a-f]{8}$/.test(args[1] ?? '')) throw new Error('usage: identity <project> <fid>');
+      cur.fid = args[1];
+    } else {
+      const [, old, nu, since, fid, match] = args;
+      if (!old || !nu || !/^\d{4}-\d{2}-\d{2}$/.test(since ?? '')) throw new Error('usage: alias <project> <old> <new> <YYYY-MM-DD> [fid] [regex]');
+      if (match) new RegExp(match, 'i'); // a bad regex fails here, not in every search
+      cur.aliases = [...(cur.aliases ?? []).filter((a: { old: string }) => a.old !== old), { old, new: nu, since, ...(fid ? { fid } : {}), ...(match ? { match } : {}) }];
+    }
+    await db.query(`INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [`identity:${project}`, cur]);
+    console.log(`identity:${project} ${JSON.stringify(cur)}`);
+  } else if (cmd === 'annotate') {
+    // annotate <chunk-id|fid> <text> ('' = remove): a note shown under that chat/card in search, the raw text stays as it was
+    const [id, ...words] = args, note = words.join(' ').trim();
+    const turn = (await db.query(/^[FSI][0-9a-f]{8}$/.test(id ?? '')
+      ? `SELECT c.turn_uuid FROM facts f JOIN chunks c ON c.source_id = f.source_id WHERE f.fid = $1 ORDER BY c.seq_from, c.id LIMIT 1`
+      : `SELECT turn_uuid FROM chunks WHERE id LIKE $1 || '%' AND length($1) >= 8 LIMIT 2`, [id ?? ''])).rows;
+    if (turn.length !== 1) throw new Error(`annotate: ${turn.length ? 'id prefix matches 2+ chunks' : 'no chunk/fact'} ${id}`);
+    const k = `note:${turn[0].turn_uuid}`;
+    if (note) await db.query(`INSERT INTO state (k, v) VALUES ($1, jsonb_build_object('text', $2::text)) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [k, note]);
+    else await db.query(`DELETE FROM state WHERE k = $1`, [k]);
+    console.log(`${k} ${note || '(removed)'}`);
   } else {
-    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|sem [--dry] [--limit n]|brain [--public] [--out file]|brain-serve [--port n] [--share [--hours n] [--no-tunnel] | --open]|publish [--build] [--force]|mute [-]<fid>...>');
+    console.log('usage: node src/cli.ts <init|migrate|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>|retokenize|index-vault [vault]|forget --session <id>|--project <path>|dream [--consolidate]|lint [--dry]|sem [--dry] [--limit n]|brain [--public] [--out file]|brain-serve [--port n] [--share [--hours n] [--no-tunnel] | --open]|publish [--build] [--force]|mute [-]<fid>...|conflict <fid> <fid>:<name>...|identity <project> <fid>|alias <project> <old> <new> <since> [fid] [regex]|annotate <id> <text>>');
   }
   if (!skipped) await health(db, JOB, jobErr);
 } catch (e) {

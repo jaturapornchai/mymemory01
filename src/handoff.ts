@@ -26,7 +26,7 @@ export async function lastOtherApp(db: pg.Pool, project: string | string[], clie
   // card note text = "# <file>\n# <title>\n\n<summary>" (dream); else the session's first real prompt
   const r = (await db.query(
     `SELECT (SELECT t.text_redacted FROM facts f JOIN turns t ON t.source_id = f.source_id
-             WHERE f.kind = 'card' AND $2 = ANY(f.session_ids) LIMIT 1) card,
+             WHERE f.kind = 'card' AND $2 = ANY(f.session_ids) ORDER BY f.valid_at DESC NULLS LAST LIMIT 1) card, -- long session: newest card
             (SELECT text_redacted FROM turns WHERE source_id = $1 AND role = 'user' AND left(text_redacted, 1) <> '['
              ORDER BY seq LIMIT 1) prompt`, [last.source_id, last.session_id])).rows[0];
   const what = r.card?.match(/\n# ([^\n]+)/)?.[1] ?? r.prompt ?? '';

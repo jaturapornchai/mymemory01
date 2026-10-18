@@ -12,7 +12,7 @@ process.env.MEMORY_HUB_INTERNAL = '1';
 const { connect, ROOT } = await import('../src/db.ts');
 const { PRIVATE_TOOLS } = await import('../src/guard.ts');
 const { origins, originText, hitLine } = await import('../src/search.ts');
-const { searchText, briefLine, BRIEF_LINE } = await import('../src/mcp.ts');
+const { searchText, briefLine, BRIEF_LINE, text } = await import('../src/mcp.ts');
 
 const db = connect('rw');
 const HIDE = [...PRIVATE_TOOLS];
@@ -82,11 +82,11 @@ test('originText / hitLine / searchText: src after what, only when given; brief 
   assert.equal(originText(undefined), '');
   const h = { id: C.main, turn_uuid: 'm4', ts: new Date(T), project: 'd:/p', session_id: 'x', header: '', text: 'hello world', score: 1, uses: 0, last: null,
     status: null, fid: null, kind: null, fact_project: null, superseded_by: null, review_target: null, changed_to: null, src_kind: 'main', tool: 'claude', ev_of: null };
-  assert.match(hitLine(h, T, o.get(C.main)), /^\[c+\w+\] 2026-09-20 \S+ p \| chat \| src claude:aaaabbbb#4$/);
+  assert.match(hitLine(h, T, o.get(C.main)), /^\[c+\w+\] 2026-09-20 \S+ p \| บันทึก chat \| src claude:aaaabbbb#4$/);
   assert.doesNotMatch(hitLine(h, T), /src/, 'no origin passed: the old line (eval baselines, golden tests)');
   assert.match(searchText([h], 'hello', true, o), /\| src claude:aaaabbbb#4\nhello world/);
   const line = briefLine({ ...h, text: 'x'.repeat(500) }, 'x', new Map([[C.main, 42]]), o.get(C.main));
-  assert.match(line, /\] 2026-09-20 p src claude:aaaabbbb#4 ≈42t: x/, 'brief: the tag names the app, so what is dropped');
+  assert.match(line, /\] 2026-09-20 p บันทึก src claude:aaaabbbb#4 ≈42t: x/, 'brief: the tag names the app, so what is dropped');
   assert.ok(line.length <= BRIEF_LINE);
 });
 
@@ -109,11 +109,18 @@ test('lint: fact text vs the turns it cites (hard anchors) and close same-projec
   // says it replaces "old" (and only mentions "ok"): far from every other note, so no dup/conflict pair
   await note('new', 'F0000a005', 'memhub-pg ใช้พอร์ต 5441 แทน F0000a003 (ยกเลิกแล้ว)', ['l0'], `[${[0, 0, 1, ...Array(1021).fill(0)].join(',')}]`);
   await note('mention', 'F0000a006', 'memhub-pg เดิมจด F0000a001 ไว้', ['l0'], `[${[0, 0, 0, 1, ...Array(1020).fill(0)].join(',')}]`);
+  await db.query(`UPDATE facts SET project = 'd:/lint/sub' WHERE fid = 'F0000a003'`); // a sub-folder is the same project (sameTree)
   const r = await lintReport(db, new Date(T));
   assert.deepEqual(r.support.map((x) => [x.fid, x.have, x.of]), [['F0000a002', 0, 3], ['F0000a004', 0, 3]], 'ok/old cite a turn holding their anchors');
   assert.deepEqual(r.conflicts.map((x) => [x.a, x.b, x.why]), [['F0000a001', 'F0000a003', 'ตัวเลขต่างกัน']], 'bad↔same: close, same numbers, no negation');
   assert.deepEqual(r.replaced.map((x) => [x.npath, x.opath]), [['v/new.md', 'v/old.md']], 'a bare mention is not a replacement');
   const md = renderLint(r, new Date(T));
-  assert.match(md, /อาจขัดกัน 1 · บอกว่าแทนแล้วแต่ของเก่ายัง active 1\n[\s\S]*\[\[ok\]\] ↔ \[\[old\]\] · ตัวเลขต่างกัน · 0\.900/);
+  assert.match(md, /อาจขัดกัน 1 · บอกว่าแทนแล้วแต่ของเก่ายัง active 1 · CONFLICT 0 คู่ · STALE 0\n[\s\S]*\[\[ok\]\] ↔ \[\[old\]\] · ตัวเลขต่างกัน · 0\.900/);
   assert.match(md, /\n- \[\[new\]\] → \[\[old\]\]\n/);
+});
+
+test('every MCP reply is redacted on the way out: a row stored before its rule existed never leaves raw', () => {
+  const pw = 'Zt8!' + 'qWe4Rk2'; // pragma: allowlist secret
+  const out = text(`[S1] ssh root ok, SSH_PASS=${pw} (F1a2b3c4d)`).content[0].text;
+  assert.ok(!out.includes(pw) && out.includes('[REDACTED:kv]') && out.includes('F1a2b3c4d'), out);
 });

@@ -107,35 +107,37 @@ export const isGlobalFact = (text: string, title = '') => GLOBAL_HINT.test(`${ti
  *  this note is saved pending with review_target (hubs/_review.md: he sets it active = accept, consolidate applies it).
  *  A pending note supersedes nothing yet (else neither would be current); the same text already active stays active. */
 export function saveNote(content: string, opts: { title?: string; project?: string; kind?: string; global?: boolean; client?: string; now?: Date;
-  supersede?: string[]; review?: string } = {}) {
+  supersede?: string[]; review?: string; activate?: boolean; extra?: Fm; reindex?: boolean; commit?: boolean } = {}) {
   const now = opts.now ?? new Date();
   const text = clean(content).trim();
   const fid = noteFid(content);
-  const scope = (opts.global ?? (!opts.project || isGlobalFact(text, opts.title))) ? 'global' : 'project';
+  // no project (an app that sent no cwd, 2026-10-18): global even when global:false, never `scope: project` with no project
+  const scope = (!opts.project || (opts.global ?? isGlobalFact(text, opts.title))) ? 'global' : 'project';
   // the title is redacted like the text: it becomes the file name, the vault commit message and every search citation
   const rel = `facts/${scope === 'global' ? '_global' : projectSlug(opts.project)}/${fid} ${fileName(opts.title ? clean(opts.title) : text.split('\n')[0], 40)}.md`;
   const path = join(MEMORY_VAULT, rel);
   // the same text again keeps what the note already has: its status (a pending note stays pending until he approves it),
   // kind, importance and dates (a rule re-saved without kind stays a rule)
   const old = existsSync(path) ? parseNote(readFileSync(path, 'utf8')).fm : undefined;
-  const status = old ? fmStr(old.status) || 'active' : opts.review ? 'pending' : 'active';
-  const review = old ? '' : opts.review ?? '';
+  // activate (memory_save user_quote: he typed the correction himself) = active now, even over its own pending copy
+  const status = opts.activate ? 'active' : old ? fmStr(old.status) || 'active' : opts.review ? 'pending' : 'active';
+  const review = old || opts.activate ? '' : opts.review ?? '';
   const sup = status === 'active' ? opts.supersede ?? [] : [];
   // the dream's "- supersedes:: [[old]]" (link edges / synapses); fid and md5 come from the text alone
   const body = `${text}\n${sup.length ? `\n${sup.map((r) => `- supersedes:: [[${basename(r, '.md')}]]`).join('\n')}\n` : ''}`;
   try {
     writeNote(rel, {
       memhub: 'fact', id: fid, kind: opts.kind ?? (fmStr(old?.kind) || 'fact'), scope, project: scope === 'global' ? '' : opts.project ?? '',
-      ...(old ? {} : { status, review_target: review }),
+      ...(old && !opts.activate ? {} : { status, review_target: review }),
       owner: 'user', importance: fmStr(old?.importance) || '8', valid_at: fmStr(old?.valid_at) || now.toISOString(), created_at: fmStr(old?.created_at) || now.toISOString(),
-      source_uuids: [noteUuid(path)], tags: ['memhub/saved'], md5: md5(text), ...(opts.client ? { client: opts.client } : {}),
+      source_uuids: [noteUuid(path)], tags: ['memhub/saved'], md5: md5(text), ...(opts.client ? { client: opts.client } : {}), ...opts.extra,
     }, body);
     for (const r of sup) // ponytail: an edit by him in the ms since mcp.ts checked it = writeNote keeps it
       writeNote(r, { status: 'superseded', superseded_by: fid, expired_at: now.toISOString(), invalid_at: now.toISOString() });
   } finally { // a failed write (EPERM on a locked note) must still close the batch, or this process never snapshots again
-    commitBatch(MEMORY_VAULT, `memory_save (${opts.client ?? 'unknown'}): ${rel}`);
+    if (opts.commit !== false) commitBatch(MEMORY_VAULT, `memory_save (${opts.client ?? 'unknown'}): ${rel}`);
   }
-  reindexSoon();
+  if (opts.reindex !== false) reindexSoon(); // false: the caller indexes and waits (a search right after must see it)
   return rel;
 }
 

@@ -194,7 +194,7 @@ test('priority order: a fact outranks its own source chat, which is folded under
   assert.ok(src && !src.fid, 'its source chat is attached');
   assert.ok(!hits.some((h) => h.id === src.id), 'and has no slot of its own');
   const [line, , source] = searchText(hits, q, true).split('\n'); // header, snippet, then the ↳ source line
-  assert.ok(line.startsWith(`[${top.fid}] `) && line.includes('| fact cur'), line);
+  assert.ok(line.startsWith(`[${top.fid}] `) && line.includes('| ✓ใช้ได้ fact'), line);
   assert.ok(source.startsWith(`↳ source chat [${src.id}] `), source);
   assert.match(source, /\d{4}-\d\d-\d\d: .*5441/, 'the first ↳ carries text, not just an id');
 });
@@ -241,8 +241,8 @@ test('identical fact = NOOP: provenance merged, no new note, hub Knowledge Page 
   assert.equal(hub.fm.freshness, 'up_to_date');
   assert.ok(Number(hub.fm.active_facts) >= 2);
   assert.match(hub.body, /ความจำ active \d+ รายการ · การ์ดเซสชัน \d+ ใบ · สถานะ: สด \(ฝันครบทุกแชต\)/);
-  assert.match(hub.body, /## โมเดลโปรเจกต์และการตัดสินใจ \(Mental Model\)[\s\S]*ตัดสินใจใช้ bge-m3 สำหรับ vector · ×2 แชต/);
-  assert.match(hub.body, /## Recent sessions[\s\S]*— การ์ด S\d+: สรุปสั้น/);
+  assert.match(hub.body, /## ความรู้และการตัดสินใจล่าสุด\n(?:- [^\n]*\n)*- \[F[0-9a-f]{8}\] \d{4}-\d{2}-\d{2} คำลุงจืด ×2 — ตัดสินใจใช้ bge-m3 สำหรับ vector\n/);
+  assert.match(hub.body, /## งานล่าสุด[^\n]*\n(?:- [^\n]*\n)*- \[S\w+\] \d{4}-\d{2}-\d{2} การ์ดเซสชัน — การ์ด S\d+: สรุปสั้น/);
 });
 
 test('ลุงจืด-owned target → proposal goes to review (pending), target untouched', async () => {
@@ -600,4 +600,53 @@ test('deepseek runner: no key-shaped token leaves, JSON mode with an example, re
     globalThis.fetch = realFetch;
     if (realKey === undefined) delete process.env.MEMHUB_DEEPSEEK_KEY; else process.env.MEMHUB_DEEPSEEK_KEY = realKey;
   }
+});
+
+test('an UPDATE whose new text is the target itself is a NOOP: the fact is never superseded by itself', async () => {
+  await indexFile(db, session('upd1', '2026-09-24', ['FACT: memhub port 5441 bound to 127.0.0.1 only']));
+  await run('upd-a');
+  await indexFile(db, session('upd2', '2026-09-24', ['FACT: เพิ่มเติม memhub port 5441 bound to 127.0.0.1 only นะ']));
+  const r = await run('upd-b');
+  const f = (await factRows()).find((x) => x.source_uuids.some((u: string) => u.startsWith('upd1-')))!;
+  assert.equal(f.status, 'active', JSON.stringify(r.stats));
+  assert.ok(!f.superseded_by, 'not superseded by itself');
+  assert.ok(f.source_uuids.some((u: string) => u.startsWith('upd2-')), 'the new mention is merged into it');
+  assert.equal(r.stats.UPDATE ?? 0, 0, JSON.stringify(r.stats));
+});
+
+test('two chats in one run repeating an existing fact both count: the second NOOP keeps the first one\'s provenance', async () => {
+  await indexFile(db, session('rep0', '2026-09-24', ['FACT: memhub ใช้ Caddy เป็น reverse proxy บน box77']));
+  await run('rep-a');
+  await indexFile(db, session('rep1', '2026-09-24', ['FACT: memhub ใช้ Caddy เป็น reverse proxy บน box77']));
+  await indexFile(db, session('rep2', '2026-09-24', ['FACT: memhub ใช้ Caddy เป็น reverse proxy บน box77']));
+  const r = await run('rep-b');
+  const f = (await factRows()).find((x) => x.source_uuids.some((u: string) => u.startsWith('rep0-')))!;
+  for (const s of ['rep1-', 'rep2-']) assert.ok(f.source_uuids.some((u: string) => u.startsWith(s)), `${s} merged: ${JSON.stringify(r.stats)}`);
+});
+
+test('a session with one hidden transcript (Google seen) dreams only its visible one: hidden turns never reach the model', async () => {
+  await indexFile(db, session('hd1', '2026-09-24', ['FACT: บริการ kappa ใช้พอร์ต 8800']));
+  const p2 = join(tmp, 'proj3', 'hd1.jsonl');
+  mkdirSync(join(tmp, 'proj3'), { recursive: true });
+  writeFileSync(p2, (['user', 'assistant'] as const).map((type, i) => JSON.stringify({ type, uuid: `hd1-x${i}`, sessionId: 'hd1', timestamp: `2026-09-24T00:00:0${i}.000Z`, cwd: tmp,
+    message: { role: type, content: type === 'user' ? 'FACT: SECRET-GMAIL ใบแจ้งหนี้ lambda' : [{ type: 'text', text: 'รับทราบ' }] } })).join('\n') + '\n');
+  await indexFile(db, p2);
+  await db.query(`UPDATE sources SET hide_as = 'google' WHERE path = $1`, [p2]);
+  const seen: string[] = [];
+  await dream(db, { llm: (req) => { seen.push(req.user); return fake(req); }, run: 'hd-1', force: true, now: NOW, log: () => {} });
+  assert.ok(seen.join('\n').includes('kappa'), 'the visible transcript is dreamed');
+  assert.ok(!seen.join('\n').includes('SECRET-GMAIL'));
+});
+
+test('two chats in one run replacing the same fact chain onto each other: one stays active, none is orphaned', async () => {
+  await indexFile(db, session('sup0', '2026-09-20', ['FACT: memhub เก็บ backup ไว้ที่ไดรฟ์ E ทุกคืน']));
+  await run('sup-a');
+  await indexFile(db, session('sup1', '2026-09-21', ['FACT: เปลี่ยนแทน memhub เก็บ backup ไว้ที่ไดรฟ์ F ทุกคืน']));
+  await indexFile(db, session('sup2', '2026-09-22', ['FACT: เปลี่ยนแทน memhub เก็บ backup ไว้ที่ไดรฟ์ G ทุกคืน']));
+  const r = await run('sup-b');
+  assert.equal(r.stats.SUPERSEDE, 2, JSON.stringify(r.stats));
+  const of = (s: string) => async () => (await factRows()).find((x) => x.source_uuids.some((u: string) => u.startsWith(`${s}-`)))!;
+  const [e, f, g] = await Promise.all(['sup0', 'sup1', 'sup2'].map((s) => of(s)()));
+  assert.deepEqual([e.status, f.status, g.status], ['superseded', 'superseded', 'active']);
+  assert.equal(f.superseded_by, g.fid); // G replaced F, not the already-replaced E
 });

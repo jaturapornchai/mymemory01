@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { redact, redactOffsite, stripPrivate } from '../src/redact.ts';
+import { rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { redact, REDACT_VER, redactOffsite, stripPrivate } from '../src/redact.ts';
 
 // Fake fixtures, split with + so secret scanners (GitHub push protection) don't read them as real tokens.
 const SECRETS: [string, string][] = [
@@ -26,6 +29,7 @@ const SECRETS: [string, string][] = [
   ['ollama', '67117a0b1c2d3e4f5a6b7c8d9e0f1a2b.' + 'Zx9QwErTyUiOpAsD'], // z.ai GLM: 16 after the dot. pragma: allowlist secret
   ['sk', 'sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a6978'], // ElevenLabs. pragma: allowlist secret
   ['sk', 'mcp_sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f0'], // pragma: allowlist secret
+  ['pem', '-----BEGIN PGP PRIVATE' + ' KEY BLOCK-----\nlQOYBF/abc+def/ghi0123\n-----END PGP PRIVATE KEY BLOCK-----'], // pragma: allowlist secret
 ];
 
 for (const [kind, secret] of SECRETS) {
@@ -57,6 +61,28 @@ const VALUE_CASES: [string, string][] = [
   ['PW: Tunn3lPass', 'Tunn3lPass'],
   ['net use \\\\SRV /user:admin /pass:Sh4reKey', 'Sh4reKey'],
   ['เข้า 203.0.113.7 root Zx9#kLm2 แล้ว', 'Zx9#kLm2'],
+  ['WEATHER_KEY=' + '0123456789abcdef0123456789abcdef', '0123456789abcdef0123456789abcdef'], // pragma: allowlist secret
+  ['MAPS_KEY=' + 'AbCdEf123456', 'AbCdEf123456'], // pragma: allowlist secret
+  ['DB_PASS=' + 'hunter2x', 'hunter2x'], // pragma: allowlist secret
+  ['SMTP_PASS: ' + 'Mail2024!', 'Mail2024!'], // pragma: allowlist secret
+  ['{"key": "' + 'Zq8x3LmP0aB7cD2e"}', 'Zq8x3LmP0aB7cD2e'], // pragma: allowlist secret
+  ['auth: { user: "a@b.c", pass: "' + 'Zx9!kq2Lm" }', 'Zx9!kq2Lm'], // pragma: allowlist secret
+  ['redis://:' + 'S3cretPassw0rd@localhost:6379', 'S3cretPassw0rd'], // pragma: allowlist secret
+  ['mysql://root:' + 'ab/cd12EF@127.0.0.1/x', 'cd12EF'], // pragma: allowlist secret
+  ['postgres://app:' + 'p@ssW0rd1@h/db', 'ssW0rd1'], // pragma: allowlist secret
+  ['authorization: bearer ' + 'abcdEFGH12345678xyz', 'abcdEFGH12345678xyz'], // pragma: allowlist secret
+  ["[shell] $env:SML_REMOTE_PW = '" + "Qz7$kLm2Wx9'", 'Qz7$kLm2Wx9'], // pragma: allowlist secret
+  ["cd deploy && DEPLOY_PW='" + "Rt5#nB8vQ' node x", 'Rt5#nB8vQ'], // pragma: allowlist secret
+  ["c.connect('192.0.2.10', 22, 'root', '" + "Hy6@pL3mZ')", 'Hy6@pL3mZ'], // pragma: allowlist secret
+  ['SSH: `root@192.0.2.10` / password: `' + 'Kd4%wE7rT`', 'Kd4%wE7rT'], // pragma: allowlist secret
+  ['use server `192.0.2.10` (root / `' + 'Vb2!xN9qL`)', 'Vb2!xN9qL'], // pragma: allowlist secret
+  ['HOST = "192.0.2.10" USER = "root" PASS = "' + 'Mn8&cX4zP"', 'Mn8&cX4zP'], // pragma: allowlist secret
+  ['MinIO accesskey=`' + 'ak-demo7x`', 'ak-demo7x'], // pragma: allowlist secret
+  ['ClickHouse `h:8123` user `admin` pass `' + 'Pq7xLm2w` ok', 'Pq7xLm2w'], // pragma: allowlist secret
+  ['- Secret key: `' + 'Zx9-demo-Key4`', 'Zx9-demo-Key4'], // pragma: allowlist secret
+  ['| S3 Secret Key | `' + 'Fk3-demo-Sec8` |', 'Fk3-demo-Sec8'], // pragma: allowlist secret
+  ["caddy hash-password --plaintext '" + "Hw4!demoPw')", 'Hw4!demoPw'], // pragma: allowlist secret
+  ["curl -s -u 'demo:" + "Cu7!demoPw' http://127.0.0.1/", 'Cu7!demoPw'], // pragma: allowlist secret
 ];
 
 for (const [input, secret] of VALUE_CASES) {
@@ -89,7 +115,48 @@ const KEEP = [
   'You are the third pass: read the file again',
   'vnc 192.0.2.10 window เปิดไม่ขึ้น',
   'ssh 192.0.2.10 root access only via tunnel',
+  'the key is to pass the test: pass: true',
+  'press the key: Enter',
+  'monkey=banana',
+  '{ "key": "ctrl+shift+p", "command": "x" }',
+  'open http://localhost:5173/@vite/client and http://localhost:8080?u=a@b.com',
+  'Bearer authentication is the basic configuration',
+  'SSH_KEY_PATH=~/.ssh/id_ed25519',
+  'const LS_KEY = "memhub.graph.v2"; SORT_KEY=name',
+  'map (input / `output`) then ws.connect(url, 22)',
+  "transcribe(ROOT/'tmp-1/a.wav')",
+  'PASS  src/foo.test.ts',
+  "grep -E 'AIza|mongodb\\+srv://|://[^/]*:[^@]*@|BEGIN'",
+  'img = (tmp / "frame_1.png") and (RUNTIME / "run_2/a.json")',
+  'DEEPSEEK_KEY=\n.env.example:12:# key',
+  '- Secrets: `JWT_SECRET`, token: `--max-2`, credentials=`include`',
+  'password: `src/auth/login.ts:12-34`',
+  'SSH_KEY: /tmp/id_ed25519',
+  'PG_PW=\\$(cat /run/pw) psql',
+  'const STORAGE_KEY = "bc_grid_v1"',
+  'pass `--force` to git push, the secret key `SECRET_KEY` env var',
+  'docker run -u 1000:1000 img; ps -u www-data:www-data',
+  '[shell] python -u D:\\tools\\x9\\run_2.py',
 ];
+
+test('known secrets: a listed value goes in any context (table cell, grep arg); one under 8 chars is ignored', async () => {
+  const f = join(tmpdir(), `memhub-known-${process.pid}.txt`), v = 'Kn0wn-' + 'demo-Value'; // pragma: allowlist secret
+  writeFileSync(f, `${v}\nshort\n`);
+  process.env.MEMHUB_KNOWN_SECRETS = f;
+  const m = await import('../src/redact.ts?known'); // own module instance: reads the list at load
+  delete process.env.MEMHUB_KNOWN_SECRETS;
+  rmSync(f);
+  const out = m.redact(`| minio | bc/${v} | grep -rl "${v}" short`).text;
+  assert.ok(!out.includes(v) && out.includes('[REDACTED:known]') && out.includes('short'), out);
+  assert.notEqual(m.REDACT_VER, REDACT_VER, 'a list change re-queues stored rows');
+});
+
+test('connstr: the password stops at a \\n escape and at the next scheme://', () => {
+  const s = 'postgres://app:' + 'Pw7xk@db:5432/x#redis://u:' + 'Rq8zz@cache "mongodb://u:' + 'Mz9qq@h:27017/db\\n-X=y@z"'; // pragma: allowlist secret
+  const out = redact(s).text;
+  for (const v of ['Pw7xk', 'Rq8zz', 'Mz9qq']) assert.ok(!out.includes(v), out);
+  assert.ok(out.includes('@db:5432/x#redis://') && out.includes('@h:27017/db'), out);
+});
 
 for (const s of KEEP) {
   test(`keeps: ${s.slice(0, 40)}`, () => {

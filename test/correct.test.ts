@@ -117,11 +117,16 @@ test('replaces on his own notes (memory_save rule, edited dream note) → review
   assert.match(await sessionStart(), /ห้ามแตะพอร์ต 5434 เด็ดขาด/, 'the old rule stays until he approves');
 });
 
-test('a very similar fact of the same kind is hinted, never replaced', async () => {
-  const r = await claude.call('memory_save', { content: 'ลุงจืดชอบกาแฟดำ ไม่ใส่น้ำตาล ทุกเช้า ที่บ้าน corrtestcoffee', kind: 'preference' });
-  const hint = r.match(/^คล้าย \[(F[0-9a-f]{8})\] (.*) — ส่ง replaces:\[\1\] ถ้าจะแทน$/m);
+test('a near-duplicate is not saved until confirm_new, and never replaced', async () => {
+  const coffee = { content: 'ลุงจืดชอบกาแฟดำ ไม่ใส่น้ำตาล ทุกเช้า ที่บ้าน corrtestcoffee', kind: 'preference' };
+  const r = await claude.call('memory_save', coffee);
+  assert.match(r, /^ยังไม่บันทึก/, r);
+  const hint = r.match(/^คล้าย \[(F[0-9a-f]{8})\] (.*) — ใช้ replaces:\[\1\] เพื่อแทน\/รวม\?$/m);
   assert.ok(hint, r);
   assert.ok(hint[2].startsWith('ลุงจืดชอบกาแฟดำ') && hint[2].length <= 60);
+  await index();
+  assert.equal(await status(noteFid(coffee.content)), undefined, 'nothing saved yet');
+  assert.match(await claude.call('memory_save', { ...coffee, confirm_new: true }), /^saved: /);
   await index();
   assert.equal((await status(hint[1])).status, 'active');
 });

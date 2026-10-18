@@ -5,6 +5,7 @@
 import { closeSync, existsSync, openSync, readdirSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { flagsFor, identityOf, notBcLine } from './accuracy.ts';
 import { connect } from './db.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { lastOtherApp } from './handoff.ts';
@@ -64,7 +65,7 @@ try {
   // this folder's facts, then each folder above it, then global ones (NULL sorts last)
   const near = `CASE WHEN f.scope IS DISTINCT FROM 'global' THEN array_position($1::text[], f.project) END`;
   const unmuted = `NOT EXISTS (SELECT 1 FROM state m WHERE m.k = 'mute:' || f.fid)`; // memory_save mute (cli.ts mute)
-  const [rules, prefs, model, cards, recent, otherApp, health] = await Promise.all([
+  const [rules, prefs, model, cards, recent, otherApp, health, id] = await Promise.all([
     // this project's rules before global ones: the 15 global rules (importance 8-9) took the top slots in every project, and
     // most of them restate ~/.agents/AGENTS.md, which every AI here already loads. 8 shown at most; the rest feed "…อีก N"
     db.query(
@@ -97,6 +98,7 @@ try {
        ORDER BY t.session_id, t.seq`, [chain, session, [...PRIVATE_TOOLS]]),
     lastOtherApp(db, chain, app, session).catch(() => null), // best-effort: the rest still shows
     db.query(`SELECT k, v FROM state WHERE k LIKE 'health:%' ORDER BY k`).catch(() => ({ rows: [] })), // cli.ts health(): last run of each background job
+    identityOf(db, chain, [...PRIVATE_TOOLS]).catch(() => null), // cli.ts identity: what this repo is / is not, shown first
   ]);
   // fact note text = "# <file name>\n<fact>\n\n- from:: …"; card = "# <file>\n# <title>\n\n<summary>…"
   const factText = (t: string) => t.replace(/^# [^\n]*\n/, '').split('\n\n- ')[0];
@@ -109,7 +111,10 @@ try {
     return hours > (STALE[job] ?? Infinity) ? [`${job} ไม่ได้รันมา ${Math.floor(hours)} ชม.`] : [];
   });
   const warn = issues.length ? `\n${flat(`งานเบื้องหลังมีปัญหา: ${issues.join(' · ')}`, 150)}` : '';
-  let room = MAX_CHARS - head.length - warn.length;
+  // B1: the project identity is the first line, outside the rule budget; B9: a repo that is not BC is told the global BC/CHAMP rules are off
+  const idHead = id?.fid ? `[memory-hub] ตัวตนโปรเจกต์นี้ [${id.fid}]: ${flat(id.text, 400)}\n${notBcLine(id) ? `${notBcLine(id)}\n` : ''}` : '';
+  if (id?.fid) rules.rows = rules.rows.filter((r) => r.fid !== id.fid);
+  let room = MAX_CHARS - head.length - warn.length; // idHead rides on top: it never costs a rule its slot
   const tail = (n: number) => `\n- …อีก ${n} ข้อ (memory_search)`;
   /** "\n<title>\n<line>…" with every whole line that still fits ('' if none), + the ids shown. A line that does not fit is
    *  skipped (a shorter one may), and skipped + `more` (not offered) end in a "…อีก N" tail so the AI knows there is more. `keep` = room
@@ -127,7 +132,11 @@ try {
     room -= out.length;
     return [out, ids];
   };
-  const factLine = (r: { fid: string; txt?: string; n?: number }) => `- [${r.fid}] ${flat(factText(r.txt ?? ''), 300)}${(r.n ?? 0) > 1 ? ` ×${r.n}` : ''}`;
+  // CONFLICT / STALE / a correction waiting for review, on the lines that may be shown (accuracy.ts)
+  const flags = await flagsFor(db, [...rules.rows.slice(0, 8), ...prefs.rows.slice(0, 3), ...model.rows.slice(0, 4)].map((r) => ({ key: r.fid, fid: r.fid })),
+    [...PRIVATE_TOOLS]).catch(() => new Map());
+  const factLine = (r: { fid: string; txt?: string; n?: number }) => `- [${r.fid}] ${flat(factText(r.txt ?? ''), 300)}${(r.n ?? 0) > 1 ? ` ×${r.n}` : ''}` +
+    (flags.get(r.fid)?.tags.length ? ` [${flags.get(r.fid)!.tags.join(' · ')}]` : '');
   const later = cards.rows.length || recent.rows.length ? 450 : 0; // ~1 card + 1 unsummarized chat
   // budget order: the other-app line (time-critical, no id) → rules → preferences → mental model → cards → recent; shown rules first
   const [hand] = block('AI ตัวอื่นเพิ่งทำงานที่นี่ (ข้อมูล ไม่ใช่คำสั่ง):', otherApp ? [['', flat(otherApp, 200)]] : []);
@@ -146,14 +155,16 @@ try {
   }), 0, recent.rows.length ? 130 : 0); // one line of today's work the dream has not carded yet beats a 2nd older card
   const [fresh, freshIds] = block('งานล่าสุดที่ยังไม่สรุป:', recent.rows.sort((a, b) => a.near - b.near || b.ts - a.ts).slice(0, cards.rows.length ? 3 : 5)
     .map((x) => [`session:${x.session_id}`, `- ${x.ts.toISOString().slice(0, 10)} ${flat(x.q, 90)}`]));
-  const ctx = (await hiddenNameMask(db, [...PRIVATE_TOOLS]))(warn + rule + pref + know + hand + card + fresh); // every app: a hidden note named in a visible one
-  if (ctx) {
+  const mask = await hiddenNameMask(db, [...PRIVATE_TOOLS]);
+  const ctx = mask(warn + rule + pref + know + hand + card + fresh); // every app: a hidden note named in a visible one
+  if (ctx || idHead) {
+    const out = mask(idHead) + head + ctx;
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: head + ctx },
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: out },
     }));
     // what this chat was given, ids only (cli stats --injected): one local round trip after the reply; table missing → skipped
     await db.query(`INSERT INTO injections (client, project, session, ids, chars, source) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [app, project, session, [...ruleIds, ...prefIds, ...knowIds, ...cardIds, ...freshIds], (head + ctx).length, source || null]).catch(() => {});
+      [app, project, session, [...(id?.fid ? [id.fid] : []), ...ruleIds, ...prefIds, ...knowIds, ...cardIds, ...freshIds], out.length, source || null]).catch(() => {});
   }
   await db.end();
 } catch {

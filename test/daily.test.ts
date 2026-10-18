@@ -132,7 +132,7 @@ test('indexed as kind daily, dated by its day, ranked below the chats it lists, 
   const { hits } = await search(db, 'README ภาษาไทย', { semantic: false, limit: 8, now: new Date(at('12:00', '2026-10-02')) });
   const chat = hits.findIndex((h) => h.session_id === 'x1'), daily = hits.findIndex((h) => h.src_kind === 'daily');
   assert.ok(chat >= 0 && daily >= 0 && chat < daily, `chat #${chat + 1} above daily note #${daily + 1}`);
-  assert.match(hitLine(hits[daily]), / \| daily note/);
+  assert.match(hitLine(hits[daily]), / \| บันทึก daily note/);
   const { briefLine } = await import('../src/mcp.ts'); // memory_search detail:"brief"
   assert.match(briefLine(hits[daily], 'README', new Map()), / daily note ≈/);
 });

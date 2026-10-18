@@ -5,10 +5,10 @@ import { closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openS
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type pg from 'pg';
-import { parseClaude, parseSubagent, type Msg } from './claude.ts';
+import { GOOGLE_HIT, mayHub, parseClaude, parseSubagent, type Msg } from './claude.ts';
 import { chunkTurns, CHUNKER_VER, type Turn } from './chunk.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
-import { redact, redactPersonal, stripPrivate } from './redact.ts';
+import { redact, REDACT_VER, redactPersonal, stripPrivate } from './redact.ts';
 import { bigramRuns, bigramTsvector, toTsvector, words } from './thai.ts';
 import * as antigravity from './tools/antigravity.ts';
 import * as codex from './tools/codex.ts';
@@ -158,6 +158,15 @@ function fileSha(path: string) {
   return h.digest('hex');
 }
 
+/** A command an AI ran: a compact tool-call line of a shell tool (claude.ts [Bash], codex/gemini/antigravity [shell]). */
+export const CMD_LINE = /^(?:[A-Z]: )?\[(?:Bash|shell|PowerShell)\] /m;
+// ลุงจืด 2026-10-18: "deploy" must find the chat that ran scp + systemctl restart though none of its lines says deploy
+const OPS_RUN = /\b(?:scp|rsync|pm2|systemctl\s+restart|docker[ -]compose\s+up|nginx\s+-s\s+reload)\b/i;
+/** A chunk's words (tsvector text); a chunk that ran a deploy/service command also holds `deploy` and `service`, first:
+ *  toTsvector keeps only the first MAX_POS positions. */
+export const chunkWords = (header: string, text: string) =>
+  toTsvector([...(CMD_LINE.test(text) && OPS_RUN.test(text) ? ['deploy', 'service'] : []), ...words(`${header}\n${text}`)]);
+
 /** import <file>: the app whose parser owns an archived file (undefined = a Claude transcript). parseClaude on another app's
  *  log finds no turns, and store() then drops that source's chunks. */
 export const toolFor = (path: string) => TOOLS.find((t) => {
@@ -262,6 +271,14 @@ export function projectChain(project: string): string[] {
   return chain;
 }
 export const projectName = (p: string) => p.split('/').filter(Boolean).at(-1) ?? p;
+const HOME_PROJECT = HOME.replace(/\\/g, '/').toLowerCase();
+/** A catch-all folder (drive root, c:/tmp, home and above): chats there are about anything, not about the folders under it. */
+export const catchAll = (p: string) => !p || /^[a-z]:\/?$/.test(p) || p === 'c:/tmp' || p === HOME_PROJECT || HOME_PROJECT.startsWith(p + '/');
+/** p and the folders above it that are one project with it (sameTree), nearest first. */
+export const projectTree = (p: string) => [p, ...projectChain(p).slice(1).filter((d) => !catchAll(d))];
+/** One project tree: a is b, a folder above it or one below it, on whole segments (catch-alls never span). Search ranking,
+ *  CONFLICT and lint all use it. ลุงจืด 2026-10-18: a session in D:\botstery\stories\x works on botstery. */
+export const sameTree = (a: string, b: string) => a === b || (b.startsWith(a + '/') && !catchAll(a)) || (a.startsWith(b + '/') && !catchAll(b));
 
 const chainCache = new Map<string, { at: number; out: string[] }>(), knownProjects = new Set<string>();
 /**
@@ -324,6 +341,27 @@ export const clean = (t: string, personal = false) => { // PG text can't hold NU
   return redact(personal ? redactPersonal(s).text : s).text;
 };
 
+/** A new redact rule never cleans rows indexed before it (memory_search returns stored text as is). redact.ts changed →
+ *  every source whose stored text the current rules would still change gets size -1, so this sync's index pass re-imports it
+ *  from the raw archive. ponytail: file hash (a comment edit rescans too), known list included; a relaxed rule's old markers stay: import --force. */
+export async function requeueUnredacted(db: pg.Pool): Promise<number | 'unchanged'> {
+  const ver = REDACT_VER;
+  if ((await db.query(`SELECT v->>'ver' v FROM state WHERE k = 'redact'`)).rows[0]?.v === ver) return 'unchanged';
+  const dirty = new Set<string>(), PAGE = 5000;
+  for (const [table, key, col] of [['turns', 'uuid', 'text_redacted'], ['chunks', 'id', 'text']]) {
+    for (let after = ''; ;) { // keyset pages: never a whole table in memory
+      const { rows } = await db.query(`SELECT ${key} k, source_id s, ${col} x FROM ${table} WHERE ${key} > $1 ORDER BY ${key} LIMIT ${PAGE}`, [after]);
+      for (const r of rows) if (redact(r.x).text !== r.x) dirty.add(r.s);
+      if (rows.length < PAGE) break;
+      after = rows[rows.length - 1].k;
+    }
+  }
+  if (dirty.size) await db.query(`UPDATE sources SET size = -1, sha256 = '' WHERE id = ANY($1::bigint[])`, [[...dirty]]);
+  await db.query(`INSERT INTO state (k, v) VALUES ('redact', jsonb_build_object('ver', $1::text, 'requeued', $2::int, 'at', now()))
+    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [ver, dirty.size]);
+  return dirty.size;
+}
+
 export type SourceMeta = {
   tool: string; path: string; kind: string; sessionId: string; project: string;
   size: number; mtimeMs: number; sha256: string;
@@ -382,13 +420,16 @@ export async function store(db: pg.Pool, m: SourceMeta, turns: StoredTurn[], inT
          SELECT id, $1, tu, sf, st, $2, $3, NULLIF(t, '')::timestamptz, h, x, w::tsvector, bg::tsvector, $4
          FROM unnest($5::text[], $6::text[], $7::int[], $8::int[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[])
            AS v(id, tu, sf, st, t, h, x, w, bg)
-         ON CONFLICT (id) DO UPDATE SET turn_uuid = EXCLUDED.turn_uuid, seq_from = EXCLUDED.seq_from, seq_to = EXCLUDED.seq_to, ts = EXCLUDED.ts
-           WHERE chunks.source_id = EXCLUDED.source_id AND (chunks.turn_uuid, chunks.seq_from, chunks.seq_to, chunks.ts)
-             IS DISTINCT FROM (EXCLUDED.turn_uuid, EXCLUDED.seq_from, EXCLUDED.seq_to, EXCLUDED.ts)`, // a rewritten source (replace) renumbers its turns; a re-dated note (obsidian.ts) moves its ts
+         ON CONFLICT (id) DO UPDATE SET turn_uuid = EXCLUDED.turn_uuid, seq_from = EXCLUDED.seq_from, seq_to = EXCLUDED.seq_to, ts = EXCLUDED.ts,
+           ctx_header = EXCLUDED.ctx_header, words = EXCLUDED.words,
+           -- the vector embeds the header too (embed.ts): a changed one (the id hashes only its base) is re-embedded by backfill
+           embedding = CASE WHEN chunks.ctx_header = EXCLUDED.ctx_header THEN chunks.embedding END,
+           model_ver = CASE WHEN chunks.ctx_header = EXCLUDED.ctx_header THEN chunks.model_ver END
+           WHERE chunks.source_id = EXCLUDED.source_id AND (chunks.turn_uuid, chunks.seq_from, chunks.seq_to, chunks.ts, chunks.ctx_header)
+             IS DISTINCT FROM (EXCLUDED.turn_uuid, EXCLUDED.seq_from, EXCLUDED.seq_to, EXCLUDED.ts, EXCLUDED.ctx_header)`, // a rewritten source (replace) renumbers its turns; a re-dated note (obsidian.ts) moves its ts
         [sourceId, m.sessionId, m.project, CHUNKER_VER, b.map((k) => k.id), b.map((k) => k.turnUuid), b.map((k) => k.seqFrom),
           b.map((k) => k.seqTo), b.map((k) => k.ts), b.map((k) => k.ctxHeader), b.map((k) => k.text),
-          b.map((k) => toTsvector(words(`${k.ctxHeader}
-${k.text}`))), b.map((k) => bigramTsvector(bigramRuns(k.text)))],
+          b.map((k) => chunkWords(k.ctxHeader, k.text)), b.map((k) => bigramTsvector(bigramRuns(k.text)))],
       );
     }
     if (inTx) await inTx(c, sourceId);
@@ -410,6 +451,7 @@ async function hideAsOf(db: pg.Pool, hub: string[]): Promise<string | null> {
   // indexed no longer resolves; match its labels too if that shows up
   // A chat already hidden like them (hide_as: shown Claude-only data, or a fact dreamed from one) counts too, by chunk id or
   // fact id: Claude sees it, and its quote of that text would otherwise reach every app.
+  if (hub.includes(GOOGLE_HIT)) return 'google';
   const text = hub.join('\n');
   const ids = [...new Set(text.match(/\b[0-9a-f]{8,16}\b/g) ?? [])].map((id) => `${id}%`);
   const fids = [...new Set(text.match(/\b[FSI][0-9a-f]{8}\b/g) ?? [])];
@@ -431,7 +473,7 @@ export async function sessionHideAs(db: pg.Pool, files: string[], force = false)
     const st = statSync(f), o = old.get(f);
     if (!force && o && Number(o.size) === st.size && Number(o.mtime_ms) === Math.round(st.mtimeMs)) continue;
     const raw = readFileSync(f, 'utf8');
-    if (raw.includes('__memory_')) parseClaude(raw, undefined, hub); // parseSubagent collects the same hub
+    if (mayHub(raw)) parseClaude(raw, undefined, hub); // parseSubagent collects the same hub
   }
   return hideAsOf(db, hub);
 }

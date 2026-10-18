@@ -18,7 +18,7 @@ const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile } = await import('../src/importer.ts');
 const { saveNote, writeNote, md5, isGlobalFact, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
-const { search, hitLine, RANK } = await import('../src/search.ts');
+const { search, hitLine, isOtherProject, RANK } = await import('../src/search.ts');
 const { searchText, briefLine, assocText } = await import('../src/mcp.ts');
 const { compete } = await import('../src/synapse.ts');
 
@@ -101,18 +101,20 @@ test('project filter keeps the curated facts of that project (their chunks live 
 });
 
 test('dream neighbour lookup (tier: 0) ranks by similarity, not by the priority tier', async () => {
-  const fids = async (tier?: number) => (await search(db, 'zuluterm yankeeterm xrayterm', { project: MEMORY_PROJECT, limit: 12, semantic: false, perSession: 1, tier }))
+  // 'เคย ': a question about the past keeps rank order (layers() would list the fact holding all 3 words first)
+  const fids = async (tier?: number) => (await search(db, 'เคย zuluterm yankeeterm xrayterm', { project: MEMORY_PROJECT, limit: 12, semantic: false, perSession: 1, tier }))
     .hits.filter((x) => x.fid && x.status !== 'superseded').map((x) => x.kind);
   assert.equal((await fids(0))[0], 'fact');
   assert.equal((await fids())[0], 'rule', 'sanity: the tier alone lifts the rule above the closer fact');
 });
 
 test('curated slot: the best active fact close to the top result moves up to slot 2', async () => {
-  const pos = async () => (await search(db, 'walrusterm narwhalterm', { semantic: false, limit: 8 })).hits.findIndex((h) => h.fid === 'Fd0000003') + 1;
+  const pos = async (past = '') => (await search(db, `${past}walrusterm narwhalterm`, { semantic: false, limit: 8 })).hits.findIndex((h) => h.fid === 'Fd0000003') + 1;
   const ratio = RANK.slotRatio;
   try { RANK.slotRatio = 99; assert.ok((await pos()) > 2, 'sanity: on score alone it is below slot 2'); }
   finally { RANK.slotRatio = ratio; }
-  assert.equal(await pos(), RANK.slot);
+  assert.equal(await pos('เคย '), RANK.slot, 'a question about the past keeps rank order: the slot');
+  assert.equal(await pos(), 1, 'layers(): a ✓ fact that answers the query goes above the records');
 });
 
 test('a fact prints from its head: no "D: # F<id>" title line or wiki link lines, the fact id is the result id', async () => {
@@ -130,7 +132,7 @@ test('a chat folded under a fact (↳) keeps its "later changed" warning', async
   assert.equal(hits[0].fid, 'Fc0000003');
   assert.deepEqual(hits[0].evidence?.[0]?.changed_to, ['Fc0000002'], 'sanity: the chat is annotated as later changed');
   const lines = searchText(hits, q, true).split('\n');
-  assert.match(lines.find((l) => l.startsWith('↳ source chat')) ?? '', /later changed -> \[Fc0000002\]/);
+  assert.match(lines.find((l) => l.startsWith('↳ source chat')) ?? '', /superseded by \[Fc0000002\]: later changed/);
   assert.ok(lines.slice(1).join('\n').length <= 402, 'one result stays within 400 chars (+ 2 cut marks) below its line');
 });
 
@@ -142,7 +144,7 @@ test('"later changed" points at the current end of a supersede chain, never at a
   const ev = searchText(one.hits, 'lynxport', true).split('\n').find((l) => l.startsWith('↳')) ?? '';
   assert.ok(ev, 'sanity: ↳ line printed');
   assert.doesNotMatch(ev, /later changed/, 'folded under C itself: no warning');
-  assert.match(hitLine(e!), /later changed -> \[Fa0000003\]\)/, 'as a result of its own it points at C');
+  assert.match(hitLine(e!), /superseded by \[Fa0000003\]: decision here later changed\)/, 'as a result of its own it points at C');
 });
 
 test('a fact with many long source chats still prints ≤ 400 chars (+ cut marks) below its line', async () => {
@@ -176,10 +178,10 @@ test('a source chat that says more than its fact keeps its own slot when it fits
 test('GitHub docs are labelled github repo / commits / issue/PR, not chat', async () => {
   const { hits } = await search(db, 'quokkaport', { semantic: false, limit: 1 });
   assert.ok(hits[0].tool, 'search returns the source tool');
-  const doc = (session_id: string) => hitLine({ ...hits[0], fid: null, kind: null, project: 'github/o/r', tool: 'github', src_kind: 'doc', session_id, changed_to: null });
-  assert.match(doc('github:o/r'), /\| github repo/);
-  assert.match(doc('github:o/r:commits'), /\| github commits/);
-  assert.match(doc('github:o/r#12'), /\| github issue\/PR/);
+  const doc = (session_id: string) => hitLine({ ...hits[0], fid: null, kind: null, project: 'github/o/r', tool: 'github', src_kind: 'doc', session_id, changed_to: null, layer: undefined });
+  assert.match(doc('github:o/r'), /\| บันทึก github repo/);
+  assert.match(doc('github:o/r:commits'), /\| บันทึก github commits/);
+  assert.match(doc('github:o/r#12'), /\| บันทึก github issue\/PR/);
 });
 
 test('currentProject priority: in-project hit beats out-of-project rule; out-of-project hit prints compact summary', async () => {
@@ -217,4 +219,25 @@ test('currentProject priority: in-project hit beats out-of-project rule; out-of-
   assert.equal(isGlobalFact('แก้บั๊กหน้าใบกำกับภาษีในระบบนี้'), false);
   const autoGlob = saveNote('กฎเหล็ก: ใช้กับทุกโปรเจกต์ autoglobtest', { project: 'd:/demo', kind: 'rule', now: NOW });
   assert.match(autoGlob, /^facts\/_global\//, 'global hint saves under facts/_global/ even when project is passed');
+});
+
+test('currentProject priority spans the project tree: a sub-folder session sees its parent project (and vice versa) as in-project; catch-alls never span', async () => {
+  // ลุงจืด 2026-10-18: sessions in D:\botstery\stories\x work on botstery, so botstery memories must not rank as another project's
+  const { hits } = await search(db, 'falconkey eaglekey', { semantic: false, limit: 8, currentProject: 'd:/demo/sub' });
+  assert.equal(hits[0]?.session_id, 'inproj', 'parent-project chat ranks #1 from a sub-folder session');
+  const rendered = searchText(hits, 'falconkey eaglekey', true, undefined, 'd:/demo/sub');
+  assert.doesNotMatch(rendered, /เคยคุยในโปรเจกต์ "demo"/, 'parent-project hit is not tagged out-of-project');
+  const h = (project: string) => ({ project, fact_project: undefined, fid: undefined, tool: 'claude' });
+  assert.equal(isOtherProject(h('d:/demo'), 'd:/demo/sub'), false, 'parent folder is the same project');
+  assert.equal(isOtherProject(h('d:/demo/sub/deep'), 'd:/demo'), false, 'child folder is the same project');
+  assert.equal(isOtherProject(h('d:/demo2'), 'd:/demo'), true, 'sibling sharing a prefix is another project');
+  // SQL side, child direction: a fact filed under d:/demo/sub beats another project's pinned rule when searched from d:/demo
+  dreamFact('Ff0000002', 'kestrelkey อยู่ใน sub-folder ของโปรเจกต์หลัก', { project: 'd:/demo/sub' });
+  dreamFact('Ff0000003', 'kestrelkey อยู่ในโปรเจกต์อื่น', { project: 'd:/otherproj', kind: 'rule', pinned: 'true' });
+  await guard();
+  await indexVault(db, MEMORY_VAULT);
+  const sub = await search(db, 'kestrelkey', { semantic: false, limit: 8, currentProject: 'd:/demo' });
+  assert.equal(sub.hits[0]?.fid, 'Ff0000002', 'child-folder fact ranks #1 from the parent project');
+  assert.equal(isOtherProject(h('c:/tmp/scratch'), 'c:/tmp'), true, 'c:/tmp is a catch-all: its sub-folders are separate');
+  assert.equal(isOtherProject(h('d:/otherproj'), 'd:'), true, 'drive root is a catch-all');
 });

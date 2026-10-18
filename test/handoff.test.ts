@@ -71,6 +71,14 @@ test('automatic line: the last session here (≤48 h) came from another app → 
   await db.query(`INSERT INTO facts (source_id, fid, kind, project, valid_at, created_at, source_uuids, session_ids, md5)
     VALUES ($1, 'Shs000001', 'card', $2, now(), now(), '{hs-codex-2}', '{hs-codex}', 'm')`, [card, PROJECT]);
   assert.equal(await h.lastOtherApp(db, PROJECT, 'claude-code'), 'ล่าสุด codex ทำงานนี้ 3 ชม.ก่อน: แก้ rounding ของ ledger ให้ตรง TFRS');
+  // a long session dreamed again ("continues a session already summarised"): its newest card, not the first one
+  const card2 = (await db.query(`INSERT INTO sources (tool, path, kind, session_id, project, size, mtime_ms, sha256)
+    VALUES ('obsidian', 'cards/hs2.md', 'note', 'cards/hs2.md', 'obsidian/memory-hub', 1, 1, 'x') RETURNING id`)).rows[0].id;
+  await db.query(`INSERT INTO turns (uuid, source_id, seq, session_id, role, text_redacted) VALUES ('hs-card2', $1, 0, 'cards/hs2.md', 'note', $2)`,
+    [card2, '# Shs000002 card\n# เพิ่ม test ledger rounding\n\nสรุป…']);
+  await db.query(`INSERT INTO facts (source_id, fid, kind, project, valid_at, created_at, source_uuids, session_ids, md5)
+    VALUES ($1, 'Shs000002', 'card', $2, now() + interval '1 minute', now(), '{hs-codex-2}', '{hs-codex}', 'm')`, [card2, PROJECT]);
+  assert.equal(await h.lastOtherApp(db, PROJECT, 'claude-code'), 'ล่าสุด codex ทำงานนี้ 3 ชม.ก่อน: เพิ่ม test ledger rounding');
   await session('gemini', 'hs-gemini-old', 'นอกช่วง 48 ชม.', 60);
   assert.match(await h.lastOtherApp(db, PROJECT, 'claude-code') ?? '', /^ล่าสุด codex/, 'older than 48 h is ignored');
 });

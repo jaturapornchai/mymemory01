@@ -8,7 +8,7 @@ description: 'Cheap use of the memory-hub MCP (memory_search/get/save), the user
 Calls are usually fast (search ≈0.1 s warm; a cold embedder can add a few seconds); the cost is tokens and round-trips. Aim for 1 search, 0-1 get per question.
 
 ## Tools (exactly 3)
-- `memory_search` {query ≤300 chars, project?, since?, until?, limit? 1-15 (default 6; at most 8 hits, 9-15 act as 8), detail? "brief"|"full"}
+- `memory_search` {query ≤300 chars, project?, kind? "rule"|"decision"|"preference"|"howto"|"fact"|"card"|"note"|"chat", since?, until?, as_of? "YYYY-MM-DD", limit? 1-15 (default 6; at most 8 hits, 9-15 act as 8), detail? "brief"|"full"}
 - `memory_get` {id, view? "text"|"timeline"|"related", around? 0-10, max_chars? 500-20000 (default 6000), limit? 1-8 (related, default 5)}
 - `memory_save` {content? ≤4000, title?, kind? rule|preference|decision|fact|howto, global?, replaces? [fid], mute? [fid]}
 
@@ -38,7 +38,7 @@ Per-app quirks (Codex code mode, Antigravity, ZCode, LM Studio): references/apps
 
 ## Cheapest sequence
 1. One search, 5-8 specific words (project, module, file, error), in the language it was discussed, one topic.
-2. Add `project:"<substring>"` when known (always in apps started outside a project folder). `since`/`until` (ISO dates, inclusive) for date ranges; time words only nudge ranking.
+2. Add `project:"<substring>"` when known (always in apps started outside a project folder). Add `kind:"rule"` / `"decision"` / `"howto"` when looking specifically for a rule, decision or procedure. `since`/`until` (ISO dates, inclusive) for date ranges; `as_of:"YYYY-MM-DD"` for point-in-time queries ("what was true on date X", hides later facts and revives facts superseded after X); time words only nudge ranking.
 3. `limit` 3-4 for a pointed lookup. Above 6 costs an extra DB query; above 15 is a validation error.
 4. Answer from the full snippets; reuse results already in context.
 5. `detail:"brief"` (≈0.4× the tokens per hit; `≈Nt` = cost of memory_get on it) only to list or skim when you expect no get: brief plus one get costs more than full.
@@ -46,9 +46,9 @@ Per-app quirks (Codex code mode, Antigravity, ZCode, LM Studio): references/apps
 7. `view:"timeline"` (≤1500 chars) = what happened around a hit; `view:"related"` = links, backlinks, similar.
 
 ## Reading results
-- First line `ไม่รู้ (not in memory): …` → tell the user memory has no record; do not answer from its near misses unless one clearly matches. No header proves nothing: it misses about half of unseen topics and never shows with since/until or on keyword-only results.
+- First line `ไม่รู้ (not in memory): …` → tell the user memory has no record; do not answer from its near misses unless one clearly matches. No header proves nothing: it misses about half of unseen topics and never shows with since/until/as_of or on keyword-only results.
 - `(keyword-only: embedder busy)` → lower recall, hits still valid. Nothing relevant → one more search is allowed (the embedder is often warm by then). Empty is not proof of absence.
-- `cur` = current fact. `OLD -> [fid]` superseded, `PENDING-REVIEW vs` / `PENDING vs` awaiting approval, `later changed -> [id]` outdated: use the newer id.
+- `cur` = current fact (`as_of:YYYY-MM-DD` when queried with `as_of`). `OLD -> [fid]` superseded, `PENDING-REVIEW vs` / `PENDING vs` awaiting approval, `superseded by [id]` outdated chat: use the newer id. `⚠CONFLICT ↔ [fid]` two current facts disagree (ask him which holds), `STALE` cites a local path that is gone, `มีฉบับแก้รออนุมัติ [fid]` a correction awaits his approval.
 - Cite the id and `src` tag; `AI-only` = the user never said it. Prefer facts over raw chats. Hit dates are UTC; since/until are Asia/Bangkok days.
 
 ## memory_save

@@ -16,13 +16,13 @@ import { hideDreamed, projectName } from './importer.ts';
 import { redactOffsite } from './redact.ts';
 import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
-import { hiddenNameMask, search } from './search.ts';
+import { day, deprecatedNames, GAP_DAYS, HIS, hiddenNameMask, SAID, search } from './search.ts';
 import { rebuildSynapses } from './synapse.ts';
 import { beforeMachineWrite, commitBatch } from './vault-git.ts';
 
 export const RUNS_DIR = process.env.MEMHUB_DREAM_RUNS ?? join(homedir(), 'ai-archive', 'raw', 'memhub-dream');
 const PROMPT = (name: string) => readFileSync(join(ROOT, 'prompts', `${name}.md`), 'utf8');
-const BKK = (d: Date) => d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Bangkok' }); // YYYY-MM-DD
+export const BKK = (d: Date) => d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Bangkok' }); // YYYY-MM-DD
 const SESSION_CAP = 20_000, BATCH_CHARS = 60_000, BATCH_SESSIONS = 12;
 // Sessions per run without --limit: other apps brought ~1000 never-dreamed sessions; the nightly drains them newest first.
 // ponytail: caps sessions, not windows — one huge session still goes whole; a window budget if a night runs too long
@@ -456,7 +456,7 @@ async function loadDigests(db: pg.Pool, ranges: Range[]): Promise<Digest[]> {
   for (const r of ranges) {
     const rows = (await db.query(
       `SELECT t.uuid, t.role, t.ts, t.text_redacted text, s.tool FROM turns t JOIN sources s ON s.id = t.source_id
-       WHERE s.session_id = $1 AND s.tool <> 'obsidian' AND s.kind = 'main' AND ($2::timestamptz IS NULL OR t.ts > $2) AND t.ts <= $3
+       WHERE s.session_id = $1 AND s.tool <> 'obsidian' AND s.kind = 'main' AND s.hide_as IS NULL AND ($2::timestamptz IS NULL OR t.ts > $2) AND t.ts <= $3
        ORDER BY t.ts, s.id, t.seq`, [r.sessionId, r.from, r.to])).rows;
     // one session never spans apps in practice; if two ever share an id, it stays one digest naming both
     const tool = [...new Set(rows.map((x) => x.tool))].join('+');
@@ -542,13 +542,16 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
       const allowed = (e?: string | null) => (e ? c?.E.find((k) => k.fid === emap.get(e)?.fid) ?? emap.get(e) : undefined);
       const target = r.data.op === 'ADD' ? undefined : allowed(r.data.target);
       if (!c || ops.has(c.n) || (r.data.op !== 'ADD' && !target)) { stats.rejected_ids++; continue; } // reject, never repair
-      ops.set(c.n, { op: r.data.op, target, text: r.data.text, why: r.data.why,
+      // UPDATE to the target's own text = same fid = same note: promoting it would supersede the fact by itself
+      const same = r.data.op === 'UPDATE' && !!r.data.text && factId(r.data.text.trim()) === target!.fid;
+      ops.set(c.n, { op: same ? 'NOOP' : r.data.op, target, text: r.data.text, why: r.data.why,
         links: (r.data.links ?? []).map((l) => ({ e: allowed(l.to)!, rel: l.rel })).filter((l) => l.e) });
     }
   }
 
   // Promote: write notes. Only machine-owned keys change; ลุงจืด's own notes are never rewritten.
-  const written = new Map<string, string>(), candRel = new Map<string, string>(); // md5 → rel, c.n → rel
+  const written = new Map<string, string>(), candRel = new Map<string, string>(), noopUuids = new Map<string, string[]>(); // md5 → rel, c.n → rel, rel → uuids
+  const replaced = new Map<string, Existing>(); // rel → the note that replaced it this run
   for (const c of cands) {
     const op = ops.get(c.n);
     if (!op || op.op === 'DROP') continue;
@@ -583,9 +586,14 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
     if (op.op === 'ADD') rel = addNote(c.text, c.uuids, {});
     else if (op.op === 'NOOP') {
       rel = op.target!.rel;
-      if (!op.target!.owned) writeNote(rel, { source_uuids: [...new Set([...op.target!.uuids, ...c.uuids])] }); // mention count
+      // mention count; each candidate holds its own snapshot of the target, so a 2nd NOOP onto it builds on the 1st one's write
+      const uuids = [...new Set([...(noopUuids.get(rel) ?? op.target!.uuids), ...c.uuids])];
+      noopUuids.set(rel, uuids);
+      if (!op.target!.owned) writeNote(rel, { source_uuids: uuids });
     } else {
-      const t = op.target!;
+      // each candidate holds its own snapshot: a 2nd UPDATE/SUPERSEDE of a fact replaced this run builds on that replacement
+      let t = op.target!;
+      while (replaced.has(t.rel)) t = replaced.get(t.rel)!;
       const text = op.op === 'UPDATE' && op.text ? op.text.trim() : c.text;
       const uuids = op.op === 'UPDATE' ? [...new Set([...c.uuids, ...t.uuids])] : c.uuids;
       // a note ลุงจืด wrote/edited/pinned is never changed; a dream-recorded rule yields only to ลุงจืด's own newer words
@@ -600,6 +608,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
         rel = addNote(text, uuids, {}, [`- supersedes:: ${link(t.rel)}`]);
         const newFid = parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.id as string;
         if (writeNote(t.rel, { status: 'superseded', superseded_by: newFid, expired_at: now.toISOString(), invalid_at: c.validAt.toISOString() }) === 'kept-user-edit') stats.kept_user_edit++;
+        replaced.set(t.rel, { ...t, fid: newFid, text, rel, validAt: c.validAt, uuids, owned: false, hand: false, pinned: false });
       }
     }
     candRel.set(c.n, rel);
@@ -711,16 +720,23 @@ export async function retireForgotten(db: pg.Pool, facts: { fid: string; path: s
   return out;
 }
 
-/** hubs/<project> hub.md (Living Project Knowledge Page / Mental Model: freshness, rules, decisions/architecture, experiences/howto,
- *  ใช้บ่อย, ใหม่, ถูกแทนที่, recent cards) + hubs/_review.md. SQL only, no LLM. */
-async function writeHubs(db: pg.Pool) {
-  // a fact dreamed from a chat hidden later (importer.hideDreamed) is no hub line, and an arrow to it shows [[?]]
+const DONT_RE = /ห้าม|อย่า|\b(?:never|do not|don't|must not)\b/i;
+export type HubDoc = { rel: string; fm: Fm; body: string };
+
+/** hubs/<project> hub.md = the playbook every app reads (ลุงจืด 2026-10-18 "ตอน dream ต้องสรุปเป็น kms หรือ skill ที่ ai เอาไปใช้ได้เลย
+ *  … จุดประสงค์คือคิดเหมือนลุงจืด"): current facts only (search.ts ✓) as rules / ห้ามทำ / his preferences / knowledge / howto;
+ *  replaced ones only as "→ X แทน" (superseded; search.ts layers' rules: the older side of a CONFLICT whose newer side is his
+ *  words > GAP_DAYS later, an older fact naming what a fact of his says เลิกใช้); the other conflicts and pending proposals
+ *  under ถามลุงจืดก่อน. Every line [fid] day คำลุงจืด|AI-only. global hub = global facts. + hubs/_review.md. SQL only, no LLM
+ *  (an LLM-written AGENTS.md cost +20% and did not help: project-skills-over-mcp). Reads only: writeHubs writes them. */
+export async function hubDocs(db: pg.Pool): Promise<HubDoc[]> {
+  // a fact dreamed from a chat hidden later (importer.hideDreamed) is no hub line, and an arrow to it shows [?]
   const HID = (col: string) => `CASE WHEN EXISTS (SELECT 1 FROM facts t JOIN sources ts ON ts.id = t.source_id WHERE t.fid = ${col} AND ts.hide_as IS NOT NULL) THEN '?' ELSE ${col} END`;
   const rel = (p: string) => basename(p.replace(/\\/g, '/'), '.md');
   const [rowsRes, unsummarizedRes, mask] = await Promise.all([
     db.query(
       `SELECT f.fid, f.kind, coalesce(f.project, '') project, f.pinned, coalesce(f.importance, 5)::int importance,
-              greatest(cardinality(f.session_ids), 1)::int proof, f.created_at,
+              greatest(cardinality(f.session_ids), 1)::int proof, f.created_at, f.valid_at, ${SAID('f')} said, ${HIS('f')} his,
               ${HID('f.superseded_by')} superseded_by, ${HID('f.review_target')} review_target, s.status, s.path,
               (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1) body,
               (SELECT count(DISTINCT a.session)::int FROM access_log a JOIN chunks c ON c.turn_uuid = a.turn_uuid
@@ -735,66 +751,120 @@ async function writeHubs(db: pg.Pool) {
     hiddenNameMask(db, [...PRIVATE_TOOLS]),
   ]);
   const rows = rowsRes.rows;
+  type R = (typeof rows)[number];
   const pendingByProj = new Map<string, number>(unsummarizedRes.rows.map((r) => [r.project as string, Number(r.n)]));
-  const factTxt = (r: (typeof rows)[number]) =>
+  const factTxt = (r: R) =>
     mask(String(r.body ?? '').replace(/^# [^\n]*\n/, '').split(/\n\n- |\n- (?:from|related|supersedes|superseded_by|review)::/)[0].replace(/\s+/g, ' ').trim());
-  const cardTxt = (r: (typeof rows)[number]) => {
+  const cardTxt = (r: R) => {
     const b = mask(String(r.body ?? '').replace(/^# [^\n]*\n/, ''));
     const title = b.match(/^# ([^\n]+)/)?.[1]?.trim() ?? '';
     const sum = (b.split('\n\n')[1] ?? '').replace(/^\*\*Outcome:\*\*.*$/s, '').replace(/\s+/g, ' ').trim();
     const s = title && sum ? `${title}: ${sum}` : title || sum;
     return s.length > 200 ? `${s.slice(0, 199).trimEnd()}…` : s;
   };
-  const proofTag = (r: (typeof rows)[number]) => (r.proof > 1 ? ` · ×${r.proof} แชต` : '');
-  const withTxt = (r: (typeof rows)[number], extra = '') => {
-    const t = factTxt(r);
-    return `[[${rel(r.path)}]]${t ? ` — ${t}` : ''}${proofTag(r)}${extra}`;
-  };
-  const rankModel = (a: (typeof rows)[number], b: (typeof rows)[number]) =>
+  const at = (r: R) => new Date(r.valid_at ?? r.created_at).getTime();
+  const when = (r: R) => day(r.valid_at ?? r.created_at);
+  const line = (r: R, n = 300) => `[${r.fid}] ${when(r)} ${r.said ? 'คำลุงจืด' : 'AI-only'}${r.proof > 1 ? ` ×${r.proof}` : ''} — ${clip(factTxt(r), n)}`;
+  const rankModel = (a: R, b: R) =>
     (b.proof > 1 ? 1 : 0) - (a.proof > 1 ? 1 : 0) || b.proof - a.proof || b.uses - a.uses || b.importance - a.importance || +b.created_at - +a.created_at;
+  const rank = (a: R, b: R) => Number(b.pinned) - Number(a.pinned) || Number(b.said) - Number(a.said) || rankModel(a, b);
   const EXP_RE = /แก้บั๊ก|สาเหตุ|เพราะ|ต้องรัน|วิธี|ระวัง|fix|bug|root cause|workaround/i;
-  const byProject = new Map<string, typeof rows>();
-  for (const r of rows) (byProject.get(r.project) ?? byProject.set(r.project, []).get(r.project)!).push(r);
+  const byFid = new Map<string, R>(rows.map((r) => [r.fid, r]));
   const fidRel = new Map(rows.map((r) => [r.fid, rel(r.path)]));
+  // accuracy.ts flags (lint --fix nightly, memory_save at once): both sides still current and visible to every app
+  const current = new Set(rows.filter((r) => (r.status ?? 'active') === 'active').map((r) => r.fid));
+  const conflicts = (await db.query(`SELECT substr(k, 10) fid, v FROM state WHERE k LIKE 'conflict:%' ORDER BY k`)).rows
+    .flatMap((r) => (r.v.with as string[]).map((o, i) => ({ a: r.fid as string, b: o, on: r.v.on[i] as string })))
+    .filter((c) => c.a < c.b && current.has(c.a) && current.has(c.b));
+  // retired: fid → why it is likely replaced; asks: the newer side → the older sides it disagrees with (ask him which holds)
+  const retired = new Map<string, string>(), asks = new Map<string, { on: Set<string>; olds: Set<string> }>();
+  const ask = (n: string, o: string, on: string) => {
+    const x = asks.get(n) ?? asks.set(n, { on: new Set(), olds: new Set() }).get(n)!;
+    x.on.add(on); x.olds.add(o);
+  };
+  for (const c of conflicts) {
+    const [o, n] = [byFid.get(c.a)!, byFid.get(c.b)!].sort((x, y) => at(x) - at(y)), gap = (at(n) - at(o)) / 864e5;
+    if (gap > GAP_DAYS && n.his) retired.set(o.fid, `น่าจะเลิกใช้: [${n.fid}] ${when(n)} ใหม่กว่า ${Math.round(gap)} วัน (ขัดกันเรื่อง ${c.on})`);
+    else ask(n.fid, o.fid, c.on);
+  }
+  const byProject = new Map<string, R[]>();
+  for (const r of rows) (byProject.get(r.project) ?? byProject.set(r.project, []).get(r.project)!).push(r);
+  const sec = (title: string, xs: string[], cap = 20) => (!xs.length ? '' : `\n## ${title}\n` + xs.slice(0, cap).map((l) => `- ${l}\n`).join('') +
+    (xs.length > cap ? `- …อีก ${xs.length - cap} ข้อ (memory_search)\n` : ''));
+  const docs: HubDoc[] = [];
   for (const [project, rs] of byProject) {
     const facts = rs.filter((r) => r.kind !== 'card');
     const active = facts.filter((r) => r.status === 'active');
     const cards = rs.filter((r) => r.kind === 'card').sort((a, b) => +b.created_at - +a.created_at);
     const unsummarized = pendingByProj.get(project) ?? 0;
     const freshLabel = unsummarized > 0 ? `มี ${unsummarized} แชตใหม่รอฝัน` : 'สด (ฝันครบทุกแชต)';
-    const rules = active.filter((r) => r.pinned || ['rule', 'feedback'].includes(r.kind))
-      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || rankModel(a, b));
-    const experiences = active.filter((r) => !r.pinned && (r.kind === 'howto' || (r.kind === 'fact' && EXP_RE.test(factTxt(r)))))
-      .sort((a, b) => (b.kind === 'howto' ? 1 : 0) - (a.kind === 'howto' ? 1 : 0) || rankModel(a, b)).slice(0, 10);
-    const expIds = new Set(experiences.map((r) => r.fid));
-    const mentalModel = active.filter((r) => !r.pinned && ['decision', 'preference', 'fact', 'insight'].includes(r.kind) && !expIds.has(r.fid))
-      .sort((a, b) => (b.kind === 'decision' ? 1 : 0) - (a.kind === 'decision' ? 1 : 0) || rankModel(a, b)).slice(0, 12);
-    const list = (xs: typeof rows, f = (r: (typeof rows)[number]) => withTxt(r)) => (xs.length ? xs.map((r) => `- ${f(r)}`).join('\n') : '- (none)');
-    const body = `# ${project ? projectName(project) : 'global'} hub\n\n` +
+    // a fact of his saying "X เลิกใช้" retires older facts here naming X; an AI-only one only asks (search.ts deprecatedNames)
+    const own = projectName(project).toLowerCase();
+    for (const f of active) if (!retired.has(f.fid)) for (const name of deprecatedNames(factTxt(f)).filter((x) => x !== own))
+      for (const h of active) if (h !== f && at(h) < at(f) && !retired.has(h.fid) && factTxt(h).toLowerCase().includes(name)) {
+        if (f.his) retired.set(h.fid, `น่าจะเลิกใช้: [${f.fid}] ${when(f)} บอกว่า ${name} เลิกใช้แล้ว`);
+        else ask(f.fid, h.fid, name);
+      }
+    const here = new Set(facts.map((r) => r.fid));
+    const askHere = [...asks].filter(([n, x]) => here.has(n) || [...x.olds].some((o) => here.has(o)));
+    const asked = new Set(askHere.flatMap(([n, x]) => [n, ...x.olds]));
+    const keep = active.filter((r) => !retired.has(r.fid) && !asked.has(r.fid)).sort(rank);
+    const guide = (r: R) => r.pinned || ['rule', 'feedback', 'preference'].includes(r.kind);
+    const dont = keep.filter((r) => guide(r) && DONT_RE.test(factTxt(r)));
+    const rules = keep.filter((r) => guide(r) && !dont.includes(r) && (r.pinned || r.kind === 'rule'));
+    const prefs = keep.filter((r) => guide(r) && !dont.includes(r) && !rules.includes(r));
+    const howto = keep.filter((r) => !guide(r) && (r.kind === 'howto' || (r.kind === 'fact' && EXP_RE.test(factTxt(r)))));
+    const know = keep.filter((r) => !guide(r) && !howto.includes(r) && ['decision', 'fact'].includes(r.kind));
+    // likely-replaced first: they still look current everywhere else
+    const replaced = [...active.filter((r) => retired.has(r.fid)).sort(rank).map((r) => `${line(r, 200)} → ${retired.get(r.fid)}`),
+      ...facts.filter((r) => r.status === 'superseded').sort((a, b) => +b.created_at - +a.created_at)
+        .map((r) => `${line(r, 200)} → ${r.superseded_by ? `ใช้ [${r.superseded_by}] แทน` : 'เลิกใช้แล้ว (ไม่มีตัวแทน)'}`)];
+    const askLines = [...askHere.map(([n, x]) => `${line(byFid.get(n)!, 200)} · ขัดกันเรื่อง ${[...x.on].join(', ')} กับ:` +
+        [...x.olds].slice(0, 3).map((o) => `\n  - ${line(byFid.get(o)!, 160)}`).join('') + (x.olds.size > 3 ? `\n  - …อีก ${x.olds.size - 3} ข้อ` : '')),
+      ...facts.filter((r) => r.status === 'pending').map((r) => `${line(r, 200)} · AI เสนอให้แทน [${r.review_target ?? '?'}]: รอลุงจืดอนุมัติ (hubs/_review.md)`)];
+    const body = `# ${project ? projectName(project) : 'global'} hub — คู่มือคิดแบบลุงจืด\n\n` +
       `ความจำ active ${active.length} รายการ · การ์ดเซสชัน ${cards.length} ใบ · สถานะ: ${freshLabel}\n\n` +
-      `## Pinned / rules\n${list(rules)}\n\n` +
-      `## โมเดลโปรเจกต์และการตัดสินใจ (Mental Model)\n${list(mentalModel)}\n\n` +
-      `## บทเรียนและวิธีแก้ปัญหา (Experiences & How-to)\n${list(experiences)}\n\n` +
-      `## ใช้บ่อย (30 วัน)\n${list(facts.filter((r) => r.uses > 0).sort((a, b) => b.uses - a.uses || b.proof - a.proof).slice(0, 10), (r) => withTxt(r, ` · ${r.uses} sessions`))}\n\n` +
-      `## ใหม่\n${list(active.slice().sort((a, b) => +b.created_at - +a.created_at).slice(0, 10))}\n\n` +
-      `## ถูกแทนที่ล่าสุด\n${list(facts.filter((r) => r.status === 'superseded').sort((a, b) => +b.created_at - +a.created_at).slice(0, 10), (r) => `[[${rel(r.path)}]] → [[${fidRel.get(r.superseded_by) ?? r.superseded_by}]]`)}\n\n` +
-      `## Recent sessions\n${list(cards.slice(0, 10), (r) => { const c = cardTxt(r); return `[[${rel(r.path)}]]${c ? ` — ${c}` : ''}`; })}\n`;
-    writeNote(`hubs/${hubName(project || 'global')}.md`, {
-      memhub: 'hub', project, freshness: unsummarized > 0 ? `stale:${unsummarized}` : 'up_to_date',
-      active_facts: String(active.length), tags: ['memhub/hub'],
-    }, body);
+      `AI อ่านหน้านี้แล้วทำงานต่อได้ทันที: dream เขียนใหม่ทุกคืนจากความจำที่ยังใช้ได้เท่านั้น\n` +
+      `- ตัดสินใจตาม: กฎ + ห้ามทำ → ลุงจืดชอบแบบนี้ → ความรู้/วิธีทำ · เรื่องใน "ถามลุงจืดก่อน" ถามเขาก่อนลงมือ · "เลิกใช้แล้ว" ห้ามใช้\n` +
+      `- คำลุงจืด = เขาพูด/สั่งบันทึกเอง · AI-only = AI สรุปเอง ไม่มีคำเขายืนยัน · ×N = ยืนยันข้ามแชต · [id] = memory_get ดูต้นทาง\n` +
+      (project ? `- กฎกลางทุกโปรเจกต์: [[global hub]]\n` : '') +
+      sec('กฎล่าสุด (ทำตามเสมอ)', rules.map((r) => line(r)), 25) +
+      sec('ห้ามทำ', dont.map((r) => line(r)), 25) +
+      sec('ลุงจืดชอบแบบนี้ (สไตล์การตัดสินใจ / feedback ที่เคยให้)', prefs.map((r) => line(r))) +
+      sec('ถามลุงจืดก่อน', askLines, 15) +
+      sec('ความรู้และการตัดสินใจล่าสุด', know.map((r) => line(r, 200))) +
+      sec('วิธีทำ (howto / deploy / แก้ปัญหา)', howto.map((r) => line(r, 200)), 15) +
+      sec('เลิกใช้แล้ว → ใช้ตัวใหม่แทน', replaced) +
+      sec('งานล่าสุด (การ์ดเซสชัน · บันทึก)', cards.slice(0, 5).map((r) => `[${r.fid}] ${when(r)} การ์ดเซสชัน — ${cardTxt(r)}`));
+    docs.push({ rel: `hubs/${hubName(project || 'global')}.md`, body, fm: {
+      memhub: 'hub', project, freshness: unsummarized > 0 ? `stale:${unsummarized}` : 'up_to_date', active_facts: String(active.length), tags: ['memhub/hub'],
+    } });
   }
   const pending = rows.filter((r) => r.status === 'pending');
   // forget cascade left these alone: ลุงจืด edited/pinned/wrote them, yet every chat they cite is gone (retireForgotten)
   const orphans = (await db.query(`SELECT s.path FROM facts f JOIN sources s ON s.id = f.source_id
     WHERE (f.edited OR f.pinned OR f.run IS NULL OR f.user_owned) AND coalesce(s.status, 'active') IN ('active', 'pending') AND ${ORPHAN} ORDER BY s.path`)).rows;
-  writeNote('hubs/_review.md', { memhub: 'hub', tags: ['memhub/review'] },
+  const validAt = new Map(rows.map((r) => [r.fid as string, at(r)]));
+  // > GAP_DAYS apart: the newer one is likely the decision now, so the line says which and how to apply it
+  const newer = (a: string, b: string) => {
+    const d = (validAt.get(b)! - validAt.get(a)!) / 864e5, [o, n] = d > 0 ? [a, b] : [b, a];
+    return Math.abs(d) > GAP_DAYS ? ` → [[${fidRel.get(n)}]] ใหม่กว่า ${Math.round(Math.abs(d))} วัน: ถ้าข้อใหม่ถูก ให้ supersede ข้อเก่า (memory_save replaces:[${o}])` : '';
+  };
+  docs.push({ rel: 'hubs/_review.md', fm: { memhub: 'hub', tags: ['memhub/review'] }, body:
     `# Review queue\n\nDream proposals that touch your own notes or assistant-only claims. Open one and set **status**:\n` +
     `- \`active\` = accept (the target gets superseded tonight)\n- \`rejected\` = reject (never proposed again)\n\n` +
     (pending.length ? pending.map((r) => `- [[${rel(r.path)}]] vs [[${fidRel.get(r.review_target) ?? r.review_target}]]`).join('\n') : '- (empty)') + '\n' +
+    (conflicts.length ? `\n## CONFLICT: ขัดกันเอง\nสองข้อนี้ยัง active ทั้งคู่ แต่ข้อหนึ่งบอกว่าไม่เกี่ยว/ห้าม/เลิกใช้ชื่อนี้ อีกข้อใช้ชื่อนี้อยู่. ` +
+      `แก้ข้อที่ผิด (memory_save replaces:[fid]) หรือตั้ง status \`rejected\`\n\n` +
+      conflicts.map((c) => `- [[${fidRel.get(c.a)}]] ↔ [[${fidRel.get(c.b)}]] · ${c.on}${newer(c.a, c.b)}`).join('\n') + '\n' : '') +
     (orphans.length ? `\n## Forgotten chats, your notes\nEvery chat these notes came from was forgotten (\`forget\`), but they are yours (edited, pinned, saved, or a rule/feedback), so they were kept. ` +
       `Delete the note = forget it too · status \`rejected\` = hide it from search · remove the \`source_uuids\` property = keep it as your own\n\n` +
-      orphans.map((r) => `- [[${rel(r.path)}]]`).join('\n') + '\n' : ''));
+      orphans.map((r) => `- [[${rel(r.path)}]]`).join('\n') + '\n' : '') });
+  return docs;
+}
+
+async function writeHubs(db: pg.Pool) {
+  for (const d of await hubDocs(db)) writeNote(d.rel, d.fm, d.body);
   await indexVault(db, MEMORY_VAULT);
   await resolveLinks(db);
 }

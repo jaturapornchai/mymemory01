@@ -20,7 +20,7 @@ Object.assign(process.env, ENV);
 for (const k of ['MEMHUB_ANTHROPIC_ONLY', 'MEMHUB_PRIVATE_SOURCES', 'ANTHROPIC_BASE_URL']) delete process.env[k];
 const { connect, ROOT } = await import('../src/db.ts');
 const { clean, hideDreamed, indexToolFile, normProject } = await import('../src/importer.ts');
-const { privateOk } = await import('../src/guard.ts');
+const { offsiteBackend, privateOk } = await import('../src/guard.ts');
 const { assertAnonymous, buildBrain } = await import('../src/brain.ts');
 
 const db = connect('rw');
@@ -77,6 +77,17 @@ test('privateOk: a Claude app on Anthropic only; z.ai / proxies / other apps / u
     ['some-bot', {}], ['unknown', {}], [undefined, {}], ['my-claude-code', {}]];
   for (const [c, env] of yes) assert.equal(privateOk(c, env), true, `${c} ${JSON.stringify(env)}`);
   for (const [c, env] of no) assert.equal(privateOk(c, env), false, `${c} ${JSON.stringify(env)}`);
+});
+
+test('offsiteBackend (MEMHUB_ANTHROPIC_ONLY=1): only api.anthropic.com passes; a localhost proxy is refused like privateOk', () => {
+  const strict = (url?: string, allow?: string) => offsiteBackend({ MEMHUB_ANTHROPIC_ONLY: '1', ANTHROPIC_BASE_URL: url, MEMHUB_ALLOW_BACKEND: allow });
+  assert.equal(strict(), null);
+  assert.equal(strict('https://api.anthropic.com'), null);
+  assert.equal(strict('https://api.z.ai/api/anthropic'), 'api.z.ai');
+  assert.equal(strict('http://localhost:4000'), 'localhost:4000');
+  assert.equal(strict('http://127.0.0.1:4000/v1'), '127.0.0.1:4000');
+  assert.equal(strict('http://localhost:4000', 'localhost:4000'), null, 'MEMHUB_ALLOW_BACKEND opts one host in');
+  assert.equal(offsiteBackend({ ANTHROPIC_BASE_URL: 'https://api.z.ai' }), null, 'off unless MEMHUB_ANTHROPIC_ONLY=1');
 });
 
 test('index: the fake mail lands with no secret (turns, chunks, headers); a non-private source keeps today\'s redaction', async () => {
@@ -145,7 +156,7 @@ test('MCP: Claude Code / Claude Desktop on Anthropic see them, labelled, still r
     assert.match(o.brief, /Gmail/, name);
     assert.match(o.dated, /gmail marker/, name);
     assert.match(o['dated brief'], /Google Maps timeline/, name);
-    assert.match(o.early, /^no matches/, name);
+    assert.match(o.early, /^ตอนนี้ [^\n]*\n\nno matches/, name);
     assert.match(o['bad until'], /until must be an ISO date/, name);
     assert.match(o['get gmail:t1 16'], /gmail marker.*\[REDACTED:otp\]/s, name);
     assert.doesNotMatch(o['timeline google-timeline 8'], /^not found/, name);
@@ -258,6 +269,12 @@ test('a Claude chat shown a Claude-only hit is Claude-only too: its answers, sum
   file('cs-e', true, chat('cs-e', priv, 'subemarker'));
   await indexFile(db, file('cs-e', false, chat('cs-e', null, 'mainemarker')));
   assert.deepEqual((await db.query(`SELECT kind || ' ' || coalesce(hide_as, '-') f FROM sources WHERE session_id = 'cs-e'`)).rows.map((r) => r.f), ['main google-timeline']);
+  // read Gmail itself through a claude.ai connector (no memory-hub hit): Claude-only too; a non-Google server's list_events is not
+  const called = (sid: string, name: string) => [line(sid, 0, { type: 'user', message: { content: `${WORD} mail question` } }),
+    line(sid, 1, { type: 'assistant', message: { content: [{ type: 'tool_use', id: `${sid}t`, name, input: {} }] } })].join('\n') + '\n';
+  await indexFile(db, file('cs-f', false, called('cs-f', 'mcp__1ea03c1d-7d88-483b-82f2-cbf5caa1777d__get_thread')));
+  await indexFile(db, file('cs-g', false, called('cs-g', 'mcp__ccd_session_mgmt__list_events')));
+  assert.deepEqual((await db.query(`SELECT session_id || ' ' || coalesce(hide_as, '-') f FROM sources WHERE session_id IN ('cs-f', 'cs-g') ORDER BY 1`)).rows.map((r) => r.f), ['cs-f google', 'cs-g -']);
 });
 
 test('a rewritten source that gains a turn in front: kept chunks follow their turn (memory_get reads the right one)', async () => {

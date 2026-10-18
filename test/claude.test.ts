@@ -33,3 +33,26 @@ test('interrupt markers are not user turns', () => {
     user('u3', 'next real question about the widget'),
   ]), [['u3', 'next real question about the widget']]);
 });
+
+test('filesTouched extracts modified file paths across tools and tags every chunk in the round without changing chunk ids', async () => {
+  const { chunkTurns, filesTouched } = await import('../src/chunk.ts');
+  assert.deepEqual(filesTouched([
+    '[Edit] D:\\memoryhub\\src\\lint.ts',
+    '[Write] /home/user/app/src/search.ts',
+    '[edit] src/a.ts src/b.ts',
+    '[NotebookEdit] d:/proj/notebooks/eval.ipynb',
+  ].join('\n')), ['src/lint.ts', 'src/search.ts', 'src/a.ts', 'src/b.ts', 'notebooks/eval.ipynb']);
+
+  const plain = chunkTurns([
+    { uuid: 'u1', seq: 0, role: 'user', ts: '2026-10-01T00:00:00Z', text: 'fix the bug' },
+    { uuid: 'a1', seq: 1, role: 'assistant', ts: '2026-10-01T00:01:00Z', text: 'x'.repeat(1180) },
+  ], 'demo');
+  const withEdit = chunkTurns([
+    { uuid: 'u1', seq: 0, role: 'user', ts: '2026-10-01T00:00:00Z', text: 'fix the bug' },
+    { uuid: 'a1', seq: 1, role: 'assistant', ts: '2026-10-01T00:01:00Z', text: `${'x'.repeat(1180)}\n\n[Edit] D:\\demo\\src\\widget.ts` },
+  ], 'demo');
+  assert.equal(withEdit.length, 2, 'split into 2 chunks');
+  assert.equal(withEdit[0].id, plain[0].id, 'chunk 1 id unchanged when a later turn in the round edits a file');
+  for (const c of withEdit) assert.match(c.ctxHeader, /\[files: src\/widget\.ts\]$/);
+});
+

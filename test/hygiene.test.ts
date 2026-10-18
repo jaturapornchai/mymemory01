@@ -115,7 +115,8 @@ test('lint & fixLint: expired, duplicate pair, orphan, broken link, replaced —
   note('facts/demo/F0000f01 twin one.md', 'F0000f01', ['bbbb-u0'], {}, 'twin one');
   note('facts/demo/F0000f02 twin two.md', 'F0000f02', ['bbbb-u0'], {}, 'twin two');
   note('facts/demo/F0000f03 rule.md', 'F0000f03', ['bbbb-u0'], { kind: 'rule' }, 'twin three'); // same vector, other kind
-  note('facts/demo/F0000f04 links.md', 'F0000f04', ['bbbb-u0'], {}, 'see [[F0000bbb multi]] and [[no such note]]');
+  note('facts/demo/F000000a7 plan-first.md', 'F000000a7', ['bbbb-u0'], {}, 'plan first'); // an imported Claude memory
+  note('facts/demo/F0000f04 links.md', 'F0000f04', ['bbbb-u0'], {}, 'see [[F0000bbb multi]], [[plan-first]] (Claude memory links by name, no fid) and [[no such note]]');
   note('facts/demo/F0000f05 secret.md', 'F0000f05', ['bbbb-u0'], { invalid_at: '2026-09-01T00:00:00.000Z' }, 'from a mail');
   commitBatch(MEMORY_VAULT, 'dream r2');
   await indexVault(db, MEMORY_VAULT);

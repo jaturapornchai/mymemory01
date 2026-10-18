@@ -320,7 +320,7 @@ export const factId = (text: string) => 'F' + md5(text).slice(0, 8);
 const cardRel = (d: Digest) => `sessions/${d.date.slice(0, 7)}/${d.date} ${projectSlug(d.project)} ${d.card.slice(1)}.md`;
 const factRel = (fid: string, text: string, scope: string, project: string) =>
   `facts/${scope === 'global' ? '_global' : projectSlug(project)}/${fid} ${fileName(text.replace(/`/g, ''), 40)}.md`;
-const hubName = (project: string) => `${projectSlug(project)} hub`;
+export const hubName = (project: string) => `${project ? projectSlug(project) : 'global'} hub`; // no project = the global hub
 const link = (rel: string) => `[[${basename(rel, '.md')}]]`;
 
 type Existing = { fid: string; kind: string; status: string | null; text: string; rel: string; owned: boolean; hand: boolean; pinned: boolean; validAt: Date; uuids: string[]; proof: number };
@@ -707,7 +707,7 @@ export async function retireForgotten(db: pg.Pool, facts: { fid: string; path: s
     // a project this forget left with no notes: writeHubs skips it, so its hub would keep listing the forgotten titles
     const left = new Set((await db.query(`SELECT DISTINCT coalesce(project, '') p FROM facts WHERE coalesce(project, '') = ANY($1)`, [[...projects]])).rows.map((r) => r.p));
     for (const p of [...projects].filter((x) => !left.has(x))) {
-      const hub = `hubs/${hubName(p || 'global')}.md`;
+      const hub = `hubs/${hubName(p)}.md`;
       const { fm, body } = existsSync(join(MEMORY_VAULT, hub)) ? parseNote(readFileSync(join(MEMORY_VAULT, hub), 'utf8')) : { fm: {} as Fm, body: '' };
       if (fm.memhub !== 'hub' || fm.project !== p || isEdited(fm, body)) continue; // another project's hub (same slug) / his edit
       beforeMachineWrite(MEMORY_VAULT, hub);
@@ -836,7 +836,7 @@ export async function hubDocs(db: pg.Pool): Promise<HubDoc[]> {
       sec('วิธีทำ (howto / deploy / แก้ปัญหา)', howto.map((r) => line(r, 200)), 15) +
       sec('เลิกใช้แล้ว → ใช้ตัวใหม่แทน', replaced) +
       sec('งานล่าสุด (การ์ดเซสชัน · บันทึก)', cards.slice(0, 5).map((r) => `[${r.fid}] ${when(r)} การ์ดเซสชัน — ${cardTxt(r)}`));
-    docs.push({ rel: `hubs/${hubName(project || 'global')}.md`, body, fm: {
+    docs.push({ rel: `hubs/${hubName(project)}.md`, body, fm: {
       memhub: 'hub', project, freshness: unsummarized > 0 ? `stale:${unsummarized}` : 'up_to_date', active_facts: String(active.length), tags: ['memhub/hub'],
     } });
   }

@@ -115,9 +115,12 @@ export async function resolveLinks(db: pg.Pool) {
   await db.query(`
     UPDATE links l SET dst_id = n.id
     FROM (SELECT DISTINCT ON (k) id, k FROM (                       -- session_id = 'vault/rel/path.md' (forward slashes)
-            SELECT id, lower(regexp_replace(session_id, '^.*/|(?:[.]md)+$', '', 'g')) k, length(session_id) len
-            FROM sources WHERE tool = 'obsidian') x
-          ORDER BY k, len) n                                         -- duplicate names: shortest path wins, like Obsidian
+            SELECT id, lower(regexp_replace(session_id, '^.*/|(?:[.]md)+$', '', 'g')) k, 0 alt, length(session_id) len
+            FROM sources WHERE tool = 'obsidian'
+            UNION ALL -- a memory-hub note "F0567d26f plan-first.md" is also [[plan-first]]: Claude memory files link by name
+            SELECT id, lower(regexp_replace(session_id, '^.*/[FSI][0-9a-f]{8} |(?:[.]md)+$', '', 'g')), 1, length(session_id)
+            FROM sources WHERE tool = 'obsidian' AND session_id ~ '/[FSI][0-9a-f]{8} [^/]+$') x
+          ORDER BY k, alt, len) n                                    -- a real file name first; duplicates: shortest path wins, like Obsidian
     WHERE l.dst_name = n.k AND l.dst_id IS DISTINCT FROM n.id`);
 }
 

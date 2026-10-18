@@ -13,7 +13,7 @@ Object.assign(process.env, { MEMHUB_PG_SCHEMA: SCHEMA, MEMHUB_MEMORY_VAULT: join
 const { connect, ROOT } = await import('../src/db.ts');
 const { md5, writeNote, MEMORY_VAULT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
-const { consolidate } = await import('../src/dream.ts');
+const { consolidate, hubName } = await import('../src/dream.ts');
 
 const db = connect('rw');
 type O = { at?: string; his?: boolean; global?: boolean; status?: string; superseded_by?: string; review_target?: string };
@@ -87,4 +87,5 @@ test('global rules live in the global hub; a project hub points there', () => {
   assert.match(section(hub('global'), 'กฎล่าสุด'), new RegExp(`- \\[${F.glob}\\] 2026-10-01 คำลุงจืด — `));
   assert.doesNotMatch(hub('plbk'), new RegExp(F.glob));
   assert.match(hub('plbk'), /\[\[global hub\]\]/);
+  assert.equal(hubName(''), 'global hub'); // a card of no project links the file the global hub is written to
 });

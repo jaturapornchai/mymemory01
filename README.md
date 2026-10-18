@@ -64,7 +64,7 @@ flowchart LR
 | แหล่ง | อ่านจากไหน | หมายเหตุ |
 |---|---|---|
 | Claude Code | `~/.claude/projects/**/*.jsonl` | รวม subagent; hook ส่งเข้าดัชนีหลังจบแต่ละรอบ (ไม่เกินทุก 10 นาที) |
-| Claude memory | `~/.claude/projects/<slug>/memory/*.md` (ไม่รวม `MEMORY.md`) | sync ทุกชั่วโมง: ไฟล์ละ 1 fact ของ project นั้น (AI ทุกตัวเห็น); ไฟล์เปลี่ยน = ฉบับใหม่แทนฉบับเก่า, ไฟล์ถูกลบ = fact เก่า superseded, ซ้ำกับ fact เดิม (cosine ≥ 0.92) = ข้าม; slug ที่โฟลเดอร์หายและไม่มีแชตเก็บไว้ = ข้าม; ลงวันที่ตามที่ Claude เขียนไฟล์ (`modified` ใน metadata ไม่มีก็ใช้เวลาแก้ไฟล์) ไม่ใช่วันนำเข้า ความจำเก่าที่เพิ่งนำเข้าจึงไม่ดูใหม่กว่าคำสั่งหลังจากนั้น |
+| Claude memory | `~/.claude/projects/<slug>/memory/*.md` (ไม่รวม `MEMORY.md`) | sync ทุกชั่วโมง: ไฟล์ละ 1 fact ของ project นั้น (AI ทุกตัวเห็น); ไฟล์เปลี่ยน = ฉบับใหม่แทนฉบับเก่า, ไฟล์ถูกลบ = fact เก่า superseded, ซ้ำกับ fact เดิม (cosine ≥ 0.92) = ข้าม; slug ที่โฟลเดอร์หายและไม่มีแชตเก็บไว้ = ข้าม; ลงวันที่ตามที่ Claude เขียนไฟล์ (`modified` ใน metadata ไม่มีก็ใช้เวลาแก้ไฟล์) ไม่ใช่วันนำเข้า ความจำเก่าที่เพิ่งนำเข้าจึงไม่ดูใหม่กว่าคำสั่งหลังจากนั้น; ลิงก์ `[[name]]` ระหว่างไฟล์ memory ตามไปเจอโน้ต `F<id> name` ได้ (ลิงก์ไปความจำที่ยังไม่มีจริงขึ้นเป็น "ลิงก์เสีย" ใน lint) |
 | Codex | `~/.codex/sessions/` + `archived_sessions/` | งาน `codex exec` ค้นได้ แต่ไม่เอาไปฝัน |
 | Gemini CLI | `~/.gemini/tmp/<project>/chats/` | Gemini ลบแชตเก่าเอง ที่นี่จึงอาจเป็นสำเนาเดียวที่เหลือ |
 | Antigravity | `~/.gemini/antigravity*/brain/*/…/transcript*.jsonl` | อ่านเฉพาะไฟล์ข้อความธรรมดา (`*.pb` เข้ารหัสอยู่) |

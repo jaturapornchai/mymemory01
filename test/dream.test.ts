@@ -526,6 +526,12 @@ test('repairSession: over-long card fields, null arrays, float importance, or on
   assert.equal(r.data!.facts[0].confidence, 0.9);
   assert.ok(r.data!.facts[0].text.length <= 400 && r.data!.facts[0].text.endsWith('…'));
   assert.equal(El.safeParse(repairSession({ s: null, card: bad.card, facts: [] })).success, false); // unknown session: still dropped
+  // live 2026-10-20: DeepSeek closed card after summary, so outcome/decisions/open landed on the session and 4 sessions lost their card
+  const early = { s: 'S2', card: { title: 't', summary: 's' }, outcome: 'partial', decisions: ['d'], open: ['o'], facts: [fact] };
+  const e = El.safeParse(repairSession(early));
+  assert.ok(e.success);
+  assert.deepEqual(e.data!.card, { title: 't', summary: 's', outcome: 'partial', decisions: ['d'], open: ['o'] });
+  assert.equal(e.data!.facts.length, 1);
 });
 
 test('repairOp: an over-long UPDATE becomes ADD instead of losing the fact; other ops just drop the text; DeepSeek nulls/long why repaired at word boundary', () => {

@@ -596,6 +596,9 @@ node web/scripts/public-check.mjs https://<เว็บของเรา>/  # �
 **ค้นไม่เจอแชตล่าสุด / hook หรืองานตั้งเวลาไม่ทำงาน?**
 ดู error ของการนำเข้าที่ `ingest.log` (โฟลเดอร์โปรเจกต์) และของงานตั้งเวลาที่ `logs\hourly.log` / `logs\nightly.log` · ตรวจว่าแอปต่อ MCP ติดด้วย `claude mcp list` หรือ `node scripts/mcp-smoke.ts "คำค้น"` · งานตั้งเวลาเรียก Node ที่ `C:\Program Files\nodejs\node.exe` ถ้าลง Node ด้วย nvm/fnm/volta ให้แก้ path ใน `scripts/hourly.cmd` และ `scripts/nightly.cmd`
 
+**hub ขึ้น "มี N แชตใหม่รอฝัน" / log ฝันบอก `without a card (retried next run)`?**
+แชตที่ฝันแล้วไม่ได้การ์ดจะไม่ถูกนับว่าฝันแล้ว คืนถัดไปลองใหม่เอง · ดูเหตุผลที่บรรทัด `dropped a session: <ฟิลด์> <ปัญหา>` ใน `logs\nightly.log` (คำตอบ JSON ของ DeepSeek ผิดรูปที่ซ่อมได้ เช่น ใส่ฟิลด์การ์ดผิดชั้น ใส่ข้อความยาวเกิน จะถูกซ่อมก่อนตรวจ ไม่ทิ้งทั้งแชต)
+
 **ถ้าฐานข้อมูลพัง/อยากเริ่มใหม่?**
 แชต โน้ต และข้อเท็จจริงสร้างใหม่ได้จากสำเนาใน `~/ai-archive` + vault: `docker compose down -v` → `docker compose up -d` → `migrate` → `sync` แต่สิ่งที่อยู่ในฐานข้อมูลอย่างเดียวจะหาย: รายการ `forget` (สิ่งที่สั่งลืมจะกลับมา ต้องสั่งใหม่), ประวัติการใช้งาน, งานส่งต่อ, และสถานะการฝัน (ฝันจะเริ่มไล่ใหม่)
 

@@ -187,7 +187,9 @@ const repairFact = (f: any) => (!f || typeof f !== 'object' ? f : {
   ...(f.invalid_at === '' ? { invalid_at: null } : {}),
 });
 export const repairSession = (x: any) => (!x?.card ? x : { ...x,
-  card: { ...x.card, title: clip(x.card.title, 80), summary: clip(x.card.summary, 600), decisions: clipAll(x.card.decisions, 200), open: clipAll(x.card.open, 200) },
+  // live 2026-10-20: card closed right after summary → outcome/decisions/open on the session, the whole batch lost its cards
+  card: { outcome: x.outcome, ...x.card, title: clip(x.card.title, 80), summary: clip(x.card.summary, 600),
+    decisions: clipAll(x.card.decisions ?? x.decisions, 200), open: clipAll(x.card.open ?? x.open, 200) },
   facts: Array.isArray(x.facts) ? x.facts.map(repairFact).filter((f: unknown) => SessionA.shape.facts.element.safeParse(f).success).slice(0, 8) : x.facts });
 // Pass B (trial 2026-10-10 + live 2026-10-13): DeepSeek JSON mode emits null for unused optional fields, >160-char Thai why,
 // or >400-char UPDATE text. An over-long UPDATE becomes ADD ("if both do not fit … choose ADD"); non-UPDATE ops drop text.
@@ -475,7 +477,9 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
   const log = o.log ?? console.log;
   const a = SchemaA.safeParse(rawA);
   const sessions = a.success ? a.data.sessions : (z.object({ sessions: z.array(z.unknown()) }).safeParse(rawA).data?.sessions ?? [])
-    .map((x) => { const r = SessionA.safeParse(x); return r.success ? r : SessionA.safeParse(repairSession(x)); }).filter((x) => x.success).map((x) => x.data!);
+    .map((x) => { const r = SessionA.safeParse(x); return r.success ? r : SessionA.safeParse(repairSession(x)); })
+    .filter((x) => x.success || void log(`  dropped a session: ${x.error!.issues.slice(0, 2).map((i) => `${i.path.join('.')} ${i.message}`).join('; ')}`))
+    .map((x) => x.data!);
   const cands: Cand[] = [];
   const cards = new Map<string, { d: Digest; card: (typeof sessions)[number]['card']; facts: string[] }>();
   for (const s of sessions) {

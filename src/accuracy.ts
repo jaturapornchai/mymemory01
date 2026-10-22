@@ -96,7 +96,7 @@ export async function factTexts(db: pg.Pool, hide: string[], project?: string | 
 
 // ---- STALE: a local path the fact cites is gone ----
 const ABS = /\b[A-Za-z]:[\\/][^\s"'`<>|*?,;()[\]{}\u0E00-\u0E7F]*/g;
-const REL = /(?<![\w.:\\/~-])(?:[\w-][\w.-]*\/)+[\w-]+\.[A-Za-z]\w{0,4}(?![\w/])/g;
+const REL = /(?<![\w.:\\/~-])(?:[\w-][\w.-]*\/)+[\w-]+(?:\.[\w-]+)*\.[A-Za-z]\w{0,4}(?![\w/-]|\.[\w-])/g; // dotted names (x.spec.ts); never end mid-name (x.exe.bak-1)
 const subdirs = new Map<string, string[]>();
 /** "C:\Program" of "C:\Program Files\…": the path went on after a space. */
 const cutAtSpace = (p: string) => {

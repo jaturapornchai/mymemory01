@@ -100,6 +100,10 @@ test('missingPaths: an absolute path gone, a relative one under the project root
   assert.ok(got.some((p) => p.includes('gone.md')), String(got));
   assert.ok(got.some((p) => p.includes('acctest-nope')), String(got));
   assert.ok(!got.some((p) => /a\.md|x\.io|docs$/.test(p)), String(got));
+  writeFileSync(join(tmp, 'docs', 'x.spec.ts'), ''); // a dotted name was cut to docs/x.spec and flagged STALE
+  assert.deepEqual(missingPaths('docs/x.spec.ts and docs/gone.spec.ts', normProject(tmp)), ['docs/gone.spec.ts']);
+  writeFileSync(join(tmp, 'docs', 'x.exe.bak-1-r2'), ''); // was cut at '-' to docs/x.exe.bak and flagged
+  assert.deepEqual(missingPaths('backup docs/x.exe.bak-1-r2', normProject(tmp)), []);
 });
 
 test('SessionStart: the identity fact is line 1 (not one of the 5 rules), then the BC/CHAMP warning; the wrong rule carries its flags', async () => {

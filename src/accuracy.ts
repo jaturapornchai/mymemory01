@@ -252,14 +252,18 @@ const userText = (o: Row): string | null => { // a Claude Code user line he type
   const c = o.message.content;
   return typeof c === 'string' ? c : Array.isArray(c) && !c.some((b) => b?.type === 'tool_result') ? c.filter((b) => b?.type === 'text').map((b) => b.text).join('\n') : null;
 };
+// the desktop app stores a typed URL as [www.x.com](https://www.x.com), the AI quotes what it saw: www.x.com (2026-10-25).
+// The SQL below drops links the same way.
+const flat = (s: string) => s.replace(/\[([^\]]*)\]\([^)\s]*\)/g, (_, t: string) => t).replace(/\s+/g, ' ').trim();
 /** memory_save user_quote: his words (≥ 6 chars, whitespace-insensitive) in a user turn of a main chat from the last 2 days, or in a live
  *  Claude Code transcript written in the last 30 min (this turn is not indexed yet). ponytail: other apps' live files are not read;
  *  their quote counts once the Stop hook indexed the turn, else the correction waits for review as before. */
 export async function userSaid(db: pg.Pool, quote: string, liveDir = LIVE_DIR): Promise<boolean> {
-  const q = quote.replace(/\s+/g, ' ').trim();
+  const q = flat(quote);
   if (q.length < 6) return false;
   if ((await db.query(`SELECT 1 FROM sources s JOIN turns t ON t.source_id = s.id WHERE s.kind = 'main' AND t.role = 'user'
-    AND t.ts > now() - interval '2 days' AND left(t.text_redacted, 1) <> '[' AND strpos(regexp_replace(t.text_redacted, '\\s+', ' ', 'g'), $1) > 0 LIMIT 1`, [q])).rowCount) return true;
+    AND t.ts > now() - interval '2 days' AND left(t.text_redacted, 1) <> '['
+    AND strpos(regexp_replace(regexp_replace(t.text_redacted, '\\[([^]]*)\\]\\([^)[:space:]]*\\)', '\\1', 'g'), '\\s+', ' ', 'g'), $1) > 0 LIMIT 1`, [q])).rowCount) return true;
   const probe = q.split(' ').sort((a, b) => b.length - a.length)[0];
   const files: string[] = [];
   const walk = (d: string, depth: number) => {
@@ -275,7 +279,7 @@ export async function userSaid(db: pg.Pool, quote: string, liveDir = LIVE_DIR): 
     try { readSync(fd, b, 0, b.length, size - b.length); } finally { closeSync(fd); }
     for (const line of b.toString('utf8').split('\n')) {
       if (!line.includes(probe)) continue;
-      try { if (userText(JSON.parse(line))?.replace(/\s+/g, ' ').includes(q)) return true; } catch { /* a cut first line */ }
+      try { if (flat(userText(JSON.parse(line)) ?? '').includes(q)) return true; } catch { /* a cut first line */ }
     }
   }
   return false;

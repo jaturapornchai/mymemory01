@@ -19,7 +19,7 @@ const { connect, ROOT } = await import('../src/db.ts');
 const { normProject } = await import('../src/importer.ts');
 const { md5, noteFid, parseNote, renderNote, saveNote, sha, writeNote, MEMORY_VAULT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
-const { accuracyFlags, conflictPairs, missingPaths, polarity, saveFlags } = await import('../src/accuracy.ts');
+const { accuracyFlags, conflictPairs, missingPaths, polarity, saveFlags, userSaid } = await import('../src/accuracy.ts');
 const { importClaudeMemory, parseMemory } = await import('../src/claude-memory.ts');
 
 const db = connect('rw');
@@ -173,6 +173,20 @@ test('memory_save user_quote: his words not in his chat → review as before; fo
   const dir = join(MEMORY_VAULT, 'facts', 'memoryhub'), file = readdirSync(dir).find((f) => f.startsWith(noteFid(fixed)))!;
   const fm = parseNote(readFileSync(join(dir, file), 'utf8')).fm;
   assert.equal(fm.user_quote, 'PROJECT นี้ไม่เกี่ยวกับ BC นะ');
+});
+
+test('user_quote: a URL the app turned into a markdown link still matches what the AI saw ("ให้ขึ้น www.x.com เลย")', async () => {
+  const live = join(tmp, 'live-md'), dir = join(live, 'p');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 's.jsonl'), JSON.stringify({ type: 'user', message: { role: 'user', content: 'ตั้งกฏ ไม่ต้องขึ้น acctestfb ให้ขึ้น [www.acctest.com](https://www.acctest.com) เลย' } }) + '\n'
+    + JSON.stringify({ type: 'user', message: { role: 'user', content: 'acctestplain ขึ้น www.acctest2.com เลย' } }) + '\n');
+  assert.equal(await userSaid(db, 'ตั้งกฏ ไม่ต้องขึ้น acctestfb ให้ขึ้น www.acctest.com เลย', live), true, 'link in the chat, plain in the quote');
+  assert.equal(await userSaid(db, 'acctestplain ขึ้น [www.acctest2.com](https://www.acctest2.com) เลย', live), true, 'plain in the chat, link in the quote');
+  assert.equal(await userSaid(db, 'ไม่ต้องขึ้น acctestfb ให้ขึ้น www.other.com เลย', live), false);
+  const src = (await db.query(`INSERT INTO sources (tool, path, kind, size, mtime_ms, sha256) VALUES ('claude', 'acctest-md.jsonl', 'main', 0, 0, '') RETURNING id`)).rows[0].id;
+  await db.query(`INSERT INTO turns (uuid, source_id, seq, session_id, role, text_redacted, ts) VALUES ('acctest-md', $1, 0, 's', 'user', $2, now())`,
+    [src, 'ตั้งกฏ acctestdb ให้ขึ้น [www.acctest3.com](https://www.acctest3.com) เลย']);
+  assert.equal(await userSaid(db, 'ตั้งกฏ acctestdb ให้ขึ้น www.acctest3.com เลย', join(tmp, 'none')), true, 'indexed turn with a link');
 });
 
 test('Claude memory import: new → fact of its project, unchanged → skipped, changed → supersedes, near-duplicate → skipped, deleted → superseded', async () => {

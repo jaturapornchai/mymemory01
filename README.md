@@ -434,7 +434,7 @@ node src/cli.ts vault undo <rev>     # ย้อน แล้วทำดัช�
 | `MEMHUB_DREAM_RUNNER` | `ollama` | ตัวรันฝันเริ่มต้น (`ollama`, `deepseek`, `claude`, หรือ `files`) |
 | `MEMHUB_DREAM_LIMIT` | `40` | จำนวน session สูงสุดต่อรอบฝัน (เมื่อไม่ได้ใส่ `--limit`) |
 | `MEMHUB_OLLAMA_KEY` | — | API key ของ Ollama Cloud สำหรับการฝัน (ใส่ใน `.env` เท่านั้น) |
-| `MEMHUB_OLLAMA_MODEL` | `deepseek-v4.1-flash` | โมเดลบน Ollama Cloud ที่ใช้ฝัน (ดูรายชื่อได้จาก `https://ollama.com/api/tags`) |
+| `MEMHUB_OLLAMA_MODEL` | `kimi-k3` | โมเดลบน Ollama Cloud ที่ใช้ฝัน (ดูรายชื่อได้จาก `https://ollama.com/api/tags`) — `kimi-k3` สรุปได้ดีสุดจากการทดสอบ แต่คิดเงินตาม token ราว $24/เดือน และช้าราว 3 นาทีต่อชุด; `deepseek-v4.1-flash` ถูกกว่าราว 15 เท่า (ราคา: ollama.com/pricing) |
 | `MEMHUB_DEEPSEEK_KEY` | — | API key ของ DeepSeek สำหรับการฝัน (ใส่ใน `.env` เท่านั้น) |
 | `MEMHUB_DEEPSEEK_MODEL` | `deepseek-flash` | โมเดล DeepSeek ที่ใช้ฝัน |
 | `MEMHUB_DREAM_MODEL` | `sonnet` | โมเดล Claude ที่ใช้ฝันเมื่อเลือก `--runner claude` |

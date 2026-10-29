@@ -644,6 +644,28 @@ test('ollamaRunner: Ollama Cloud /api/chat, same prompt + scrub as DeepSeek, ret
   }
 });
 
+test('ollamaRunner: at most 3 requests in flight (Ollama Cloud below Max), the rest wait here and all finish', async () => {
+  const realFetch = globalThis.fetch, realKey = process.env.MEMHUB_OLLAMA_KEY;
+  process.env.MEMHUB_OLLAMA_KEY = 'test-key';
+  let now = 0, max = 0;
+  globalThis.fetch = (async () => {
+    max = Math.max(max, ++now);
+    await new Promise((r) => setTimeout(r, 20));
+    now--;
+    return new Response(JSON.stringify({ message: { content: '{"ok":1}' }, done_reason: 'stop' }));
+  }) as typeof fetch;
+  try {
+    const llm = ollamaRunner('m', () => {}, 1);
+    const out = await Promise.all([1, 2, 3, 4, 5].map((i) => llm({ id: `A-${i}`, system: '', user: '', schema: {} })));
+    assert.equal(out.length, 5);
+    assert.ok(out.every((x) => (x as { ok: number }).ok === 1));
+    assert.equal(max, 3);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (realKey === undefined) delete process.env.MEMHUB_OLLAMA_KEY; else process.env.MEMHUB_OLLAMA_KEY = realKey;
+  }
+});
+
 test('an UPDATE whose new text is the target itself is a NOOP: the fact is never superseded by itself', async () => {
   await indexFile(db, session('upd1', '2026-09-24', ['FACT: memhub port 5441 bound to 127.0.0.1 only']));
   await run('upd-a');

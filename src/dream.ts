@@ -119,20 +119,33 @@ export const deepseekRunner = (model = process.env.MEMHUB_DEEPSEEK_MODEL ?? 'dee
 
 /**
  * Ollama Cloud, the default dream brain (ลุงจืด 2026-10-29 "ใช้ ollama cloud เป็นสมอง ตอน dream"): native /api/chat with DeepSeek's
- * prompt. deepseek-v4.1-flash = the family the pass A checklist was tuned on. Its `format` schema is ignored (probe 2026-10-29: asked
- * for facts, got rules), so the schema rides in the prompt as for DeepSeek. No peak-hour skip: that double price is DeepSeek's own.
+ * prompt. kimi-k3 won a blind opus judging of 3 real nightly batches (2026-10-29): pass A 7.83 vs 6.67 for deepseek-v4.1-flash, half
+ * the important facts missed, every fact has its project; pass B 9 of 12 disputed ops right vs 7. Cost ~15x flash (~$24 vs ~$1.6 a
+ * month) and ~200 s a batch; ลุงจืด chose it. Its `format` schema is ignored (probe 2026-10-29: asked for facts, got rules), so the
+ * schema rides in the prompt as for DeepSeek.
  */
-export const ollamaRunner = (model = process.env.MEMHUB_OLLAMA_MODEL ?? 'deepseek-v4.1-flash', log = console.log, retryMs = 1000): Llm => async (req) => {
+export const ollamaRunner = (model = process.env.MEMHUB_OLLAMA_MODEL ?? 'kimi-k3', log = console.log, retryMs = 1000): Llm => async (req) => {
   const key = process.env.MEMHUB_OLLAMA_KEY;
   if (!key) throw new Error('MEMHUB_OLLAMA_KEY is not set (.env)');
   if (process.env.MEMHUB_ANTHROPIC_ONLY === '1') throw new Error('refusing ollama: MEMHUB_ANTHROPIC_ONLY=1');
   const body = JSON.stringify({ model, stream: false, think: req.id.startsWith('A-'), options: { temperature: 0, num_predict: 65536 }, messages: offsiteMessages(req) });
-  return offsiteJson('ollama', 'https://ollama.com/api/chat', key, body, retryMs, (r, ms) => {
+  return ollamaSlot(() => offsiteJson('ollama', 'https://ollama.com/api/chat', key, body, retryMs, (r, ms) => {
     const cached = r.prompt_eval_cached_count ?? 0;
     log(`  ${req.id}: in ${(r.prompt_eval_count ?? 0) - cached} + cache ${cached}, out ${r.eval_count ?? '?'} tokens, ${ms} ms`);
     return { text: r.message?.content ?? '', finish: r.done_reason };
-  });
+  }));
 };
+
+/** Ollama Cloud runs 3 requests at once on Pay-as-you-go/Pro (10 on Max) and queues the rest on its side, where the wait counts
+ *  against the 600 s timeout of a 10-batch night: queue here instead. ponytail: fixed at 3; a setting if ลุงจืด moves to Max. */
+const ollamaSlot = (() => {
+  let free = 3;
+  const waiting: (() => void)[] = [];
+  return async <T>(f: () => Promise<T>): Promise<T> => {
+    if (free > 0) free--; else await new Promise<void>((r) => waiting.push(r)); // a finished call hands its slot straight over
+    try { return await f(); } finally { const next = waiting.shift(); if (next) next(); else free++; }
+  };
+})();
 
 /** The messages an offsite LLM gets: prompt + schema + one example first (a shared cached prefix per pass), pass A adds the rule
  *  checklist; the batch scrubbed of key-shaped tokens. A lone surrogate (an emoji cut by a length cap) becomes \ud83d in JSON,

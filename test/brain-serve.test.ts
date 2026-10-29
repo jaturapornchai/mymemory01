@@ -4,10 +4,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { request } from 'node:http';
+import { createServer, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
-const port = 5600 + (process.pid % 300);
+// free ports from the OS: a pid-based one hit TightVNC's 5800 (Windows answers EACCES, not EADDRINUSE)
+const freePort = () => new Promise<number>((r) => { const s = createServer().listen(0, '127.0.0.1', () => { const { port } = s.address() as AddressInfo; s.close(() => r(port)); }); });
+const port = await freePort();
 const get = (path: string, host: string) => new Promise<number>((resolve, reject) => {
   request({ host: '127.0.0.1', port, path, headers: { host } }, (res) => { res.resume(); resolve(res.statusCode ?? 0); }).on('error', reject).end();
 });
@@ -31,7 +34,7 @@ test('brain-serve refuses a foreign Host header on every route (DNS rebinding)',
 
 // --share (friends, through a tunnel): every route needs the link token, then its cookie; ลุงจืด's own AI calls never leave
 test('brain-serve --share: nothing without the link token; the link sets the cookie; /live.json stays empty', async () => {
-  const sp = port + 300; // beside the other test's port
+  const sp = await freePort();
   const call = (path: string, headers: Record<string, string> = {}) => new Promise<{ status: number; cookie: string; body: string }>((resolve, reject) => {
     request({ host: '127.0.0.1', port: sp, path, headers: { host: `127.0.0.1:${sp}`, ...headers } }, (res) => {
       let body = '';
@@ -70,7 +73,7 @@ test('brain-serve --share: nothing without the link token; the link sets the coo
 
 // --open (memory.bcaicloud.com behind Caddy, ลุงจืด 2026-10-08: anyone may play): no token, the --share guards stay
 test('brain-serve --open: no token needed, /live.json empty, secret questions refused, Host guard first', async () => {
-  const op = port + 600;
+  const op = await freePort();
   const call = (path: string, host = `127.0.0.1:${op}`) => new Promise<{ status: number; body: string }>((resolve, reject) => {
     request({ host: '127.0.0.1', port: op, path, headers: { host } }, (res) => {
       let body = '';

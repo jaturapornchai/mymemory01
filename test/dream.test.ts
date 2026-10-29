@@ -19,7 +19,7 @@ process.env.MEMORY_HUB_INTERNAL = '1';
 process.env.MEMHUB_DREAM_LIMIT = '25';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
-const { dream, deepseekRunner, filesRunner, buildDigests, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
+const { dream, deepseekRunner, ollamaRunner, filesRunner, buildDigests, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
 const { rebuildSynapses } = await import('../src/synapse.ts');
 const { parseNote, saveNote, fileName, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
@@ -605,6 +605,42 @@ test('deepseek runner: no key-shaped token leaves, JSON mode with an example, re
   } finally {
     globalThis.fetch = realFetch;
     if (realKey === undefined) delete process.env.MEMHUB_DEEPSEEK_KEY; else process.env.MEMHUB_DEEPSEEK_KEY = realKey;
+  }
+});
+
+test('ollamaRunner: Ollama Cloud /api/chat, same prompt + scrub as DeepSeek, retries 429, unwraps a ```json fence, thinks on pass A only', async () => {
+  const sent: { url: string; auth: string; body: any }[] = [];
+  const replies: { status?: number; content: string }[] = [{ status: 429, content: 'limit' }, { content: '```json\n{"sessions":[]}\n```' }, { content: '{"ops":[]}' }];
+  const realFetch = globalThis.fetch, realKey = process.env.MEMHUB_OLLAMA_KEY, realOnly = process.env.MEMHUB_ANTHROPIC_ONLY;
+  process.env.MEMHUB_OLLAMA_KEY = 'test-key'; // fetch is stubbed: nothing reaches the API
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    sent.push({ url, auth: (init.headers as Record<string, string>).authorization, body: JSON.parse(String(init.body)) });
+    const next = replies.shift()!;
+    if (next.status) return new Response(next.content, { status: next.status });
+    return new Response(JSON.stringify({ message: { role: 'assistant', content: next.content }, done_reason: 'stop', prompt_eval_count: 9, eval_count: 3 }));
+  }) as typeof fetch;
+  try {
+    const leak = 'aB3dE5gH7jK9mN1pQ2rS4tU6v';
+    const out = await ollamaRunner('deepseek-v4.1-flash', () => {}, 1)({ id: 'A-1', system: 'SYS', user: `KEY=${leak} ใช้ตัวนี้ cut \uD83D`,
+      schema: { type: 'object', properties: { s: { type: 'string', pattern: '^S\\d+$' } } } });
+    assert.deepEqual(out, { sessions: [] });
+    assert.equal(sent.length, 2);
+    const b = sent[1].body;
+    assert.equal(sent[1].url, 'https://ollama.com/api/chat');
+    assert.equal(sent[1].auth, 'Bearer test-key'); // pragma: allowlist secret
+    assert.deepEqual([b.model, b.stream, b.think, b.options.temperature], ['deepseek-v4.1-flash', false, true, 0]);
+    assert.ok(!JSON.stringify(b).includes(leak));
+    assert.ok(b.messages[1].content.isWellFormed());
+    assert.match(b.messages[0].content, /^SYS\n\nFinal check before you answer[\s\S]*"s":"S1"/);
+    assert.deepEqual(await ollamaRunner('deepseek-v4.1-flash', () => {}, 1)({ id: 'B-1', system: 'SYS', user: 'u', schema: { type: 'object' } }), { ops: [] });
+    assert.equal(sent[2].body.think, false);
+    assert.ok(!sent[2].body.messages[0].content.includes('Final check'));
+    process.env.MEMHUB_ANTHROPIC_ONLY = '1';
+    await assert.rejects(ollamaRunner('m', () => {}, 1)({ id: 'x', system: '', user: '', schema: {} }), /MEMHUB_ANTHROPIC_ONLY/);
+  } finally {
+    if (realOnly === undefined) delete process.env.MEMHUB_ANTHROPIC_ONLY; else process.env.MEMHUB_ANTHROPIC_ONLY = realOnly;
+    globalThis.fetch = realFetch;
+    if (realKey === undefined) delete process.env.MEMHUB_OLLAMA_KEY; else process.env.MEMHUB_OLLAMA_KEY = realKey;
   }
 });
 

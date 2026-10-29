@@ -1,5 +1,5 @@
 @echo off
-rem memory-hub nightly: dream (DeepSeek off-peak by default; cli skips peak hours and scrubs key-shaped tokens), consolidation, yesterday's daily note (after the dream so its sessions have cards; no LLM, a failure only logs), lint, publish, sem
+rem memory-hub nightly: dream (Ollama Cloud by default, key-shaped tokens scrubbed first), consolidation, yesterday's daily note (after the dream so its sessions have cards; no LLM, a failure only logs), lint, publish, sem
 cd /d "%~dp0.."
 if not exist logs mkdir logs
 echo === %date% %time% >> logs\nightly.log

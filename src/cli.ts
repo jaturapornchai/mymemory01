@@ -303,10 +303,11 @@ try {
       console.log(JSON.stringify({ aliases, ...(sync ? { migrated: splits } : { pending_splits: splits }) }, null, 2));
     }
   } else if (cmd === 'dream') {
-    // dream [--runner deepseek|claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, synapses, hubs)
+    // dream [--runner ollama|deepseek|claude|files] [--run id] [--force] [--limit n] | dream --consolidate (no LLM: approvals, synapses, hubs)
     const d = await import('./dream.ts');
     const opt = (k: string) => (args.includes(k) ? args[args.indexOf(k) + 1] : undefined);
-    const runner = opt('--runner') ?? process.env.MEMHUB_DREAM_RUNNER ?? (process.env.MEMHUB_CLAUDE_BIN ? 'claude' : 'deepseek');
+    const runner = opt('--runner') ?? process.env.MEMHUB_DREAM_RUNNER ?? (process.env.MEMHUB_CLAUDE_BIN ? 'claude' : 'ollama');
+    if (!['ollama', 'deepseek', 'claude', 'files'].includes(runner)) throw new Error(`dream: unknown --runner ${runner}`);
     if (args.includes('--consolidate')) {
       await d.consolidate(db);
       const { MEMORY_VAULT } = await import('./notes.ts');
@@ -323,7 +324,7 @@ try {
       const lim = opt('--limit'); // --limit 0 = no sessions (it once meant the default 25 and dreamed for real)
       if (lim !== undefined && !/^\d+$/.test(lim)) throw new Error(`dream: --limit needs a whole number, got ${lim}`);
       const r = await d.dream(db, { run, force: args.includes('--force'), limit: lim === undefined ? undefined : Number(lim),
-        llm: runner === 'files' ? d.filesRunner(dir) : runner === 'deepseek' ? d.deepseekRunner() : d.claudeRunner() });
+        llm: runner === 'files' ? d.filesRunner(dir) : runner === 'ollama' ? d.ollamaRunner() : runner === 'deepseek' ? d.deepseekRunner() : d.claudeRunner() });
       if (r.status === 'locked') skipped = true;
       console.log(JSON.stringify({ run, status: r.status, stats: r.stats }));
       if (r.pending) console.log(`pending requests (answer each <id>.request.json with <id>.result.json, then rerun):\n${r.pending.map((p) => join(dir, `${p}.request.json`)).join('\n')}`);

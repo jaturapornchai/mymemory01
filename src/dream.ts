@@ -1,7 +1,7 @@
 // Dream: distil finished AI sessions (every app: sources.tool except obsidian) into session cards + facts (notes in the
 // memory-hub vault), reconcile new facts with existing ones (ADD / NOOP / UPDATE / SUPERSEDE, never delete), then rebuild the synapses (synapse.ts) and hub notes.
-// LLM = Claude (claude -p with Anthropic auth, or answered by Claude agents through request/result files), or DeepSeek's API
-// (ลุงจืด 2026-10-10, --runner deepseek). Claude-only sources (Google = kind 'doc', chats shown them = hide_as) are never dreamed.
+// LLM = Ollama Cloud (default since ลุงจืด 2026-10-29), Claude (claude -p with Anthropic auth, or answered by Claude agents through
+// request/result files), or DeepSeek's API (ลุงจืด 2026-10-10, --runner deepseek). Claude-only sources (Google = kind 'doc', chats shown them = hide_as) are never dreamed.
 // Design + sources: docs/research/phase4-design.md §3–5.
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -107,17 +107,49 @@ export const deepseekRunner = (model = process.env.MEMHUB_DEEPSEEK_MODEL ?? 'dee
   const key = process.env.MEMHUB_DEEPSEEK_KEY;
   if (!key) throw new Error('MEMHUB_DEEPSEEK_KEY is not set (.env)');
   if (process.env.MEMHUB_ANTHROPIC_ONLY === '1') throw new Error('refusing deepseek: MEMHUB_ANTHROPIC_ONLY=1');
-  const passA = req.id.startsWith('A-');
   // thinking is on by default (billed as output); max_tokens defaults to 8K, too small for a 12-session pass A in Thai (thinking: up to 18K seen)
-  const body = JSON.stringify({ model, thinking: { type: passA ? 'enabled' : 'disabled' }, temperature: 0, max_tokens: 65536, response_format: { type: 'json_object' }, messages: [
-    { role: 'system', content: `${req.system}${passA ? `\n\n${PROMPT('dream-extract-deepseek')}` : ''}\n\nReply with one json object that follows this JSON schema:\n${JSON.stringify(req.schema)}\n\nExample json (format only):\n${JSON.stringify(sample(req.schema))}` },
-    // a lone surrogate (an emoji cut by a length cap) becomes \ud83d in JSON, which DeepSeek's parser rejects with a 400
-    { role: 'user', content: redactOffsite(req.user).toWellFormed() }] });
+  const body = JSON.stringify({ model, thinking: { type: req.id.startsWith('A-') ? 'enabled' : 'disabled' }, temperature: 0, max_tokens: 65536,
+    response_format: { type: 'json_object' }, messages: offsiteMessages(req) });
+  return offsiteJson('deepseek', 'https://api.deepseek.com/chat/completions', key, body, retryMs, (r, ms) => {
+    const u = r.usage ?? {};
+    log(`  ${req.id}: in ${u.prompt_cache_miss_tokens ?? '?'} + cache ${u.prompt_cache_hit_tokens ?? 0}, out ${u.completion_tokens ?? '?'} tokens, ${ms} ms`);
+    return { text: r.choices?.[0]?.message?.content ?? '', finish: r.choices?.[0]?.finish_reason };
+  });
+};
+
+/**
+ * Ollama Cloud, the default dream brain (ลุงจืด 2026-10-29 "ใช้ ollama cloud เป็นสมอง ตอน dream"): native /api/chat with DeepSeek's
+ * prompt. deepseek-v4.1-flash = the family the pass A checklist was tuned on. Its `format` schema is ignored (probe 2026-10-29: asked
+ * for facts, got rules), so the schema rides in the prompt as for DeepSeek. No peak-hour skip: that double price is DeepSeek's own.
+ */
+export const ollamaRunner = (model = process.env.MEMHUB_OLLAMA_MODEL ?? 'deepseek-v4.1-flash', log = console.log, retryMs = 1000): Llm => async (req) => {
+  const key = process.env.MEMHUB_OLLAMA_KEY;
+  if (!key) throw new Error('MEMHUB_OLLAMA_KEY is not set (.env)');
+  if (process.env.MEMHUB_ANTHROPIC_ONLY === '1') throw new Error('refusing ollama: MEMHUB_ANTHROPIC_ONLY=1');
+  const body = JSON.stringify({ model, stream: false, think: req.id.startsWith('A-'), options: { temperature: 0, num_predict: 65536 }, messages: offsiteMessages(req) });
+  return offsiteJson('ollama', 'https://ollama.com/api/chat', key, body, retryMs, (r, ms) => {
+    const cached = r.prompt_eval_cached_count ?? 0;
+    log(`  ${req.id}: in ${(r.prompt_eval_count ?? 0) - cached} + cache ${cached}, out ${r.eval_count ?? '?'} tokens, ${ms} ms`);
+    return { text: r.message?.content ?? '', finish: r.done_reason };
+  });
+};
+
+/** The messages an offsite LLM gets: prompt + schema + one example first (a shared cached prefix per pass), pass A adds the rule
+ *  checklist; the batch scrubbed of key-shaped tokens. A lone surrogate (an emoji cut by a length cap) becomes \ud83d in JSON,
+ *  which DeepSeek's parser rejects with a 400. */
+const offsiteMessages = (req: LlmReq) => [
+  { role: 'system', content: `${req.system}${req.id.startsWith('A-') ? `\n\n${PROMPT('dream-extract-deepseek')}` : ''}\n\nReply with one json object that follows this JSON schema:\n${JSON.stringify(req.schema)}\n\nExample json (format only):\n${JSON.stringify(sample(req.schema))}` },
+  { role: 'user', content: redactOffsite(req.user).toWellFormed() }];
+
+/** POST to an offsite LLM, 3 tries for a network error / 429 / 5xx and 3 for a reply that is not JSON (empty, cut). read = the
+ *  reply text + finish reason out of the provider's response (it logs the usage). A ```json fence around the reply is dropped. */
+async function offsiteJson(name: string, url: string, key: string, body: string, retryMs: number,
+  read: (r: any, ms: number) => { text: string; finish?: string }): Promise<unknown> {
   for (let attempt = 1; ; attempt++) {
     const t0 = Date.now();
     let res: Response;
     try {
-      res = await fetch('https://api.deepseek.com/chat/completions', { method: 'POST', body, signal: AbortSignal.timeout(600_000),
+      res = await fetch(url, { method: 'POST', body, signal: AbortSignal.timeout(600_000),
         headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` } });
     } catch (e) {
       if (attempt >= 3) throw e;
@@ -129,15 +161,13 @@ export const deepseekRunner = (model = process.env.MEMHUB_DEEPSEEK_MODEL ?? 'dee
         await new Promise((r) => setTimeout(r, attempt * retryMs));
         continue;
       }
-      throw new Error(`deepseek ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      throw new Error(`${name} ${res.status}: ${(await res.text()).slice(0, 300)}`);
     }
-    const r = await res.json() as { choices: { message: { content: string }; finish_reason: string }[]; usage?: Record<string, number> };
-    const u = r.usage ?? {};
-    log(`  ${req.id}: in ${u.prompt_cache_miss_tokens ?? '?'} + cache ${u.prompt_cache_hit_tokens ?? 0}, out ${u.completion_tokens ?? '?'} tokens, ${Date.now() - t0} ms`);
-    try { return JSON.parse(r.choices[0].message.content); }
-    catch (e) { if (attempt >= 3) throw new Error(`deepseek: no json (${r.choices[0]?.finish_reason}): ${String(e).slice(0, 200)}`); }
+    const { text, finish } = read(await res.json(), Date.now() - t0);
+    try { return JSON.parse(text.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, '')); }
+    catch (e) { if (attempt >= 3) throw new Error(`${name}: no json (${finish}): ${String(e).slice(0, 200)}`); }
   }
-};
+}
 
 // ---------------- schemas (JSON schema for the LLM; validation per item in Node: reject, never repair ids) ----------------
 

@@ -140,6 +140,10 @@ const RARE_FRACTION = 0.05; // terms in >5% of chunks don't select candidates (t
 // (bigram + vector legs still run). Any df made the words leg a near-full scan: 270–330 ms for a term in 42,803 of 45,447
 // chunks (idf 0.05, PERF 2026-10-04). 1 = the old fallback (A/B: eval).
 const KW_FALLBACK_MAX_DF = Number(process.env.MEMHUB_KW_FALLBACK_MAX_DF ?? 0.5);
+// The words leg reads every chunk holding a candidate (≈ Σ df): candidates join rarest first while their df adds up to ≤ this
+// (the rarest always joins); the rest still add score. 93 of 200 bench queries summed 4,000–15,300. 2026-10-10 A/B (MCP, 400
+// searches ×2): p50/p95 55/100 → 45/79 ms, keyword-only 46/94 → 36/69; eval tune vis@3–8 same, direct10 −1/88. 0 = no budget.
+const KW_DF_BUDGET = Number(process.env.MEMHUB_KW_DF_BUDGET ?? 4000);
 
 // Keyword legs, run while Ollama embeds the query: $1 words tsquery, $2 bigram tsquery, $3 project, $4 since, $5 before,
 // $6/$7 every query term's tsquery / IDF, $8 tools to hide, $9 until (exclusive end: dateRange), $10-$12 own (OWN).
@@ -359,6 +363,7 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   });
   let cand = scored.filter((t) => t.df <= Math.max(50, RARE_FRACTION * n));
   if (!cand.length) cand = scored.filter((t) => t.df <= KW_FALLBACK_MAX_DF * n).sort((a, b) => a.df - b.df).slice(0, 3);
+  if (KW_DF_BUDGET > 0) { let sum = 0; cand = [...cand].sort((a, b) => a.df - b.df).filter((t, i) => (sum += t.df) <= KW_DF_BUDGET || !i); }
   const wq = cand.length ? cand.map((t) => t.lit).join(' | ') : null;
 
   const project = o.project?.toLowerCase() || null, before = o.before ?? null;

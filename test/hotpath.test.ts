@@ -1,4 +1,4 @@
-// Hot path: search's own-session freshness filter (every leg), term_df refresh vs readers, forget's access_log purge.
+// Hot path: search's own-session freshness filter (every leg), the words leg's df budget, term_df refresh vs readers, forget's access_log purge.
 // Needs the memhub-pg container; throwaway schema + temp vault, and a fake Ollama so the vector leg runs without a GPU.
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -92,4 +92,15 @@ test('forget purges the access_log of what it forgot only: re-chunked turns of o
   ]);
   await forget(db, 'session', 'gone-s');
   assert.deepEqual((await db.query('SELECT query FROM access_log ORDER BY query')).rows.map((r) => r.query), ['keep', 'keep, chunk id changed']);
+});
+
+test('words leg: rarest candidates first while their df adds up to ≤ 4000, the rest only score (live: 93 of 200 queries scanned more)', async () => {
+  const sid = (await db.query('SELECT id FROM sources LIMIT 1')).rows[0].id;
+  await db.query(`INSERT INTO chunks (id, source_id, turn_uuid, seq_from, seq_to, session_id, ctx_header, text, words, bigrams, chunker_ver)
+    SELECT 'fill' || g, $1, 'fill', 0, 0, 'fill', '', '', '', '', 'x' FROM generate_series(1, 40000) g`, [sid]); // corpus ≈ 40k: 5% = 2000
+  await db.query(`ANALYZE chunks; INSERT INTO term_df (word, ndoc) VALUES ('zqbudaa', 1500), ('zqbudbb', 1800), ('zqbudcc', 1900)`);
+  try {
+    const { explain } = await search(db, 'zqbudcc zqbudaa zqbudbb', { semantic: false, explain: true });
+    assert.deepEqual(Object.fromEntries(explain!.terms.map((t) => [t.key, t.used])), { zqbudaa: true, zqbudbb: true, zqbudcc: false });
+  } finally { await db.query(`DELETE FROM chunks WHERE session_id = 'fill'; DELETE FROM term_df WHERE word LIKE 'zqbud%'; ANALYZE chunks`); }
 });

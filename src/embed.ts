@@ -1,5 +1,6 @@
 // Local embeddings via Ollama (never a remote API: embeddings can be inverted back to text).
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type pg from 'pg';
 
@@ -17,7 +18,13 @@ export async function ensureOllama(url = OLLAMA, start?: () => void): Promise<bo
   try {
     if (start) start();
     else {
-      const p = spawn('ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true });
+      // Windows: a detached (console-less) ollama makes every runner it spawns (llama-server.exe) open its own terminal
+      // window, so start it inside a hidden console instead (hidden.vbs = WScript Run ..., 0) that the runners inherit.
+      const script = (f: string) => fileURLToPath(new URL(`../scripts/${f}`, import.meta.url));
+      const [cmd, args]: [string, string[]] = process.platform === 'win32'
+        ? ['wscript.exe', [script('hidden.vbs'), script('ollama-serve.cmd')]]
+        : ['ollama', ['serve']];
+      const p = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
       p.on('error', () => {});
       p.unref();
     }

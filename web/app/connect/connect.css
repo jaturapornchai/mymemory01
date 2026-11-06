@@ -1,0 +1,87 @@
+/* /connect: a plain reading page. body is overflow:hidden for the brain canvas, so this page scrolls itself. */
+.doc {
+  height: 100dvh;
+  overflow-y: auto;
+  font-size: 15px;
+  line-height: 1.7;
+}
+.doc__body {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: max(24px, env(safe-area-inset-top)) 20px 48px;
+}
+.doc a {
+  color: var(--accent);
+}
+.doc h1 {
+  margin: 12px 0 8px;
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.doc h2 {
+  margin: 32px 0 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.doc__crumb,
+.doc__lead,
+.doc dd {
+  color: var(--text-2);
+}
+.doc__crumb {
+  font-size: 13px;
+}
+.doc code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+.doc pre {
+  margin: 8px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  overflow-x: auto; /* long commands scroll: a soft wrap at "--header" read as "- -header" */
+  user-select: all; /* one click selects the whole command */
+}
+.doc__cards {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.doc__cards li {
+  display: grid;
+  gap: 2px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.doc__cards b {
+  font-weight: 600;
+}
+.doc__cards code {
+  user-select: all;
+}
+.doc__cards span {
+  color: var(--text-2);
+}
+.doc__faq {
+  margin: 0;
+}
+.doc__faq div {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.doc__faq dt {
+  font-weight: 600;
+}
+.doc__faq dd {
+  margin: 2px 0 0;
+}
+.doc__back {
+  margin-top: 32px;
+}

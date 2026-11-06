@@ -598,3 +598,6 @@ html[data-theme='light'] .heat {
     outline-color: Highlight;
   }
 }
+.how__link {
+  color: var(--accent);
+}

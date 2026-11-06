@@ -217,6 +217,9 @@ export const HowPanel = memo(function HowPanel(props: {
           ) : (
             <p className="how__note">ข้อมูลชุดนี้ยังไม่แยกตาม AI</p>
           )}
+          <p className="how__note">
+            <a className="how__link" href="/connect">วิธีเชื่อม AI จากเครื่องอื่น (MCP) →</a>
+          </p>
         </section>
 
         <section className="how__sec" aria-labelledby="how-heat">

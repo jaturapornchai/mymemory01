@@ -1,6 +1,6 @@
 // node src/cli.ts <init|migrate [--force]|sync [--google-full]|import [--force] [file]|ingest <live.jsonl>|embed|search [--since d] [--until d] <query>|stats [--latency|--injected [n]]|daily [YYYY-MM-DD] [--out dir]|vault <init|log|diff|undo>|google <login|status [--dry]|revoke>>
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -443,10 +443,12 @@ try {
         }
         let p = normalize(join(out, decodeURIComponent(url.pathname)));
         if (!p.startsWith(out)) { res.writeHead(403); return res.end(); }
-        if (existsSync(p) && !(await import('node:fs')).statSync(p).isFile()) p = join(p, 'index.html');
-        if (!existsSync(p)) p = existsSync(`${p}.html`) ? `${p}.html` : join(out, '404.html');
-        res.writeHead(existsSync(p) ? 200 : 404, { 'content-type': TYPES[extname(p)] ?? 'application/octet-stream' });
-        res.end(existsSync(p) ? readFileSync(p) : 'not found');
+        const isFile = (f: string) => existsSync(f) && statSync(f).isFile();
+        // /connect: Next's export writes connect.html beside a connect/ folder of RSC payloads, so .html beats the folder
+        if (!isFile(p)) p = [`${p}.html`, join(p, 'index.html')].find(isFile) ?? '';
+        const nf = join(out, '404.html');
+        res.writeHead(p ? 200 : 404, { 'content-type': TYPES[extname(p || nf)] ?? 'application/octet-stream' });
+        res.end(p ? readFileSync(p) : existsSync(nf) ? readFileSync(nf) : 'not found');
       } catch (e) { res.writeHead(500); res.end(share ? 'error' : (e as Error).message); }
     }).listen(port, '127.0.0.1', async () => {
       console.log(`brain (local, real labels): http://127.0.0.1:${port}`);

@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { request } from 'node:http';
 import { createServer, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -90,5 +91,8 @@ test('brain-serve --open: no token needed, /live.json empty, secret questions re
     assert.deepEqual(Object.values(await call(`/search?q=${encodeURIComponent('api key ของ openai')}`)), [422, 'secret']);
     assert.deepEqual(Object.values(await call('/graph.json')), [500, 'error'], 'no database: no error text');
     assert.equal((await call('/live.json', `evil.example:${op}`)).status, 403);
+    assert.equal((await call('/no-such-file-here')).status, 404, 'the 404 page answers 404, not 200');
+    // Next's export writes connect.html beside a connect/ folder of RSC payloads: the page must win over the folder
+    if (existsSync(join(ROOT, 'web', 'out', 'connect.html'))) assert.ok((await call('/connect')).body.includes('/mcp/claude'), '/connect serves connect.html');
   } finally { p.kill(); }
 });

@@ -43,6 +43,17 @@ function resultText(content: unknown): string {
 
 const stripReminders = (t: string) => t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
 
+/** Claude Desktop side session: the brief the session that started it wrote (older Claude Code sets no turnOrigin on it). */
+export const BRIEF = /^(?:Task|Background) \(from the session that started this one\):/;
+/** `claude -p` (sdk-cli) / Agent SDK (sdk-ts) run, from Claude Code's own `entrypoint`: a script or another AI typed every prompt. */
+export function isHeadless(raw: string): boolean {
+  for (const l of raw.split('\n', 50)) {
+    if (!l.includes('"entrypoint"')) continue;
+    try { const e = JSON.parse(l).entrypoint; if (typeof e === 'string') return e.startsWith('sdk-'); } catch {}
+  }
+  return false;
+}
+
 // memory-hub's own tools (any MCP server name): their replies are never indexed, only scanned (importer: Claude-only hits)
 const HUB_TOOL = /__memory_(?:search|get|related|timeline)$/;
 // claude.ai Gmail / Drive / Calendar reads (server named by a uuid, or claude_ai_* in the CLI): Google data is Claude-only
@@ -83,6 +94,8 @@ export function parseClaude(raw: string, toolNames = new Map<string, string>(), 
         if (text.startsWith('[Request interrupted')) return; // the harness's Esc marker, not his words
         if (queued && userSeen.has(text)) return;
         userSeen.add(text);
+        // the app or another session wrote it (side-session brief, "the app was quit…"): kept and searchable, never his words
+        if ((o.turnOrigin ?? 'human') !== 'human' || BRIEF.test(text)) role = 'notice';
       }
       out.push({ ...base, role, text });
     };

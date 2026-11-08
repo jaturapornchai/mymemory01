@@ -10,6 +10,7 @@ import { basename, join } from 'node:path';
 import type pg from 'pg';
 import { z } from 'zod';
 import { ROOT } from './db.ts';
+import { BRIEF } from './claude.ts';
 import { backfill } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { hideDreamed, projectName } from './importer.ts';
@@ -276,7 +277,7 @@ const choice = (s: string) => ASK.test(s) && s.includes('"="') ? `[ตอบต�
 export function buildDigests(sessionId: string, project: string, rows: Row[], continued = false, tool = 'claude'): Digest[] {
   const turns: DTurn[] = [];
   const files = new Map<string, number>(); // path → row index first edited
-  let pend: DTurn | null = null;
+  let pend: DTurn | null = null, brief = false;
   const flush = () => {
     if (pend) { const t = pend.text.replace(TOOL_LINE, '').replace(/\n{3,}/g, '\n\n').trim(); if (t) turns.push({ ...pend, text: cut(t, 1500) }); }
     pend = null;
@@ -295,13 +296,16 @@ export function buildDigests(sessionId: string, project: string, rows: Row[], co
         if (c) { pend = null; turns.push({ uuid: r.uuid, role: 'user', ts: r.ts, i, text: cut(c, 2000) }); }
         else if (!(k % 2)) pend = { uuid: r.uuid, role: 'assistant', ts: r.ts, i, text: part };
       }
+    } else if (r.role === 'notice' && BRIEF.test(r.text)) { // a side session's task, written by the session that started it
+      flush(); brief = true;
+      turns.push({ uuid: r.uuid, role: 'assistant', ts: r.ts, i, text: cut(r.text.trim(), 2000) });
     } else if (r.role === 'tool') { // Claude: the asking reply is replaced by what follows, like any non-final assistant row
       const c = choice(r.text.trim());
       if (c) { pend = null; turns.push({ uuid: r.uuid, role: 'user', ts: r.ts, i, text: cut(c, 2000) }); }
     }
   }
   flush();
-  if (!turns.some((t) => t.role === 'user' && t.text.length >= 10)) return []; // nothing ลุงจืด said worth a card
+  if (!brief && !turns.some((t) => t.role === 'user' && t.text.length >= 10)) return []; // nothing ลุงจืด said (or was asked) worth a card
   const size = (t: DTurn) => t.text.length + 8;
   if (turns.reduce((a, t) => a + size(t), 0) > SESSION_CAP) for (const t of turns) if (t.role === 'assistant') t.text = cut(t.text, 600);
   const wins: DTurn[][] = [[]];

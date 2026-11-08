@@ -56,3 +56,14 @@ test('filesTouched extracts modified file paths across tools and tags every chun
   for (const c of withEdit) assert.match(c.ctxHeader, /\[files: src\/widget\.ts\]$/);
 });
 
+
+test('a prompt the app or the session that started this one wrote is a notice, not his words', () => {
+  const sdk = (uuid: string, turnOrigin: string, content: string) =>
+    JSON.stringify({ ...base, type: 'user', uuid, parentUuid: null, turnOrigin, message: { role: 'user', content } });
+  assert.deepEqual(parseClaude([
+    sdk('b1', 'sdk', 'Background (from the session that started this one): fix the demo widget'),
+    user('b2', 'Task (from the session that started this one):\nrename the demo widget'), // older Claude Code: no turnOrigin
+    sdk('b3', 'sdk', 'The app was quit while you were working. Please continue from where you left off.'),
+    sdk('b4', 'human', 'ok go ahead with the demo widget'),
+  ].join('\n')).map((m) => [m.uuid, m.role]), [['b1', 'notice'], ['b2', 'notice'], ['b3', 'notice'], ['b4', 'user']]);
+});

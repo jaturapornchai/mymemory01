@@ -70,7 +70,7 @@ test('all jobs ok and fresh → no line', async () => {
 
 test('a dream whose claude CLI fails: the error reaches health:dream, exit code kept, SessionStart shows the line', async () => {
   // fake claude = node itself: "bad option: --model" → no output → the dream throws, like the OAuth failure did
-  const r = spawnSync(process.execPath, [join(ROOT, 'src', 'cli.ts'), 'dream', '--force'], { encoding: 'utf8', env: { ...ENV, MEMHUB_CLAUDE_BIN: process.execPath } });
+  const r = spawnSync(process.execPath, [join(ROOT, 'src', 'cli.ts'), 'dream', '--force'], { encoding: 'utf8', env: { ...ENV, MEMHUB_CLAUDE_BIN: process.execPath, MEMHUB_DREAM_RUNNER: 'claude' } }); // .env may name another runner
   assert.notEqual(r.status, 0, 'a failed dream still exits non-zero');
   const v = (await db.query(`SELECT v FROM state WHERE k = 'health:dream'`)).rows[0].v;
   assert.equal(v.ok, false);
@@ -115,7 +115,7 @@ async function holding<T>(keys: string[], f: () => Promise<T> | T): Promise<T> {
   try { for (const k of keys) await c.query(`SELECT pg_advisory_lock(hashtext($1))`, [k]); return await f(); }
   finally { await c.query(`SELECT pg_advisory_unlock_all()`); c.release(); }
 }
-const dreamRun = () => spawnSync(process.execPath, [CLI, 'dream', '--force'], { encoding: 'utf8', env: { ...ENV, MEMHUB_CLAUDE_BIN: process.execPath } });
+const dreamRun = () => spawnSync(process.execPath, [CLI, 'dream', '--force'], { encoding: 'utf8', env: { ...ENV, MEMHUB_CLAUDE_BIN: process.execPath, MEMHUB_DREAM_RUNNER: 'claude' } });
 
 test('a run skipped by its lock keeps the previous health row: a hung dream still goes stale', async () => {
   await allOk();

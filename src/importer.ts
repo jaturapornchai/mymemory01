@@ -5,7 +5,7 @@ import { closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openS
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type pg from 'pg';
-import { GOOGLE_HIT, mayHub, parseClaude, parseSubagent, type Msg } from './claude.ts';
+import { GOOGLE_HIT, isHeadless, mayHub, parseClaude, parseSubagent, type Msg } from './claude.ts';
 import { chunkTurns, CHUNKER_VER, type Turn } from './chunk.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
 import { redact, REDACT_VER, redactPersonal, stripPrivate } from './redact.ts';
@@ -384,7 +384,7 @@ export async function store(db: pg.Pool, m: SourceMeta, turns: StoredTurn[], inT
       `INSERT INTO sources (tool, path, kind, session_id, project, size, mtime_ms, sha256, hide_as)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (path) DO UPDATE SET size = EXCLUDED.size, mtime_ms = EXCLUDED.mtime_ms, sha256 = EXCLUDED.sha256,
-         session_id = EXCLUDED.session_id, project = EXCLUDED.project, imported_at = now(), hide_as = coalesce(sources.hide_as, EXCLUDED.hide_as)
+         kind = EXCLUDED.kind, session_id = EXCLUDED.session_id, project = EXCLUDED.project, imported_at = now(), hide_as = coalesce(sources.hide_as, EXCLUDED.hide_as)
        RETURNING id`,
       [m.tool, m.path, m.kind, m.sessionId, m.project, m.size, Math.round(m.mtimeMs), m.sha256, m.hideAs ?? null],
     );
@@ -403,9 +403,9 @@ export async function store(db: pg.Pool, m: SourceMeta, turns: StoredTurn[], inT
          SELECT DISTINCT ON (u) u, $1, s, $2, p, r, NULLIF(t, '')::timestamptz, $3, x, $4
          FROM unnest($5::text[], $6::int[], $7::text[], $8::text[], $9::text[], $10::text[]) AS v(u, s, p, r, t, x)
          ORDER BY u, s -- a transcript can repeat a line: one command may not upsert a uuid twice, the first copy wins
-         ON CONFLICT (uuid) DO UPDATE SET text_redacted = EXCLUDED.text_redacted, project = EXCLUDED.project, session_id = EXCLUDED.session_id
-           WHERE turns.source_id = EXCLUDED.source_id AND (turns.text_redacted, turns.project, turns.session_id)
-             IS DISTINCT FROM (EXCLUDED.text_redacted, EXCLUDED.project, EXCLUDED.session_id)`, // import --force re-applies redaction/project rules
+         ON CONFLICT (uuid) DO UPDATE SET text_redacted = EXCLUDED.text_redacted, project = EXCLUDED.project, session_id = EXCLUDED.session_id, role = EXCLUDED.role
+           WHERE turns.source_id = EXCLUDED.source_id AND (turns.text_redacted, turns.project, turns.session_id, turns.role)
+             IS DISTINCT FROM (EXCLUDED.text_redacted, EXCLUDED.project, EXCLUDED.session_id, EXCLUDED.role)`, // import --force re-applies redaction/project/role rules
         [sourceId, m.sessionId, m.project, !!m.isSub, b.map((t) => t.uuid), b.map((t) => t.seq),
           b.map((t) => t.parentUuid), b.map((t) => t.role), b.map((t) => t.ts), b.map((t) => t.text)],
       );
@@ -511,7 +511,7 @@ export async function indexFile(db: pg.Pool, path: string, force = false, shared
   const hideAs = (await hideAsOf(db, hub)) ?? (shared !== undefined ? shared
     : await sessionHideAs(db, [`${dir}.jsonl`, ...walk(join(dir, 'subagents'))].filter((f) => f.endsWith('.jsonl') && existsSync(f)), force));
   await store(db, {
-    tool: 'claude', path, kind: isSub ? 'subagent' : 'main', sessionId, project,
+    tool: 'claude', path, kind: isSub ? 'subagent' : isHeadless(buf.toString('utf8')) ? 'headless' : 'main', sessionId, project,
     size: st.size, mtimeMs: st.mtimeMs, sha256: hash, label: projectName(project), isSub, hideAs,
     replace: !!old && st.size < Number(old.size), // rewritten (not appended): drop rows so seq numbers stay consistent
   }, turns, async (c) => {

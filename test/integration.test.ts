@@ -151,3 +151,18 @@ test('a changed parser that drops a turn mid-file keeps turns numbered like the 
   assert.deepEqual(rows.map((r) => [r.seq, r.text_redacted]),
     [[0, 'alpha question renum'], [1, 'alpha answer renum'], [2, 'beta answer renum'], [3, 'gamma answer renum']]);
 });
+
+test('a claude -p / Agent SDK transcript is headless; a forced re-import relabels an older row (kind, brief turn role)', async () => {
+  const f = join(dir, 'proj', 'sess-sdkrun.jsonl'), g = join(dir, 'proj', 'sess-briefrun.jsonl');
+  writeFileSync(f, line('user', 'scripted prompt sdkrun', { entrypoint: 'sdk-cli' }) + say('scripted answer sdkrun'));
+  writeFileSync(g, line('user', 'Task (from the session that started this one): briefrun', { entrypoint: 'claude-desktop' }) + say('done briefrun'));
+  await indexFile(db, f); await indexFile(db, g);
+  const kinds = async () => (await db.query(`SELECT s.kind, t.role FROM sources s JOIN turns t ON t.source_id = s.id AND t.seq = 0
+    WHERE s.path = ANY($1) ORDER BY s.path DESC`, [[f, g]])).rows.map((r) => [r.kind, r.role]);
+  assert.deepEqual(await kinds(), [['headless', 'user'], ['main', 'notice']]);
+  // rows indexed before the fix: re-importing the file is how they are relabelled
+  await db.query(`UPDATE sources SET kind = 'main' WHERE path = $1`, [f]);
+  await db.query(`UPDATE turns t SET role = 'user' FROM sources s WHERE s.id = t.source_id AND s.path = $1`, [g]);
+  await indexFile(db, f, true); await indexFile(db, g, true);
+  assert.deepEqual(await kinds(), [['headless', 'user'], ['main', 'notice']]);
+});

@@ -19,7 +19,7 @@ process.env.MEMORY_HUB_INTERNAL = '1';
 process.env.MEMHUB_DREAM_LIMIT = '25';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
-const { dream, deepseekRunner, ollamaRunner, filesRunner, buildDigests, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
+const { dream, deepseekRunner, ollamaRunner, filesRunner, buildDigests, renderBatch, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
 const { rebuildSynapses } = await import('../src/synapse.ts');
 const { parseNote, saveNote, fileName, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
@@ -99,6 +99,20 @@ test('digest: user turns kept, tool lines + bracket turns dropped, files listed'
   assert.equal(d.upto, '2026-09-01T01:02:03.456Z'); // covers the trailing bracket turn too
   assert.equal(d.card, 'Ss');
   assert.deepEqual(buildDigests('s', 'p', [{ uuid: 'x', role: 'user', ts: new Date(), text: 'ok' }]), []); // nothing worth a card
+});
+
+test('digest: a side-session brief is the task, shown as an A line (never his words); a session with only app prompts has no card', () => {
+  const brief = 'Task (from the session that started this one): แก้ไฟล์ demo ให้หน่อย';
+  const [d] = buildDigests('s', 'd:/demo', [
+    { uuid: 'a', role: 'notice', ts: new Date(), text: brief },
+    { uuid: 'b', role: 'assistant', ts: new Date(), text: 'แก้แล้วครับ' },
+  ]);
+  assert.deepEqual(d.turns.map((t) => [t.uuid, t.role]), [['a', 'assistant'], ['b', 'assistant']]);
+  assert.match(renderBatch([d]).text, /T1 A: Task \(from the session/);
+  assert.deepEqual(buildDigests('s', 'p', [
+    { uuid: 'x', role: 'notice', ts: new Date(), text: 'The app was quit while you were working. Please continue from where you left off.' },
+    { uuid: 'y', role: 'assistant', ts: new Date(), text: 'ทำต่อแล้วครับ' },
+  ]), []);
 });
 
 test('digest: his pick from an AI multiple-choice question is a user turn (Claude tool row, ZCode line); dismissed = nothing', () => {

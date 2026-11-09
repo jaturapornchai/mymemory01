@@ -200,10 +200,12 @@ export async function codeSearch(db: pg.Pool, q: string, o: { repo?: string; pat
     .filter((h) => h.files.length); // the hourly index replaced that file between the two queries
 }
 
-/** Hit as text: first file's GitHub link, other copies counted, ≤12 lines around the first line holding a query word. */
+/** Hit as text: first file's GitHub link, other copies counted, ≤12 lines around the line holding the most query words
+ *  (vaultSafe = vaultsafe + vault + safe: its own line, not the first line that only says "vault"); earliest on a tie. */
 export function codeHitText(h: CodeHit, q: string): string {
   const keys = queryTerms(q).map((t) => t.key), lines = h.text.split('\n');
-  const at = Math.max(0, lines.findIndex((l) => words(l).some((w) => keys.some((k) => w.startsWith(k)))));
+  const score = lines.map((l) => { const ws = words(l); return keys.filter((k) => ws.some((w) => w.startsWith(k))).length; });
+  const at = score.indexOf(Math.max(...score));
   const from = Math.max(0, at - 4), to = Math.min(lines.length, from + 12);
   const [f, ...more] = h.files, a = h.line0 + from, b = h.line0 + to - 1;
   const url = `https://github.com/${f.repo}/blob/HEAD/${f.path.split('/').map(encodeURIComponent).join('/')}#L${a}-L${b}`;

@@ -94,3 +94,11 @@ test('re-index: edited file replaced, deleted file gone, a copy in another repo 
   assert.equal((await db.query('SELECT count(*)::int n FROM code_chunks')).rows[0].n, 1, 'old blobs removed, the shared one kept once');
   assert.match(code.codeHitText((await code.codeSearch(db, 'VoidReceipt'))[0], 'VoidReceipt'), /\(\+1 copies: org\/fork-ish\/copy\/receipt\.go\)/);
 });
+
+test('hit text centres on the line holding the whole identifier, not the first line holding one of its parts', () => {
+  const text = ['// the vault notes module', ...Array.from({ length: 18 }, (_, i) => `const filler${i} = ${i};`), 'export const vaultSafe = (s) => s;', '', 'const z = 1;'].join('\n');
+  const t = code.codeHitText({ line0: 1, text, files: [{ repo: 'me/app', path: 'src/notes.ts' }] }, 'vaultSafe');
+  assert.match(t, /^me\/app\/src\/notes\.ts:16-22\n/);
+  assert.match(t, /   20\| export const vaultSafe/);
+  assert.match(code.codeHitText({ line0: 1, text: 'a\nb', files: [{ repo: 'me/app', path: 'x.ts' }] }, 'nothing'), /^me\/app\/x\.ts:1-2\n/); // no line matches → top
+});

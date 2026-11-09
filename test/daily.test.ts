@@ -19,7 +19,7 @@ const { store } = await import('../src/importer.ts');
 const { writeNote, MEMORY_VAULT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { search, hitLine } = await import('../src/search.ts');
-const { dailyNote, writeDaily, placeGuard, yesterday } = await import('../src/daily.ts');
+const { dailyNote, writeDaily, placeGuard, yesterday, catchUpDays } = await import('../src/daily.ts');
 const { commitBatch, kindOf } = await import('../src/vault-git.ts');
 
 const db = connect('rw');
@@ -94,6 +94,16 @@ test('one day per project: apps + counts, first–last time, topics, GitHub, fac
   await assert.rejects(dailyNote(db, '2026-02-31'), /not a date/, 'no roll-over to March');
   await assert.rejects(dailyNote(db, "2026-10-01'; DROP TABLE x"), /not a date/);
   assert.match(yesterday(new Date('2026-10-02T20:00:00Z')), /^2026-10-02$/, 'yesterday in Bangkok: 03:00 on the 3rd → the 2nd');
+});
+
+test('catch-up: the nightly writes yesterday plus any day of the week before it with no note, oldest first', () => {
+  const now = new Date('2026-11-10T03:30:00+07:00'); // the nightly after 11-09's was skipped (rebooted, nobody logged on)
+  assert.deepEqual(catchUpDays(now, () => true), ['2026-11-09'], 'yesterday always (regenerated), nothing else');
+  assert.deepEqual(catchUpDays(now, (d) => d !== '2026-11-08'), ['2026-11-08', '2026-11-09'], 'the skipped night keeps its note');
+  const none = catchUpDays(now, () => false);
+  assert.equal(none.length, 7);
+  assert.equal(none[0], '2026-11-03');
+  assert.equal(none.at(-1), '2026-11-09');
 });
 
 test('place guard: every place the Timeline names (regions, districts, English labels), any country, trip words; everyday words pass', async () => {

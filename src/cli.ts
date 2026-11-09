@@ -330,21 +330,25 @@ try {
       if (r.pending) console.log(`pending requests (answer each <id>.request.json with <id>.result.json, then rerun):\n${r.pending.map((p) => join(dir, `${p}.request.json`)).join('\n')}`);
     }
   } else if (cmd === 'daily') {
-    // daily [YYYY-MM-DD] [--out dir]: the day's activity note (default yesterday, Asia/Bangkok) → vault daily/ + index;
-    // --out = a preview file only (no vault, no git, no index)
+    // daily [YYYY-MM-DD] [--out dir]: the day's activity note → vault daily/ + index; no date = the nightly: yesterday plus
+    // any day of the week before with no note (Asia/Bangkok); --out = preview files only (no vault, no git, no index)
     const d = await import('./daily.ts');
     const out = args.includes('--out') ? args[args.indexOf('--out') + 1] : undefined;
     if (args.includes('--out') && !out) throw new Error('usage: daily [YYYY-MM-DD] [--out dir]');
-    const day = args.find((a) => !a.startsWith('--') && a !== out) ?? d.yesterday();
-    const r = await d.writeDaily(db, day, out);
-    if (r === 'written') {
+    const day = args.find((a) => !a.startsWith('--') && a !== out);
+    let wrote = false;
+    for (const x of day ? [day] : d.catchUpDays()) {
+      const r = await d.writeDaily(db, x, out);
+      wrote ||= r === 'written';
+      console.log(`daily ${x}: ${r}`); // kept-user-edit = ลุงจืด edited that note: left as is
+    }
+    if (wrote) {
       const { MEMORY_VAULT } = await import('./notes.ts');
       const { indexVault, resolveLinks } = await import('./obsidian.ts');
       await indexVault(db, MEMORY_VAULT);
       await resolveLinks(db);
       await (await import('./embed.ts')).backfill(db, 8, () => {}).catch(() => 0); // Ollama down → the next sync embeds it
     }
-    console.log(`daily ${day}: ${r}`); // kept-user-edit = ลุงจืด edited that note: left as is
   } else if (cmd === 'brain') {
     // brain [--public] [--out file.json] [--rebake] → graph for the web viewer (public = anonymized, safe to publish)
     const { buildBrain } = await import('./brain.ts');

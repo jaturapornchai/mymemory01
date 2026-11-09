@@ -2,7 +2,8 @@
 // Per project: which AI apps ran how many sessions and when, each session's topic (its dream card, else its first prompt),
 // GitHub commits / issues, facts created or superseded that day. SQL over what is already indexed.
 // Every app reads the vault, so Claude-only data never gets in: no PRIVATE_TOOLS source and no chat that was shown one
-// (hide_as), hence no places. The nightly writes yesterday; a note ลุงจืด edited is his (notes.writeNote keeps it).
+// (hide_as), hence no places. The nightly writes yesterday plus any missing day of the week before (catchUpDays); a note
+// ลุงจืด edited is his (notes.writeNote keeps it).
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type pg from 'pg';
@@ -19,6 +20,20 @@ const TD = ['อา.', 'จ.', 'อ.', 'พ.', 'พฤ.', 'ศ.', 'ส.'];
 /** YYYY-MM-DD in ลุงจืด's time zone (Asia/Bangkok, no DST). */
 export const bkkDay = (d: Date) => d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Bangkok' });
 export const yesterday = (now = new Date()) => bkkDay(new Date(now.getTime() - 864e5));
+/**
+ * Days the nightly writes: yesterday (always, regenerated) plus any day of the week up to it that has no note, oldest first,
+ * so a nightly the PC missed (2026-11-09: rebooted, nobody logged on) does not lose that day's note for good.
+ * ponytail: a note ลุงจืด deleted by hand within the week comes back; a day with no activity stays missing and is
+ * re-queried each night (one cheap query) until it ages out.
+ */
+export function catchUpDays(now = new Date(), has = (day: string) => existsSync(join(MEMORY_VAULT, 'daily', `${day}.md`)), back = 7): string[] {
+  const days: string[] = [];
+  for (let i = back; i >= 1; i--) {
+    const day = bkkDay(new Date(now.getTime() - i * 864e5));
+    if (i === 1 || !has(day)) days.push(day);
+  }
+  return days;
+}
 const hm = (d: Date) => d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 /** One short line of someone's text: redacted, and no [[link]] / #tag / alias break of its own (the note's links are the machine's). */
 const line = (s: string, n: number) => {

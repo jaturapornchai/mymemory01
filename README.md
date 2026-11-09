@@ -390,6 +390,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install-tasks.ps1 -Remove
 
 vault ที่ memory-hub เขียน (`MEMHUB_MEMORY_VAULT`) เป็น git ในเครื่อง **ไม่มี remote ไม่เคย push** ทุกครั้งที่ฝันหรือ `memory_save` = 1 commit และสิ่งที่เราแก้เองใน Obsidian จะถูก commit แยกก่อนเสมอ (`ลุงจืด แก้เอง (snapshot)`; "ลุงจืด" คือชื่อผู้ใช้ที่ระบบเรียก ดูหัวข้อข้อจำกัด)
 
+โน้ตที่ระบบเขียนเองจะถูกปิดข้อมูลเหล่านี้ก่อนบันทึกเสมอ (ทั้งในเนื้อ, frontmatter และชื่อไฟล์) เพื่อไม่ให้ git hook สแกนความลับ (ถ้ามี) บล็อก commit: IP สาธารณะ → `x.x.x.x`, อีเมลจริง → `***@โดเมน`, รหัสผ่านใน URI ฐานข้อมูล → ตัดทิ้ง (IP ภายใน/อีเมลตัวอย่างไม่ถูกปิด) — แชตต้นฉบับยังเก็บค่าจริง ค้นเจอใน `memory_search` เหมือนเดิม; โน้ตที่เราแก้เองไม่ถูกแตะ และคีย์/token จริงยังถูก hook บล็อกให้เราเอาออกเอง
+
 ```powershell
 node src/cli.ts vault log            # ดูประวัติ
 node src/cli.ts vault diff           # ฝันครั้งล่าสุดแก้โน้ตอะไรบ้าง

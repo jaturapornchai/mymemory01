@@ -182,7 +182,7 @@ test('git failures never fail a machine write (mocked runner: git missing, index
     "vault history skipped: git add: fatal: Unable to create '.git/index.lock': File exists."]);
 });
 
-test('a note the global secret-scan hook blocks (his paste, a machine note quoting a DSN) stays out, named; history goes on', () => {
+test('a note the global secret-scan hook blocks (his paste) stays out, named; a machine note quoting a DSN loses the password and commits', () => {
   vg.snapshot(MEMORY_VAULT); // leftovers of the mocked-failure test
   const warns: string[] = [];
   const warn = console.warn;
@@ -191,18 +191,18 @@ test('a note the global secret-scan hook blocks (his paste, a machine note quoti
   try {
     writeFileSync(join(MEMORY_VAULT, 'pasted.md'), `key sk-${randomBytes(16).toString('hex')}\n`); // human paste; built at runtime
     saved.push(saveNote('hook บล็อกได้ แต่ save ต้องผ่าน', { now: NOW }));
-    // redacted to memhub_ro:[REDACTED:connstr]@ : still "DB/URI with password" to the hook
+    // redacted to memhub_ro:[REDACTED:connstr]@ (still "DB/URI with password" to the hook) → notes.vaultSafe drops the password part
     saved.push(saveNote(`DSN ของ memory-hub: ${'postgres'}://memhub_ro:${randomBytes(8).toString('hex')}@127.0.0.1:5441/memhub`, { now: NOW }));
     saved.push(saveNote('Ollama bge-m3 ทำ embedding', { now: NOW }));
   } finally { console.warn = warn; }
   assert.ok(saved.every((r) => existsSync(join(MEMORY_VAULT, r))));
-  assert.match(readFileSync(join(MEMORY_VAULT, saved[1]), 'utf8'), /memhub_ro:\[REDACTED:connstr\]@/);
+  assert.match(readFileSync(join(MEMORY_VAULT, saved[1]), 'utf8'), /postgres:\/\/memhub_ro@127\.0\.0\.1:5441\/memhub/);
   if (!spawnSync('git', ['config', '--get', 'core.hooksPath'], { encoding: 'utf8' }).stdout.trim()) return; // no global hook: all committed
   const [rel, dsn, next] = saved;
-  assert.deepEqual(subjects().slice(0, 2), [`memory_save (unknown): ${next}`, `memory_save (unknown): ${rel}`]);
-  assert.deepEqual([filesOf('HEAD'), filesOf('HEAD~1')], [[next], [rel]]);
-  assert.deepEqual(git('ls-files', '--others', '--exclude-standard').split('\n').sort(), [dsn, 'pasted.md']);
+  assert.deepEqual(subjects().slice(0, 3), [`memory_save (unknown): ${next}`, `memory_save (unknown): ${dsn}`, `memory_save (unknown): ${rel}`]);
+  assert.deepEqual([filesOf('HEAD'), filesOf('HEAD~1'), filesOf('HEAD~2')], [[next], [dsn], [rel]]);
+  assert.equal(git('ls-files', '--others', '--exclude-standard').trim(), 'pasted.md');
   assert.equal(git('diff', '--cached', '--name-only'), ''); // unstaged: never re-blocks a later commit
   assert.ok(warns.some((w) => w.includes('hook blocked pasted.md:')), warns.join('\n'));
-  assert.ok(warns.some((w) => w.includes(`hook blocked ${dsn}:`)), warns.join('\n'));
+  assert.ok(!warns.some((w) => w.includes(dsn)), warns.join('\n'));
 });

@@ -17,9 +17,22 @@ export const md5 = (s: string) => createHash('md5').update(s.toLowerCase().repla
 /** Same uuid obsidian.ts gives a note → a saved note can cite itself as provenance. */
 export const noteUuid = (path: string) => 'obs:' + createHash('sha256').update(path).digest('hex').slice(0, 24);
 
+// The vault's git runs ลุงจืด's global secret-scan hook (~/.githooks/secret-scan.pl): a public IP, a real email or a URI with a
+// password in a note blocks its commit for good. So machine notes (body, frontmatter, file name) mask exactly those shapes, with
+// the hook's own allow lists; the session archive keeps the originals (memory_search still finds them in the chats).
+const IP = /(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])/g;
+const OK_IP = /^(?:0|10|127|2(?:2[4-9]|[3-5]\d))\.|^(?:169\.254|192\.168|192\.0\.2|198\.51\.100|203\.0\.113)\.|^172\.(?:1[6-9]|2\d|3[01])\.|^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|^(?:1\.1\.1\.1|1\.0\.0\.1|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9)$|(?:^|\.)(?:25[6-9]|2[6-9]\d|[3-9]\d\d)(?:\.|$)/;
+const EMAIL = /\b[A-Za-z0-9._%+-]+(@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b/g;
+const OK_EMAIL = /^(?:no-?reply|git)@|@(?:[\w.-]+\.)?(?:example\.(?:com|org|net)|users\.noreply\.github\.com)$|\.(?:example|test|invalid|localhost|local|png|jpe?g|gif|svg|webp|ico|js|mjs|ts|tsx|css|json|md|html?)$|^(?:x{6,}|your|example|changeme|placeholder|dummy|fake|sample|test|redacted)/i;
+const URI_PW = /\b((?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb|rediss?|amqps?|mssql|sqlserver|clickhouse|ftp|smtps?):\/\/[^/\s:@'"`]+):[^@\s'"`/]{3,}@/gi;
+/** Public IP → x.x.x.x, email → ***@its-domain, URI password (even a redacted one) dropped. */
+export const vaultSafe = (s: string) => s.replace(URI_PW, '$1@')
+  .replace(EMAIL, (e, at) => (OK_EMAIL.test(e) ? e : `***${at}`))
+  .replace(IP, (ip) => (OK_IP.test(ip) ? ip : 'x.x.x.x'));
+
 /** Obsidian-safe file name (Thai kept); trailing .md stripped so adding .md never makes .md.md. */
 export const fileName = (s: string, max = 80) =>
-  cutAtWord(s.replace(/[\\/:*?"<>|#^[\]\x00-\x1f`]+/g, ' ').replace(/\s+/g, ' ').trim(), max).replace(/(?:\.md)+$/i, '').trim() || 'untitled';
+  cutAtWord(vaultSafe(s).replace(/[\\/:*?"<>|#^[\]\x00-\x1f`]+/g, ' ').replace(/\s+/g, ' ').trim(), max).replace(/(?:\.md)+$/i, '').trim() || 'untitled';
 
 /** Truncate on a word boundary (Thai-aware) so names/IPs/numbers are never cut into a different-looking value. */
 export function cutAtWord(s: string, max: number) {
@@ -86,8 +99,9 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
     cur = old.body;
   }
   // CRLF text (a Windows-written Claude memory file): parseNote reads \n only, so a \r kept here = body_sha never matches = "his edit"
-  const nextBody = (body ?? cur ?? '').replace(/\r\n/g, '\n');
-  const next = renderNote({ ...fm, ...meta, body_sha: sha(nextBody) }, nextBody);
+  const nextBody = vaultSafe((body ?? cur ?? '').replace(/\r\n/g, '\n'));
+  const safeFm = Object.fromEntries(Object.entries({ ...fm, ...meta }).map(([k, v]) => [k, Array.isArray(v) ? v.map(vaultSafe) : vaultSafe(v)]));
+  const next = renderNote({ ...safeFm, body_sha: sha(nextBody) }, nextBody);
   if (cur !== undefined && existsSync(path) && readFileSync(path, 'utf8').replace(/\r\n/g, '\n') === next) return 'unchanged';
   beforeMachineWrite(MEMORY_VAULT, rel); // git history: ลุงจืด's pending edits get their own commit before the batch's first write
   mkdirSync(dirname(path), { recursive: true });

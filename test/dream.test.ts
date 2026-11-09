@@ -21,7 +21,7 @@ const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
 const { dream, deepseekRunner, ollamaRunner, filesRunner, buildDigests, renderBatch, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
 const { rebuildSynapses } = await import('../src/synapse.ts');
-const { parseNote, saveNote, fileName, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
+const { parseNote, saveNote, fileName, sha, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { search, hitLine } = await import('../src/search.ts');
 const { searchText } = await import('../src/mcp.ts');
@@ -140,6 +140,20 @@ test('digest: his pick from an AI multiple-choice question is a user turn (Claud
 test('note file names never carry path or control characters (a JSON "D:\\books" decodes to a backspace)', () => {
   assert.equal(fileName('`D:\books-model` = เอกสาร\tmodel'), 'D ooks-model = เอกสาร model');
   assert.equal(fileName(String.raw`C:\Program Files\x`), 'C Program Files x');
+});
+
+test('machine notes mask what the vault secret-scan hook blocks: public IP, real email, URI password (name, frontmatter, body)', () => {
+  // built at runtime: a literal public IP / email in this file would trip the same hook on the repo's own commit
+  const ip = [8, 26, 41, 7].join('.'), mail = ['jead.t', 'gmail.com'].join('@'), uri = `postgres://app:${'[REDACTED:pw]'}@db.${'host'}.com:5432/x`;
+  const rel = saveNote(`server ${ip} ผู้ดูแล ${mail} ฐาน ${uri} · ภายใน 10.0.0.5 · เวอร์ชัน v1.2.3.4 · ${['noreply', 'anthropic.com'].join('@')}`,
+    { title: `deploy ${ip}`, project: 'd:/demo', kind: 'howto', now: NOW, reindex: false });
+  assert.equal(rel.split('/').at(-1)!.replace(/^F\w+ /, ''), 'deploy x.x.x.x.md');
+  const raw = readFileSync(join(MEMORY_VAULT, rel), 'utf8');
+  assert.ok(!raw.includes(ip) && !raw.includes(mail) && !raw.includes(':[REDACTED'), raw);
+  assert.match(raw, /server x\.x\.x\.x ผู้ดูแล \*\*\*@gmail\.com ฐาน postgres:\/\/\*\*\*@db\.host\.com:5432\/x · ภายใน 10\.0\.0\.5 · เวอร์ชัน v1\.2\.3\.4 · noreply@/);
+  const n = parseNote(raw);
+  assert.equal(n.fm.body_sha, sha(n.body), 'masked body still reads as machine-written');
+  unlinkSync(join(MEMORY_VAULT, rel));
 });
 
 // a long session: 40 rounds × (1500-char question + 1200-char answer) ≈ 4 windows

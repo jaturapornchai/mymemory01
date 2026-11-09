@@ -197,3 +197,22 @@ GRANT INSERT ON injections TO memhub_ro;
 GRANT USAGE ON SEQUENCE injections_id_seq TO memhub_ro;
 ALTER TABLE injections ADD COLUMN IF NOT EXISTS source text; -- Claude Code SessionStart source: startup | resume | clear | compact | fork
 GRANT SELECT ON injections TO memhub_ro;                      -- the hook skips a resume of a chat it already briefed
+
+-- Source code of ลุงจืด's GitHub repos (src/code.ts, tool code_search): apart from the memory, never in memory_search / dream / brain.
+-- A blob's text is stored once however many repos/paths hold it (forked-by-copy repos share most of their files).
+CREATE TABLE IF NOT EXISTS code_files (
+  repo text NOT NULL,                          -- owner/name as GitHub writes it
+  path text NOT NULL,
+  blob text NOT NULL,                          -- git blob sha at the default branch's tip
+  PRIMARY KEY (repo, path)
+);
+CREATE INDEX IF NOT EXISTS code_files_blob ON code_files (blob);
+CREATE TABLE IF NOT EXISTS code_chunks (
+  blob  text NOT NULL,
+  line0 int NOT NULL,                          -- first line (1-based); a binary blob has no chunks
+  text  text NOT NULL,                         -- redacted
+  words tsvector NOT NULL,
+  PRIMARY KEY (blob, line0)
+);
+CREATE INDEX IF NOT EXISTS code_chunks_words ON code_chunks USING gin (words);
+GRANT SELECT ON code_files, code_chunks TO memhub_ro;

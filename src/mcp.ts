@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { codeHitText, codeSearch } from './code.ts';
 import { connect } from './db.ts';
 import { warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
@@ -499,6 +500,29 @@ server.registerTool(
     if (mutes.length) out.push((await run(process.execPath, [join(import.meta.dirname, 'cli.ts'), 'mute', ...mutes],
       { env: { ...process.env, MEMORY_HUB_INTERNAL: '1' }, windowsHide: true, timeout: 20_000 })).stdout.trim()); // rw child: we hold ro only
     return text(out.join('\n'));
+  },
+);
+
+// local only: mcp-http.ts forwards an allowlist, so bots and remote apps never see the source code
+server.registerTool(
+  'code_search',
+  {
+    description: 'Keyword search over the source code of ลุงจืด\'s GitHub repos (his own + smlsoft, default branch, no forks; ' +
+      'synced hourly). Use to find where something is implemented, an existing function/table/API, or how a module did X. ' +
+      'Every word must appear in the hit (identifiers split: getUserById matches "user"); none match → any word. ' +
+      'Returns repo/path:lines, GitHub link and ≤12 lines; identical files in other repos are counted, not repeated. Not in memory_search.',
+    inputSchema: {
+      query: z.string().min(1).max(300).describe('words / identifiers, Thai or English'),
+      repo: z.string().max(100).optional().describe('repo name contains, e.g. a repo name or jaturapornchai/'),
+      path: z.string().max(200).optional().describe('path contains, e.g. .go or controllers/'),
+      limit: z.number().int().min(1).max(20).optional().describe('default 8'),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ query, repo, path, limit = 8 }) => {
+    const no = off(); if (no) return text(no);
+    const hits = await codeSearch(db, query, { repo, path, limit });
+    return text(hits.map((h) => codeHitText(h, query)).join('\n\n') || `no code hits for: ${query}`);
   },
 );
 

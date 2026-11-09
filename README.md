@@ -72,6 +72,7 @@ flowchart LR
 | LM Studio | `~/.lmstudio/conversations/` | ไฟล์ถูกเขียนใหม่ทั้งไฟล์ → เก็บเวอร์ชันเก่าเป็น `.bak` |
 | Kimi Code | `~/.kimi-code/sessions/*/*/agents/*/wire.jsonl` + `state.json` | อ่านแค่ `sessions/` (ไม่แตะ credentials/config); รวม subagent และ session ที่ Kimi ย้ายมาจาก `~/.kimi` (`ses_*`); `~/.kimi` แบบเก่าไม่อ่าน |
 | GitHub | `gh api` (อ่านอย่างเดียว token อยู่ใน `gh`) | การ์ด repo + README, commit ที่เราเขียน, issue/PR ที่เกี่ยวกับเรา — ค้นได้ ไม่เอาไปฝัน |
+| ซอร์สโค้ด GitHub | clone แบบตื้น (bare, depth 1) ของ repo เรา + smlsoft ไว้ที่ `~/ai-archive/raw/code/` | ตารางแยก ค้นด้วย `code_search` เท่านั้น ไม่ปนกับ `memory_search` ฝัน หรือสมอง; ข้าม fork, repo ว่าง, `node_modules`/`vendor`/`dist`/venv, lock file, ไฟล์ที่ generate, binary, ไฟล์ลับ (`.env`, `*.pem`, `*.key`) และไฟล์ใหญ่กว่า 256 KB; ไฟล์เดียวกันหลาย repo เก็บครั้งเดียว |
 | Obsidian | vault ที่ตั้งใน `MEMHUB_VAULTS` | อ่านอย่างเดียว เก็บ `[[wikilink]]` เป็นเส้นเชื่อม |
 | Gmail · Google Docs · Google Sheets | Google API สิทธิ์ `gmail.readonly` + `drive.readonly` เท่านั้น | **เห็นได้เฉพาะ Claude** ดู [Google](#google-gmail-docs-sheets--maps-timeline-ไม่บังคับ) |
 | Google Maps Timeline | ไฟล์ export จากมือถือ | **เห็นได้เฉพาะ Claude** ชื่อสถานที่หาแบบออฟไลน์ด้วย GeoNames |
@@ -112,13 +113,14 @@ flowchart LR
 - **เว็บสาธารณะ** มีแค่รูปร่างกราฟ ตัวเลข เวลา และชื่อแอป AI; `assertAnonymous` ตรวจทุกครั้งก่อนอัปโหลด เจอชื่อโปรเจกต์/path/session ใด ๆ = ยกเลิก
 - **ข้อความจาก AI อื่นเป็นแค่ "ข้อมูล" ไม่ใช่ "คำสั่ง":** งานส่งต่อข้ามแอปถูกติดป้ายนี้ และกรองแท็กที่ใช้หลอก AI ออก
 
-### เครื่องมือ MCP 3 ตัว
+### เครื่องมือ MCP 4 ตัว
 
 | เครื่องมือ | ทำอะไร |
 |---|---|
 | `memory_search` | ค้นความจำ (ไทย/อังกฤษ/โค้ด) กรองตามโปรเจกต์, ชนิด (`kind`: `rule`\|`feedback`\|`decision`\|`preference`\|`howto`\|`fact`\|`card`\|`insight`\|`chat`\|`note`), ช่วงวันที่ (`since`/`until`) หรือย้อนดูตามวันในอดีต (`as_of: YYYY-MM-DD`) ได้ไม่เกิน 8 ชิ้นพร้อม id, ป้าย `✓ใช้ได้` / `บันทึก` / `✗เลิกใช้` และใครพูด (`AI-only` = ไม่มีคำลุงจืดยืนยัน) |
 | `memory_get` | เปิดเนื้อหาเต็มของชิ้นที่เลือก + บทสนทนารอบ ๆ หรือที่มาของข้อเท็จจริง (ข้อความต้นทางพร้อม `src` id ของลุงจืดก่อน, ลิงก์ GitHub); `view:"timeline"` = เกิดอะไรก่อน/หลังชิ้นนั้น และแอปอื่นทำอะไรกับโปรเจกต์เดียวกันช่วงนั้น (≤1,500 ตัวอักษร); `view:"related"` = ตามเส้นเชื่อมแบบสมอง: wikilink, backlink, ที่ถูกใช้คู่กันบ่อย, ที่มา/subagent/แชตถัดไป, ที่ความหมายคล้ายกัน |
 | `memory_save` | "จำไว้นะ" — เขียนโน้ตลง vault ของ memory-hub ให้ทุกแอปเห็นในแชตถัดไป; `replaces:[fid]` = แก้ความจำที่ผิด (ของเก่ากลายเป็นของเก่าทันที ถ้าเป็นโน้ตที่เราเขียน/แก้เองจะเข้าคิวรีวิว `hubs/_review.md` แทน), `user_quote` = คำที่ลุงจืดพิมพ์ขอแก้ในแชตนี้ (ตรวจกับบันทึกแชตจริง รวมแชตที่เปิดอยู่; URL ที่แอปแปลงเป็นลิงก์ `[www.x.com](https://www.x.com)` นับเท่ากับ `www.x.com`) แล้ว `replaces` มีผลทันทีแม้เป็นโน้ตของลุงจืดเอง ไม่ต้องเข้าคิว, `mute:[fid]` = ไม่ต้องยกมาตอนเริ่มแชตอีก (ยังค้นเจอ, `-fid` = เลิก); ถ้าซ้ำกับความจำเดิมมาก **ไม่บันทึก** แต่บอก fid ที่ซ้ำ (รวมด้วย `replaces` หรือส่ง `confirm_new:true` ถ้าเป็นเรื่องใหม่จริง) และถ้าขัดกับข้อที่มีอยู่จะตอบ `⚠ CONFLICT` พร้อมบันทึกคู่นั้นทันที |
+| `code_search` | ค้นซอร์สโค้ดใน repo GitHub ของเรา + smlsoft: ทุกคำต้องอยู่ในชิ้นเดียวกัน (ไม่เจอเลย → คำใดคำหนึ่ง) ชื่อตัวแปรถูกแยกคำ (`getUserById` เจอด้วย "user") กรอง `repo`/`path` ได้ ได้ `repo/path:บรรทัด` + ลิงก์ GitHub + โค้ด ≤12 บรรทัด — มีเฉพาะ MCP ในเครื่อง ไม่ส่งผ่าน `/mcp` ไปให้บอทหรือแอปเครื่องอื่น |
 
 skill สำหรับ AI ทุกตัว (ใช้ memory-hub ให้คุ้ม: ค้นครั้งเดียว, get เท่าที่จำเป็น, ไม่ยิงถี่): [skills/memory-hub/SKILL.md](skills/memory-hub/SKILL.md) — copy โฟลเดอร์ไปที่ `~/.agents/skills/` (Codex, Gemini CLI, ZCode), `~/.claude/skills/` (Claude Code), `~/.gemini/config/skills/` และ `~/.gemini/antigravity-cli/skills/` (Antigravity); LM Studio ไม่มี skill ให้ใช้ system prompt ใน [references/apps.md](skills/memory-hub/references/apps.md)
 
@@ -288,7 +290,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-tasks.ps1
 powershell -ExecutionPolicy Bypass -File scripts\install-tasks.ps1 -Remove
 ```
 
-- **hourly** = `migrate` → `sync` → `publish` · **nightly** = `dream` → `dream --consolidate` → `daily` → `lint` → `publish` → `sem` (แต่ละขั้นล้มได้โดยไม่ทำให้ขั้นถัดไปไม่รัน)
+- **hourly** = `migrate` → `sync` → `code sync` → `publish` · **nightly** = `dream` → `dream --consolidate` → `daily` → `lint` → `publish` → `sem` (แต่ละขั้นล้มได้โดยไม่ทำให้ขั้นถัดไปไม่รัน)
 - รันในชื่อผู้ใช้ปัจจุบัน เฉพาะตอนล็อกอินอยู่ ไม่ต้องเก็บรหัสผ่าน ไม่มีหน้าต่างเด้ง (ผ่าน `scripts\hidden.vbs`)
 - log อยู่ที่ `logs\hourly.log` และ `logs\nightly.log`
 - `publish` ไม่ทำอะไรจนกว่าจะผูกโฟลเดอร์ `deploy\memory-hub-brain` กับโปรเจกต์ Vercel **ของเราเอง** (ยังไม่ผูก = log เขียน `publish: skipped` แล้วข้าม)
@@ -354,6 +356,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-tasks.ps1 -Remove
 | `stats --injected [n]` | n ครั้งล่าสุด (ปกติ 10) ที่ SessionStart ใส่สรุปให้แชตใหม่: แอป เหตุที่เรียก (startup/resume/clear/compact, `-` = แอปไม่บอก) โปรเจกต์ จำนวนตัวอักษร และ id ที่ใส่ (เก็บแค่ id ไม่เก็บข้อความ เปิดดูด้วย `memory_get`) |
 | `daily [YYYY-MM-DD] [--out dir]` | บันทึกประจำวันลง vault memory-hub `daily/YYYY-MM-DD.md` (ไม่ใส่วัน = เมื่อวาน ตามเวลาไทย และวันใดใน 7 วันล่าสุดที่ยังไม่มีโน้ต เช่นคืนที่เครื่องรีบูตแล้วไม่มีใครล็อกออนจน nightly ไม่ได้รัน): ต่อโปรเจกต์ แอปไหนกี่ session เวลาแรก–สุดท้าย เรื่องที่ทำ commit/issue ความจำใหม่/ถูกแทนที่ งานส่งต่อ — ไม่ใช้ LLM, ไม่มีข้อมูล Google/สถานที่, โน้ตที่เราแก้แล้วจะไม่ถูกเขียนทับ, ค้นได้แต่อันดับต่ำกว่าแชต; `--out` = เขียนไฟล์ตัวอย่างไว้ที่อื่น ไม่แตะ vault |
 | `index-vault [vault]` | ทำดัชนี Obsidian ใหม่ (ไม่ระบุ = ทุก vault) |
+| `code sync|index|search <คำค้น> [--repo r] [--path p]` | ซอร์สโค้ด GitHub: `sync` (hourly) = clone/fetch เฉพาะ repo ที่ push ใหม่ แล้วทำดัชนีเฉพาะไฟล์ที่เปลี่ยน · `index` = ทำดัชนีจาก clone ที่มีอยู่ · `search` = ค้นแบบเดียวกับ `code_search` |
 | `forget --session <id>` / `forget --project <path>` | ลบออกจากดัชนีถาวรและกันนำเข้าซ้ำ (ไฟล์ดิบใน archive ไม่ถูกลบ) พร้อมลบข้อเท็จจริง/การ์ดที่ฝันจากแชตนั้นอย่างเดียว แล้วพิมพ์รายการที่ลบ |
 | `project [--sync \| --mv <from> <to> \| --alias <from> <to>]` | ดูรายการโปรเจกต์และการจับคู่ข้ามเครื่อง/ย้ายโฟลเดอร์; `--sync` = รวมโปรเจกต์ที่ซ้ำอัตโนมัติ (ตาม git remote / ชื่อโฟลเดอร์ระดับ root), `--mv` = ย้ายรวมข้อมูล+โน้ตและจำถาวร, `--alias` = ผูกชื่อ/path/repo เข้ากับโปรเจกต์หลัก |
 | `dream [--limit n] [--runner ollama\|deepseek\|claude\|files] [--run id] [--force]` | ฝัน (เห็นคำตอบที่เรากดเลือกจากตัวเลือกของ AI ด้วย: เลือกตัวที่ AI แนะนำ = การตัดสินใจ, เลือกตัวอื่น/แก้/เลือกแบบเดิมซ้ำ = สิ่งที่ชอบ): สรุปแชตใหม่เป็นการ์ด + ข้อเท็จจริง (ปกติไม่เกิน 40 session ต่อรอบ ใหม่สุดก่อน; ค่าเริ่มต้นคือ `ollama` = Ollama Cloud; `--runner deepseek` = DeepSeek API ซึ่งข้ามรอบถ้าตรงช่วงราคาแพงของ DeepSeek เว้นใส่ `--force`; `--runner claude` = ใช้ `claude -p`) |
@@ -417,6 +420,8 @@ node src/cli.ts vault undo <rev>     # ย้อน แล้วทำดัช�
 | `MEMHUB_LIVE_DIR` | `~/.claude/projects` | แชต Claude Code ตัวจริง (อ่านอย่างเดียว) |
 | `MEMHUB_ARCHIVE_DIR` | `~/ai-archive/raw/claude/projects` | สำเนาถาวรของแชต Claude |
 | `MEMHUB_ARCHIVE_ROOT` | `~/ai-archive/raw` | สำเนาของแอปอื่น (`<root>/<แอป>`) |
+| `MEMHUB_CODE_OWNERS` | `jaturapornchai,smlsoft` | เจ้าของ repo ที่ดึงซอร์สโค้ดมาทำดัชนี คั่นด้วย `,` |
+| `MEMHUB_CODE_DIR` | `<MEMHUB_ARCHIVE_ROOT>/code` | ที่เก็บ clone แบบ bare (`<owner>/<repo>.git`) |
 | `MEMHUB_CODEX_HOME` / `MEMHUB_GEMINI_HOME` / `MEMHUB_ANTIGRAVITY_HOME` / `MEMHUB_ZCODE_HOME` / `MEMHUB_LMSTUDIO_HOME` / `KIMI_CODE_HOME` | `~/.codex` / `~/.gemini` / `~/.gemini` / `~/.zcode` / `~/.lmstudio` / `~/.kimi-code` | โฟลเดอร์ข้อมูลของแต่ละแอป |
 | `MEMHUB_EXCLUDE_PROJECTS` | — | path โปรเจกต์ที่ห้ามเข้าดัชนี คั่นด้วย `,` เช่น `d:/clientx` |
 | `MEMHUB_PROJECT_MAP` | — | ผูก path หรือ `owner/repo` ข้ามเครื่องเข้ากับโปรเจกต์หลัก คั่นด้วย `,` เช่น `/users/jead/bccode=d:/bccode,owner/repo=d:/app` (หรือใช้ `project --alias` / `--mv`) |
@@ -554,6 +559,7 @@ node web/scripts/public-check.mjs https://<เว็บของเรา>/  # �
 - แชตจากแอปอื่นเข้ามาตามรอบ hourly; ของ Claude Code ปกติเข้าภายใน ~10 นาที (รอบท้าย ๆ ของแชตที่ยังเปิดค้างจะเข้าตอนปิดแชตหรือรอบ hourly)
 - ตัดความลับใช้ pattern + ความสุ่มของข้อความ รหัสผ่านสั้น ๆ ที่เป็นคำธรรมดาในประโยคอาจหลุด — อย่าวางรหัสผ่านในแชต
 - ตัดคำไทยใช้พจนานุกรมของ ICU คำย่อแปลก ๆ อาศัยการค้นแบบวลีสั้น
+- ซอร์สโค้ดค้นด้วยคำอย่างเดียว (ยังไม่ทำเวกเตอร์) และมีแค่ branch หลักล่าสุด ไม่มีประวัติ commit; repo ที่ลบจาก GitHub ยังอยู่ในดัชนีจนกว่าจะลบแถวเอง
 - ป้าย `✗เลิกใช้` / `⚠CONFLICT` ตัดสินด้วยกฎ (ชื่อเดียวกัน + คำปฏิเสธ/ยกเลิก, "X เลิกใช้แล้ว", วันที่ห่างกันเกิน 7 วัน) ไม่ใช้ LLM — สองข้อที่ขัดกันแต่ไม่ได้ใช้ชื่อเดียวกันจะไม่ถูกจับ ต้องแก้เองด้วย `memory_save replaces`
 - ประตู Claude-only ของข้อมูล Google คุมแค่ MCP และ SessionStart — ไฟล์ดิบใน `~/ai-archive/raw/google*` และฐานข้อมูลยังเป็นข้อความธรรมดา โปรแกรมใดที่มี shell ในเครื่องอ่านได้ (อย่า sync โฟลเดอร์นี้ขึ้น cloud)
 - ถ้าให้ Claude `memory_save` ข้อความจากเมล โน้ตนั้นจะเห็นได้ทุกแอป

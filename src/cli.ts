@@ -103,6 +103,30 @@ if (cmd === 'lint') {
   process.exit();
 }
 
+if (cmd === 'code') {
+  // code sync (hourly: clone/fetch GitHub repos, then index) | code index | code search <query> [--repo r] [--path p] — src/code.ts
+  const code = await import('./code.ts'), { connect } = await import('./db.ts');
+  const [sub, ...rest] = args, opt = (k: string) => (rest.includes(k) ? rest[rest.indexOf(k) + 1] : undefined);
+  const db = connect(sub === 'search' ? 'ro' : 'rw');
+  try {
+    if (sub === 'sync' || sub === 'index') {
+      const lock = await db.connect(); // a long first index must not overlap the next hourly run
+      try {
+        if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext(current_schema() || ':memhub-code')) ok`)).rows[0].ok) console.log('code: another run is busy, skipped');
+        else {
+          if (sub === 'sync') console.log('code sync', JSON.stringify(await code.syncRepos()));
+          console.log('code index', JSON.stringify(await code.indexCode(db)));
+        }
+      } finally { lock.release(); }
+    } else if (sub === 'search') {
+      const q = rest.filter((a, i) => !a.startsWith('--') && !['--repo', '--path'].includes(rest[i - 1])).join(' ');
+      const hits = await code.codeSearch(db, q, { repo: opt('--repo'), path: opt('--path') });
+      console.log(hits.map((h) => code.codeHitText(h, q)).join('\n\n') || 'no code hits');
+    } else throw new Error('usage: code sync | code index | code search <query> [--repo r] [--path p]');
+  } finally { await db.end(); }
+  process.exit();
+}
+
 if (cmd === 'sem') {
   // sem [--dry] [--limit n]: nightly, last: the local Gemma judges new top-cosine pairs → edges kind sem (src/sem.ts).
   // --dry = counts on the read-only role, no Gemma call; llama-server down or not serving Gemma → skipped, exit 0

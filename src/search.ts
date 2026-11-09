@@ -182,12 +182,12 @@ WITH ${PF}, ${HIDE('$8', '$13', '$14')},
 w AS (
   SELECT id, row_number() OVER (ORDER BY s DESC, ts DESC) r, s FROM (
     SELECT id, ts, (SELECT sum(x.idf) FROM unnest($6::tsquery[], $7::float8[]) x(q, idf) WHERE wd @@ x.q) s
-    FROM (SELECT id, ts, words || ''::tsvector wd FROM chunks -- words detoasted once per row, not once per query term:
-      WHERE $1::text IS NOT NULL AND words @@ $1::tsquery    -- 200 queries: p50/p95/p99 41/155/192 → 29/69/107 ms, same rows
+    FROM (SELECT id, ts, words wd FROM chunks -- words sit in the row (STORAGE MAIN, schema.sql): nothing to detoast per term;
+      WHERE $1::text IS NOT NULL AND words @@ $1::tsquery    -- the old words || '' copy cost 2 KB a row (200 legs p50/p95 23/69 → 15/45 ms)
         AND ($3::text IS NULL OR project LIKE '%' || $3 || '%' OR source_id IN (SELECT pf.source_id FROM pf)) AND ($4::timestamptz IS NULL OR ts >= $4) AND ($5::timestamptz IS NULL OR ts < $5) AND ($9::timestamptz IS NULL OR ts < $9)
         AND ($14::timestamptz IS NULL OR ts < $14 OR source_id IN (SELECT source_id FROM facts))
         AND source_id NOT IN (SELECT id FROM hide) AND ${OWN('$10', '$11', '$12')}
-      OFFSET 0) c -- OFFSET 0: keeps the subquery (and its one detoast) from being flattened into the scoring
+      ) c
   ) z ORDER BY r LIMIT 60),
 b AS (
   SELECT id, row_number() OVER (ORDER BY ts_rank_cd(bigrams, $2::tsquery, 1) DESC, ts DESC) r

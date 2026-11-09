@@ -214,5 +214,17 @@ CREATE TABLE IF NOT EXISTS code_chunks (
   words tsvector NOT NULL,
   PRIMARY KEY (blob, line0)
 );
+-- tsvectors stay in the row (STORAGE MAIN; text / embedding go out of line instead): half the chunks' words are > 2 KB, and
+-- out of line (uncompressed: a tsvector barely compresses) a common word's keyword leg fetched 10-25k TOAST values just to rank
+-- them. 20 common words, same rows: 30 → 9 ms. Rows written earlier keep their layout until a rewrite (VACUUM FULL <table>).
+-- Checked first: SET STORAGE queues an exclusive lock even as a no-op.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'chunks'::regclass AND attname IN ('words', 'bigrams') AND attstorage <> 'm') THEN
+    ALTER TABLE chunks ALTER COLUMN words SET STORAGE MAIN, ALTER COLUMN bigrams SET STORAGE MAIN;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'code_chunks'::regclass AND attname = 'words' AND attstorage <> 'm') THEN
+    ALTER TABLE code_chunks ALTER COLUMN words SET STORAGE MAIN;
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS code_chunks_words ON code_chunks USING gin (words);
 GRANT SELECT ON code_files, code_chunks TO memhub_ro;

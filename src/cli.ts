@@ -19,7 +19,10 @@ async function health(db: { query: (q: string, p: unknown[]) => Promise<unknown>
   const msg = String((e as Error)?.message ?? e).trim().split('\n')[0].replace(/(?:\b[A-Za-z]:[\\/]|\\\\|\/(?:home|Users)\/|~[\\/]).*$/, '<path>')
     .replace(/(['"`])[^'"`]*[\\/][^'"`]*\1/g, '<path>');
   const err = e === undefined ? {} : { err: redact(redactPersonal(msg).text).text.slice(0, 120) };
-  await db.query(`INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`,
+  // a failure right after a failure keeps since = when the failures began (SessionStart counts the days); a good run drops it
+  await db.query(`INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v || CASE
+      WHEN EXCLUDED.v->>'ok' = 'false' AND state.v->>'ok' = 'false' THEN jsonb_build_object('since', coalesce(state.v->>'since', state.v->>'at'))
+      ELSE '{}'::jsonb END`,
     [`health:${job}`, { ok: e === undefined, at: new Date().toISOString(), ...err }]).catch(() => {});
 }
 

@@ -401,7 +401,7 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
     // The plan (turn ranges + batches) is frozen per run id, so a files-runner run resumes with the same digests →
     // the same request ids, whatever ลุงจืด said in the meantime.
     const planKey = `dream:plan:${o.run}`;
-    let plan: { ranges: Range[]; batches: string[][]; stats?: DreamStats; missed?: string[]; resultsA?: unknown[] } | undefined =
+    let plan: { ranges: Range[]; batches: string[][]; at?: string; stats?: DreamStats; missed?: string[]; resultsA?: unknown[] } | undefined =
       (await db.query('SELECT v FROM state WHERE k = $1', [planKey])).rows[0]?.v;
     let batches: Batch[];
     if (plan?.ranges) {
@@ -423,9 +423,9 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
         await consolidate(db, now);
         return { status: 'skipped', stats };
       }
-      if (!digests.length) { await consolidate(db, now); return { status: 'done', stats }; }
+      if (!digests.length) { await db.query(PLANS_DONE, [planKey]); await consolidate(db, now); return { status: 'done', stats }; }
       batches = packBatches(digests).map(renderBatch);
-      plan = { ranges, batches: batches.map((x) => x.digests.map((d) => d.key)) };
+      plan = { ranges, batches: batches.map((x) => x.digests.map((d) => d.key)), at: now.toISOString() }; // at: SessionStart names a run left pending for hours
       await db.query('INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v', [planKey, JSON.stringify(plan)]);
     }
     stats.sessions = plan.ranges.length;
@@ -466,7 +466,7 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
       // a files runner stops at every pass-B request: kept with the plan, the run record counts the whole run, not its last invocation
       await db.query('UPDATE state SET v = $2 WHERE k = $1', [planKey, JSON.stringify({ ...plan, stats, missed: [...missed] })]);
     }
-    await db.query('DELETE FROM state WHERE k = $1', [planKey]);
+    await db.query(PLANS_DONE, [planKey]);
     mkdirSync(RUNS_DIR, { recursive: true });
     appendFileSync(join(RUNS_DIR, `${o.run}.json`), JSON.stringify({ run: o.run, at: now.toISOString(), stats, batches: record }) + '\n');
     await consolidate(db, now);
@@ -694,6 +694,10 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
 }
 
 // ---------------- nightly consolidation (no LLM) ----------------
+
+// A run that ends done took what was waiting: the plan of a run that died before it (a files runner whose session stopped) has
+// nothing left to resume, and SessionStart would warn about it until the 2-day prune. Rows without `at` (older code) wait for that prune.
+const PLANS_DONE = `DELETE FROM state WHERE k = $1 OR (k LIKE 'dream:plan:%' AND v ? 'at')`;
 
 /** Approvals, synapse rebuild ('sleep': structural kinds + co-access with downscaling, synapse.ts), hub + review notes. Safe to run every night. */
 export async function consolidate(db: pg.Pool, now = new Date()) {

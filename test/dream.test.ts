@@ -308,12 +308,16 @@ test('deleted fact file → tombstone → never re-created', async () => {
   assert.ok(!notes('facts').some((f) => readFileSync(join(MEMORY_VAULT, 'facts', f), 'utf8').includes('6000')));
 });
 
-test('files runner: writes requests, stops, continues once results exist', async () => {
+test('files runner: writes requests, stops, continues once results exist; done drops the plan of a run that died before it', async () => {
   await indexFile(db, session('s8', '2026-09-21', ['FACT: memhub web ใช้ Next.js 16 static export']));
   const dir = join(tmp, 'req');
   const runner = filesRunner(dir);
+  const plans = async () => Object.fromEntries((await db.query(`SELECT k, v->>'at' began FROM state WHERE k LIKE 'dream:plan:%' AND v ? 'at'`)).rows.map((x) => [x.k.slice(11), x.began]));
+  await db.query(`INSERT INTO state (k, v) VALUES ('dream:plan:died-files', '{"ranges": [], "batches": [], "at": "2026-09-24T18:05:00.000Z"}')`);
   const r1 = await dream(db, { llm: runner, run: 'f1', force: true, now: NOW, log: () => {} });
   assert.equal(r1.status, 'pending');
+  // the start time is what SessionStart reads to say a run has been pending for hours; a pending run drops nothing
+  assert.deepEqual(await plans(), { 'died-files': '2026-09-24T18:05:00.000Z', f1: NOW.toISOString() });
   for (const f of readdirSync(dir).filter((x) => x.endsWith('.request.json'))) {
     const req = JSON.parse(readFileSync(join(dir, f), 'utf8'));
     writeFileSync(join(dir, f.replace('.request.', '.result.')), JSON.stringify(await fake(req)));
@@ -326,6 +330,7 @@ test('files runner: writes requests, stops, continues once results exist', async
     r2 = await dream(db, { llm: runner, run: 'f1', force: true, now: NOW, log: () => {} });
   }
   assert.equal(r2.status, 'done');
+  assert.deepEqual(await plans(), {}, 'a finished run took what was waiting: nothing is left for the run that died to resume');
   assert.ok(notes('facts').some((f) => readFileSync(join(MEMORY_VAULT, 'facts', f), 'utf8').includes('Next.js 16')));
 });
 

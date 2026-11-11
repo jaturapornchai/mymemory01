@@ -18,8 +18,14 @@ const MAX_CHARS = 2000;
 const flat = (s: string, n: number) => { const t = s.replace(/\s+/g, ' ').trim(); return t.length > n ? cutAtWord(t, n - 1).trimEnd() + '…' : t; };
 // health line: hours before a job counts as stale, and the fix for a known error
 const STALE: Record<string, number> = { sync: 3, dream: 36 };
+// a dream run pending this long is not being answered any more: a files-runner round takes minutes (2026-11-12: 3 min for the whole run)
+const STALLED_H = 3;
 // matched against "<job>: <err>"; Ollama down reaches embed as a bare "fetch failed" / ECONNREFUSED
-const HINTS: [RegExp, string][] = [[/oauth|authenticat|credential|\/login/i, ' (แก้: claude /login)'], [/ollama|^embed: .*(?:fetch failed|ECONNREFUSED)/i, ' (เปิด Ollama)']];
+// First match wins, against "<job>: <err>". Quota comes before Ollama: "ollama 429 … monthly usage limit" is a used-up plan, not a
+// stopped Ollama (2026-10-31: six nights of "เปิด Ollama"); a provider's 401 is its API key, not the claude login.
+const HINTS: [RegExp, string][] = [[/\b(?:ollama|deepseek) (?:402|429)\b|usage limit|insufficient balance/i, ' (โควตา AI หมด)'],
+  [/\b(?:ollama|deepseek) 401\b/i, ' (API key ใช้ไม่ได้)'], [/oauth|authenticat|credential|\/login/i, ' (แก้: claude /login)'],
+  [/ollama|^embed: .*(?:fetch failed|ECONNREFUSED)/i, ' (เปิด Ollama)']];
 const app = process.argv.includes('--app') ? process.argv[process.argv.indexOf('--app') + 1] ?? '' : 'claude-code';
 
 /** Codex exec (`codex exec`, e.g. gpt-image-2 / gpt-ask.py) and Codex subagents write session_meta before SessionStart runs. */
@@ -97,7 +103,9 @@ try {
          AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND t.session_id = ANY(f.session_ids))
        ORDER BY t.session_id, t.seq`, [chain, session, [...PRIVATE_TOOLS]]),
     lastOtherApp(db, chain, app, session).catch(() => null), // best-effort: the rest still shows
-    db.query(`SELECT k, v FROM state WHERE k LIKE 'health:%' ORDER BY k`).catch(() => ({ rows: [] })), // cli.ts health(): last run of each background job
+    // cli.ts health(): last run of each background job; + the start time of every dream run still open (the plan itself holds whole pass-A results)
+    db.query(`SELECT k, CASE WHEN k LIKE 'health:%' THEN v ELSE jsonb_build_object('at', v->>'at') END v FROM state
+              WHERE k LIKE 'health:%' OR k LIKE 'dream:plan:%' ORDER BY k LIKE 'dream:plan:%', k`).catch(() => ({ rows: [] })),
     identityOf(db, chain, [...PRIVATE_TOOLS]).catch(() => null), // cli.ts identity: what this repo is / is not, shown first
   ]);
   // fact note text = "# <file name>\n<fact>\n\n- from:: …"; card = "# <file>\n# <title>\n\n<summary>…"
@@ -107,10 +115,15 @@ try {
   const now = Date.now();
   const issues = health.rows.flatMap(({ k, v }) => {
     const job = k.slice(7), hours = (now - Date.parse(v.at)) / 3600e3;
-    if (!v.ok) return [`${job} ล้มเหลว${HINTS.find(([re]) => re.test(`${job}: ${v.err ?? ''}`))?.[1] ?? ''}: ${flat(String(v.err ?? '?'), 60)}`];
+    // a run left pending (the session answering a files runner died) exits 0 and records health:dream ok: only its plan row tells.
+    // A plan with no start time (older code) → NaN → not shown.
+    if (k.startsWith('dream:plan:')) return hours >= STALLED_H ? [`dream รอบ ${k.slice(11)} ค้างกลางทางมา ${Math.floor(hours)} ชม.`] : [];
+    const days = Math.floor((now - Date.parse(v.since ?? v.at)) / 86400e3); // since = the first of the failures in a row (cli.ts health)
+    if (!v.ok) return [`${job} ล้มเหลว${days > 0 ? `มา ${days} วัน` : ''}${HINTS.find(([re]) => re.test(`${job}: ${v.err ?? ''}`))?.[1] ?? ''}: ${flat(String(v.err ?? '?'), 60)}`];
     return hours > (STALE[job] ?? Infinity) ? [`${job} ไม่ได้รันมา ${Math.floor(hours)} ชม.`] : [];
   });
-  const warn = issues.length ? `\n${flat(`งานเบื้องหลังมีปัญหา: ${issues.join(' · ')}`, 150)}` : '';
+  // "แจ้งลุงจืดในคำตอบแรก": as a bare status line it reached 29 sessions (2026-10-31 → 11-06) and not one AI passed it on
+  const warn = issues.length ? `\n${flat(`งานเบื้องหลังมีปัญหา (แจ้งลุงจืดในคำตอบแรก): ${issues.join(' · ')}`, 150)}` : '';
   // B1: the project identity is the first line, outside the rule budget; B9: a repo that is not BC is told the global BC/CHAMP rules are off
   const idHead = id?.fid ? `[memory-hub] ตัวตนโปรเจกต์นี้ [${id.fid}]: ${flat(id.text, 400)}\n${notBcLine(id) ? `${notBcLine(id)}\n` : ''}` : '';
   if (id?.fid) rules.rows = rules.rows.filter((r) => r.fid !== id.fid);

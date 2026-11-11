@@ -15,8 +15,8 @@ import { words } from './thai.ts';
 type Row = Record<string, any>;
 /** fact note text (DB first turn) → its claim: no '# title' line, no '- from:: [[…]]' link lines. */
 export const claim = (t: string) => String(t ?? '').replace(/^# [^\n]*\n/, '').split('\n\n- ')[0];
-const ACTIVE = `coalesce(s.status, 'active') = 'active'`;
-const VISIBLE = (p: string) => `coalesce(s.hide_as, s.tool) <> ALL(${p}::text[]) AND NOT EXISTS (SELECT 1 FROM sources h WHERE h.session_id = ANY(f.session_ids) AND coalesce(h.hide_as, h.tool) = ANY(${p}::text[]))`;
+export const ACTIVE = `coalesce(s.status, 'active') = 'active'`;
+export const VISIBLE = (p: string) => `coalesce(s.hide_as, s.tool) <> ALL(${p}::text[]) AND NOT EXISTS (SELECT 1 FROM sources h WHERE h.session_id = ANY(f.session_ids) AND coalesce(h.hide_as, h.tool) = ANY(${p}::text[]))`;
 const TEXT = `(SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1)`;
 
 // ---- CONFLICT: one name, opposite polarity ("POS sync กับ BC AI Account" vs "myapp ไม่เกี่ยวกับ BC") ----

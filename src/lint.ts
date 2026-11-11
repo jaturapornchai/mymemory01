@@ -2,13 +2,14 @@
 // Written to hubs/_lint.md, a machine note of its own: hubs/_review.md is rebuilt whole by every consolidate, so a section
 // there would vanish by morning. Newest dated section first, the last KEEP kept; an edited _lint.md is his → never rewritten.
 // Ids/titles only; Claude-only sources (guard.PRIVATE_TOOLS, hide_as) are filtered out of every query.
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import type pg from 'pg';
 import { ORPHAN } from './dream.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
 import { projectName, sameTree } from './importer.ts';
-import { accuracyFlags, saveFlags } from './accuracy.ts';
+import { accuracyFlags, claim, saveFlags } from './accuracy.ts';
 import { type Fm, fmList, fmStr, isEdited, isHis, MEMORY_PROJECT, MEMORY_VAULT, parseNote, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { commitBatch } from './vault-git.ts';
@@ -73,6 +74,8 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
         FROM v n CROSS JOIN LATERAL regexp_matches(n.body, '(?:(?:แทน(?:ที่)?|ยกเลิก|replac\\w*|supersed\\w*)[^.\\n]{0,40}(F[0-9a-f]{8})|(F[0-9a-f]{8})[^.\\n]{0,40}(?:ถูกแทน|ถูกยกเลิก|ยกเลิกแล้ว|replaced|superseded))', 'gi') m
         JOIN v o ON o.fid = coalesce(m[1], m[2])
         WHERE o.fid <> n.fid) x ORDER BY 2, 4 LIMIT ${CAP}`),
+    // a fact names a repo file (`src/x.ts`) that is neither on disk nor tracked any more: report only, the fact may still be right about history
+    gone: await gonePaths(q, `${PUBLIC_FACT} AND ${active}`),
   };
 }
 
@@ -118,13 +121,93 @@ function conflicting(rows: Row[]) {
     return why ? [{ a: r.a, apath: r.apath, b: r.b, bpath: r.bpath, sim: r.sim, why }] : [];
   }));
 }
+const SKIP_DIR = /^(?:tmp|logs|dist|\.git)\//i; // untracked, come and go
+const WENT_AWAY = /ลบ|เลิกใช้|ย้าย|เปลี่ยนชื่อ|ไม่มีแล้ว|remove|delete|rename|moved|drop/i; // the fact itself says the file is gone
+/** Repo-relative file paths a fact names: a whole backticked span, relative with a separator + extension, or absolute under `root`. */
+export function pathRefs(text: string, root: string): string[] {
+  const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase(), out = new Set<string>();
+  for (const m of text.matchAll(/`([^`\n]+)`/g)) {
+    let p = m[1].replace(/\\/g, '/').replace(/:\d+(?:-\d+)?$/, '');
+    if (/\s|[*?{<>]|:\/\/|^~/.test(p)) continue;
+    const abs = /^[a-z]:\//i.test(p);
+    if (abs) { if (!r || !p.toLowerCase().startsWith(`${r}/`)) continue; p = p.slice(r.length + 1); } else if (p.startsWith('/')) continue;
+    p = p.replace(/^\.\//, '');
+    if ((!abs && !p.includes('/')) || !/\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(p)) continue;
+    if (p.split('/').some((s) => s === '..' || s === 'node_modules') || SKIP_DIR.test(p)) continue;
+    if (/(?:^|\/)\.[^/]*$/.test(p)) continue; // `Menu.cpp/.h` = shorthand for two files, not a path (measured on real facts 2026-11-12)
+    out.add(p);
+  }
+  return [...out];
+}
+const gitLines = (root: string, ...args: string[]) => execFileSync('git', ['-c', 'core.quotePath=false', '-C', root, ...args],
+  { encoding: 'utf8', maxBuffer: 256 << 20, stdio: ['ignore', 'pipe', 'ignore'] }).toLowerCase().split('\n').filter(Boolean);
+/** Adds each file and every tail of it after a '/' (a fact may name a file from a folder inside the repo). */
+function addTails(set: Set<string>, files: string[]) {
+  for (const f of files) {
+    set.add(f);
+    for (let i = f.indexOf('/'); i >= 0; i = f.indexOf('/', i + 1)) set.add(f.slice(i + 1));
+  }
+  return set;
+}
+type RepoFiles = { here: Set<string>; tips: Set<string> };
+/** Files of a repo as lower-case path suffixes: `here` = tracked in this folder's checkout, `tips` = at the tip of any local or
+ *  remote-tracking branch. null = not a repo here / git failed. One per root per run. */
+function trackedTails(root: string, cache: Map<string, RepoFiles | null>) {
+  if (!cache.has(root)) {
+    let files: RepoFiles | null = null;
+    try {
+      if (existsSync(join(root, '.git'))) {
+        files = { here: addTails(new Set(), gitLines(root, 'ls-files')), tips: new Set() };
+        for (const tip of new Set(gitLines(root, 'for-each-ref', '--format=%(objectname)', 'refs/heads', 'refs/remotes')))
+          addTails(files.tips, gitLines(root, 'ls-tree', '-r', '--name-only', tip));
+      }
+    } catch { files = null; }
+    cache.set(root, files);
+  }
+  return cache.get(root)!;
+}
+type Removed = { head: Set<string>; any: Set<string> };
+/** Paths a commit removed: `head` = in the history of the checked-out branch, `any` = on any branch. Asked only for a repo with a missing file. */
+function removedTails(root: string, cache: Map<string, Removed>) {
+  if (!cache.has(root)) {
+    const log = (...scope: string[]) => {
+      try { return addTails(new Set(), gitLines(root, 'log', ...scope, '--no-renames', '--diff-filter=D', '--name-only', '--format=')); } catch { return new Set<string>(); }
+    };
+    cache.set(root, { head: log(), any: log('--all') });
+  }
+  return cache.get(root)!;
+}
+/** Active facts whose project repo is here, is a git repo, and no longer has (on disk or tracked, at any depth) a file the fact names. */
+async function gonePaths(q: (sql: string, ...params: unknown[]) => Promise<Row[]>, where: string) {
+  const facts = await q(`SELECT f.fid, f.project, s.path, (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body
+    FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${where} AND f.kind <> 'card' AND coalesce(f.project, '') <> '' ORDER BY s.path`);
+  return withTotal(goneIn(facts));
+}
+/** Uncapped part of gonePaths (the facts: fid, project, path, body). A file missing from this checkout is still there when
+ *  another branch tip has it and the checked-out branch never removed it: the folder is behind (5 of 95 flagged facts, measured
+ *  2026-11-12). A file the checked-out branch removed is gone even when an older branch keeps it (46 of the 95).
+ *  `deleted` = a commit removed the file (certain); otherwise git never had it (an untracked file, another project's file, a
+ *  plan). Certain ones first: the report is capped. */
+export function goneIn(facts: Row[]) {
+  const cache = new Map<string, RepoFiles | null>(), removed = new Map<string, Removed>();
+  return facts.flatMap((f) => {
+    const root = String(f.project), text = claim(f.body);
+    if (!isAbsolute(root) || !existsSync(root) || WENT_AWAY.test(text)) return []; // a project that is no folder (`obsidian/<vault>`) must not resolve against the cwd
+    const repo = trackedTails(root, cache);
+    const missing = repo ? pathRefs(text, root).filter((p) => !existsSync(join(root, p)) && !repo.here.has(p.toLowerCase())) : [];
+    if (!repo || !missing.length) return [];
+    const rm = removedTails(root, removed);
+    const gone = missing.find((p) => !repo.tips.has(p.toLowerCase()) || rm.head.has(p.toLowerCase()));
+    return gone ? [{ fid: f.fid, path: gone, note: f.path, deleted: rm.any.has(gone.toLowerCase()) }] : [];
+  }).sort((a, b) => Number(b.deleted) - Number(a.deleted));
+}
 export type LintReport = Awaited<ReturnType<typeof lintReport>>;
 
 const total = (rows: Row[]) => Number(rows[0]?.total ?? 0);
 export const lintSummary = (r: LintReport) =>
   `เลยวันหมดอายุ ${total(r.expired)} · อาจซ้ำ ${total(r.dups)} คู่ · แชตต้นทางหายหมด ${total(r.orphans)} · ลิงก์เสีย ${total(r.broken)}` +
   ` · หลักฐานไม่ตรง ${total(r.support)} · อาจขัดกัน ${total(r.conflicts)} · บอกว่าแทนแล้วแต่ของเก่ายัง active ${total(r.replaced)}` +
-  ` · CONFLICT ${total(r.entity)} คู่ · STALE ${total(r.stale)}`;
+  ` · CONFLICT ${total(r.entity)} คู่ · STALE ${total(r.stale)}` + (r.gone.length ? ` · อ้างไฟล์ที่ไม่มีแล้ว ${total(r.gone)}` : '');
 
 /** One dated section (Asia/Bangkok day). Wikilinks to notes; a broken target is plain code (a link would be broken itself). */
 export function renderLint(r: LintReport, now = new Date()): string {
@@ -142,6 +225,8 @@ export function renderLint(r: LintReport, now = new Date()): string {
     sec('CONFLICT: ข้อหนึ่งบอกไม่เกี่ยว/ห้าม/เลิกใช้ชื่อนี้ อีกข้อใช้ชื่อนี้อยู่ (ทั้งคู่ active)', r.entity,
       (x) => `[[${title(x.apath)}]] ↔ [[${title(x.bpath)}]] · ${x.name}`) +
     sec('STALE: อ้าง path ในเครื่องที่ไม่มีแล้ว', r.stale, (x) => `[[${title(x.path)}]] · ไม่พบ \`${x.paths.join(' ').replace(/`/g, '')}\``) +
+    sec('อ้างไฟล์ในโปรเจกต์ที่ไม่มีแล้ว (ไม่อยู่บนดิสก์ และไม่อยู่ใน branch ไหนของ git)', r.gone,
+      (x) => `[[${title(x.note)}]] · ไม่พบ \`${String(x.path).replace(/`/g, '')}\` · ${x.deleted ? 'เคยอยู่ใน git แล้วถูกลบ' : 'ไม่เคยอยู่ใน git'}`) +
     sec('ลิงก์เสีย', r.broken, (x) => `[[${title(x.path)}]] → \`${String(x.dst_name).replace(/`/g, '')}\``);
 }
 

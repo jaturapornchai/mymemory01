@@ -27,33 +27,30 @@ type Row = Record<string, any>;
 export async function lintReport(db: pg.Pool, now = new Date()) {
   const q = async (sql: string, ...params: unknown[]): Promise<Row[]> => (await db.query(sql, [[...PRIVATE_TOOLS], ...params])).rows;
   const active = `coalesce(s.status, 'active') = 'active'`;
-  const acc = await accuracyFlags(db, [...PRIVATE_TOOLS]);
-  return {
-    // accuracy.ts: a name excluded in one current fact and used in another; a local path a fact cites is gone
-    entity: withTotal(acc.pairs),
-    stale: withTotal(acc.stale),
+  const [acc, expired, dups, orphans, broken, support, conflictRows, replaced, gone] = await Promise.all([
+    accuracyFlags(db, [...PRIVATE_TOOLS]),
     // stated end passed: invalid_at = world time it stopped being true (dream), expired_at = learned it is no longer current
-    expired: await q(`SELECT f.fid, s.path, least(f.invalid_at, f.expired_at) ended, count(*) OVER () total FROM facts f JOIN sources s ON s.id = f.source_id
+    q(`SELECT f.fid, s.path, least(f.invalid_at, f.expired_at) ended, count(*) OVER () total FROM facts f JOIN sources s ON s.id = f.source_id
       WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card' AND (f.invalid_at < $2 OR f.expired_at <= $2) ORDER BY 3, 1 LIMIT ${CAP}`, now),
     // same project + kind, cosine ≥ DUP on the note's first embedded chunk. ponytail: all pairs per group (~800 facts = ms);
     // an HNSW lateral join if the vault grows to tens of thousands
-    dups: await q(`WITH v AS (SELECT f.fid, f.kind, coalesce(f.project, '') project, s.path,
+    q(`WITH v AS (SELECT f.fid, f.kind, coalesce(f.project, '') project, s.path,
         (SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) e
         FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card')
       SELECT a.fid a, a.path apath, b.fid b, b.path bpath, 1 - (a.e <=> b.e) sim, count(*) OVER () total
       FROM v a JOIN v b ON b.project = a.project AND b.kind = a.kind AND a.fid < b.fid
       WHERE a.e <=> b.e <= $2 ORDER BY a.e <=> b.e, a.fid LIMIT ${CAP}`, 1 - DUP),
     // every chat it came from is forgotten / no longer indexed (the forget cascade retires these unless ลุงจืด edited them)
-    orphans: await q(`SELECT f.fid, s.path, count(*) OVER () total FROM facts f JOIN sources s ON s.id = f.source_id
+    q(`SELECT f.fid, s.path, count(*) OVER () total FROM facts f JOIN sources s ON s.id = f.source_id
       WHERE ${PUBLIC_FACT} AND coalesce(s.status, 'active') IN ('active', 'pending') AND ${ORPHAN} ORDER BY s.path LIMIT ${CAP}`),
     // [[links]] in notes that resolve to no note in any vault; hubs/ is rebuilt every night, so its links are skipped
-    broken: await q(`SELECT s.path, l.dst_name, count(*) OVER () total FROM links l JOIN sources s ON s.id = l.src_id
+    q(`SELECT s.path, l.dst_name, count(*) OVER () total FROM links l JOIN sources s ON s.id = l.src_id
       WHERE ${PUBLIC} AND s.tool = 'obsidian' AND s.project = $2 AND l.dst_id IS NULL AND NOT starts_with(s.session_id, $3)
       ORDER BY s.path, l.dst_name LIMIT ${CAP}`, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`),
     // a dream fact vs the turns of the session it came from (+ its batch project header): are its hard anchors there?
-    support: await unsupported(db, q, `${PUBLIC_FACT} AND ${active}`),
+    unsupported(db, q, `${PUBLIC_FACT} AND ${active}`),
     // close pairs of one project tree (not duplicates, and not already linked by Pass B) whose numbers or negation differ
-    conflicts: conflicting(await q(`WITH v AS (SELECT f.fid, s.id sid, coalesce(f.project, '') project, s.path,
+    q(`WITH v AS (SELECT f.fid, s.id sid, coalesce(f.project, '') project, s.path,
         (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body,
         (SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) e
         FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card'),
@@ -65,17 +62,25 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
       FROM pp JOIN v a ON a.project = pp.pa JOIN v b ON b.project = pp.pb AND a.fid < b.fid
       WHERE a.e <=> b.e <= $2 AND a.e <=> b.e > $3
         AND NOT EXISTS (SELECT 1 FROM links l WHERE (l.src_id = a.sid AND l.dst_id = b.sid) OR (l.src_id = b.sid AND l.dst_id = a.sid))
-      ORDER BY a.e <=> b.e, a.fid, b.fid LIMIT 500`, 1 - CONFLICT, 1 - DUP)),
+      ORDER BY a.e <=> b.e, a.fid, b.fid LIMIT 500`, 1 - CONFLICT, 1 - DUP),
     // a fact whose text says it replaces another ("แทน F…", "ยกเลิก") while that one is still active: the replacement was only
     // written in the text, nothing retired the old one, and SessionStart kept showing both (3 global rules, 2026-10-09)
-    replaced: await q(`WITH v AS (SELECT f.fid, s.path, split_part((SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1), E'\\n\\n- ', 1) body
+    q(`WITH v AS (SELECT f.fid, s.path, split_part((SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1), E'\\n\\n- ', 1) body
         FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${PUBLIC_FACT} AND ${active} AND f.kind <> 'card')
       SELECT nfid, npath, ofid, opath, count(*) OVER () total FROM (SELECT DISTINCT n.fid nfid, n.path npath, o.fid ofid, o.path opath
         FROM v n CROSS JOIN LATERAL regexp_matches(n.body, '(?:(?:แทน(?:ที่)?|ยกเลิก|replac\\w*|supersed\\w*)[^.\\n]{0,40}(F[0-9a-f]{8})|(F[0-9a-f]{8})[^.\\n]{0,40}(?:ถูกแทน|ถูกยกเลิก|ยกเลิกแล้ว|replaced|superseded))', 'gi') m
         JOIN v o ON o.fid = coalesce(m[1], m[2])
         WHERE o.fid <> n.fid) x ORDER BY 2, 4 LIMIT ${CAP}`),
     // a fact names a repo file (`src/x.ts`) that is neither on disk nor tracked any more: report only, the fact may still be right about history
-    gone: await gonePaths(q, `${PUBLIC_FACT} AND ${active}`),
+    gonePaths(q, `${PUBLIC_FACT} AND ${active}`),
+  ]);
+  return {
+    // accuracy.ts: a name excluded in one current fact and used in another; a local path a fact cites is gone
+    entity: withTotal(acc.pairs),
+    stale: withTotal(acc.stale),
+    expired, dups, orphans, broken, support,
+    conflicts: conflicting(conflictRows),
+    replaced, gone,
   };
 }
 
@@ -149,22 +154,28 @@ function addTails(set: Set<string>, files: string[]) {
   }
   return set;
 }
-type RepoFiles = { here: Set<string>; tips: Set<string> };
-/** Files of a repo as lower-case path suffixes: `here` = tracked in this folder's checkout, `tips` = at the tip of any local or
- *  remote-tracking branch. null = not a repo here / git failed. One per root per run. */
+type RepoFiles = { here: Set<string>; tips: Set<string> | null };
+/** Files of a repo as lower-case path suffixes: `here` = tracked in this folder's checkout, `tips` = lazily loaded tip trees of
+ *  local/remote branches only when a cited path is missing locally. null = not a repo here / git failed. One per root per run. */
 function trackedTails(root: string, cache: Map<string, RepoFiles | null>) {
   if (!cache.has(root)) {
     let files: RepoFiles | null = null;
     try {
-      if (existsSync(join(root, '.git'))) {
-        files = { here: addTails(new Set(), gitLines(root, 'ls-files')), tips: new Set() };
-        for (const tip of new Set(gitLines(root, 'for-each-ref', '--format=%(objectname)', 'refs/heads', 'refs/remotes')))
-          addTails(files.tips, gitLines(root, 'ls-tree', '-r', '--name-only', tip));
-      }
+      if (existsSync(join(root, '.git'))) files = { here: addTails(new Set(), gitLines(root, 'ls-files')), tips: null };
     } catch { files = null; }
     cache.set(root, files);
   }
   return cache.get(root)!;
+}
+function branchTails(root: string, repo: RepoFiles): Set<string> {
+  if (repo.tips === null) {
+    repo.tips = new Set();
+    try {
+      for (const tree of new Set(gitLines(root, 'for-each-ref', '--format=%(tree)', 'refs/heads', 'refs/remotes')))
+        addTails(repo.tips, gitLines(root, 'ls-tree', '-r', '--name-only', tree));
+    } catch {}
+  }
+  return repo.tips;
 }
 type Removed = { head: Set<string>; any: Set<string> };
 /** Paths a commit removed: `head` = in the history of the checked-out branch, `any` = on any branch. Asked only for a repo with a missing file. */
@@ -193,11 +204,13 @@ export function goneIn(facts: Row[]) {
   return facts.flatMap((f) => {
     const root = String(f.project), text = claim(f.body);
     if (!isAbsolute(root) || !existsSync(root) || WENT_AWAY.test(text)) return []; // a project that is no folder (`obsidian/<vault>`) must not resolve against the cwd
+    const refs = pathRefs(text, root);
+    if (!refs.length) return [];
     const repo = trackedTails(root, cache);
-    const missing = repo ? pathRefs(text, root).filter((p) => !existsSync(join(root, p)) && !repo.here.has(p.toLowerCase())) : [];
+    const missing = repo ? refs.filter((p) => !existsSync(join(root, p)) && !repo.here.has(p.toLowerCase())) : [];
     if (!repo || !missing.length) return [];
-    const rm = removedTails(root, removed);
-    const gone = missing.find((p) => !repo.tips.has(p.toLowerCase()) || rm.head.has(p.toLowerCase()));
+    const tips = branchTails(root, repo), rm = removedTails(root, removed);
+    const gone = missing.find((p) => !tips.has(p.toLowerCase()) || rm.head.has(p.toLowerCase()));
     return gone ? [{ fid: f.fid, path: gone, note: f.path, deleted: rm.any.has(gone.toLowerCase()) }] : [];
   }).sort((a, b) => Number(b.deleted) - Number(a.deleted));
 }
@@ -231,7 +244,7 @@ export function renderLint(r: LintReport, now = new Date()): string {
 }
 
 /** Auto-retire machine-owned (!isHis) expired facts, unretired replaced targets, and ≥0.95 duplicate pairs (provenance merged). */
-export async function fixLint(db: pg.Pool, now = new Date()) {
+async function runFixLint(db: pg.Pool, now = new Date()) {
   const r = await lintReport(db, now);
   const vault = MEMORY_VAULT.replace(/\\/g, '/');
   const rel = (p: string) => String(p).replace(/\\/g, '/').slice(vault.length + 1);
@@ -293,7 +306,10 @@ export async function fixLint(db: pg.Pool, now = new Date()) {
     await resolveLinks(db);
   }
   await saveFlags(db, await accuracyFlags(db, [])); // after retiring: a retired fact loses its flags; every fact, private ones too
-  return out;
+  return { out, report: r };
+}
+export async function fixLint(db: pg.Pool, now = new Date()) {
+  return (await runFixLint(db, now)).out;
 }
 
 /** forget: older sections (KEEP days) still link the notes it just deleted → drop those lines. An edited _lint.md is his. */
@@ -311,9 +327,9 @@ export async function pruneLint(db: pg.Pool, titles: string[], msg: string) {
 /** lint [--dry] [--fix]: dry = print the section; fix = auto-retire machine dups/expired/replaced first; else hubs/_lint.md. */
 export async function runLint(db: pg.Pool, o: { dry?: boolean; fix?: boolean; now?: Date } = {}): Promise<string> {
   const now = o.now ?? new Date();
-  const fixed = o.fix ? await fixLint(db, now) : undefined;
-  const fixMsg = fixed ? `fixed: -${fixed.expired} expired, -${fixed.replaced} replaced, -${fixed.dups} dups\n` : '';
-  const r = await lintReport(db, now);
+  const fixed = o.fix ? await runFixLint(db, now) : undefined;
+  const fixMsg = fixed ? `fixed: -${fixed.out.expired} expired, -${fixed.out.replaced} replaced, -${fixed.out.dups} dups\n` : '';
+  const r = fixed && fixed.out.expired + fixed.out.replaced + fixed.out.dups === 0 ? fixed.report : await lintReport(db, now);
   const section = renderLint(r, now);
   if (o.dry) return `${fixMsg}${section}`;
   const path = join(MEMORY_VAULT, LINT_REL);

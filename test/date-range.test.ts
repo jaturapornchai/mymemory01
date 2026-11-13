@@ -197,9 +197,22 @@ test('kind filter and asOf point-in-time temporal query (resurrects later-supers
     ['Fe0000010', 'superseded', 'Fe0000011'],
   ]);
 
-  // kind='chat': only raw chats come back (no facts)
+  // kind='chat': only raw chats come back (no facts), and sup/changed_to still resolves across excluded obsidian facts
   const chatsOnly = await search(spy().db, WORD, { semantic: false, kind: 'chat', limit: 8 });
   assert.ok(chatsOnly.hits.length > 0 && chatsOnly.hits.every((h) => h.fid === null && h.tool !== 'obsidian'));
+  const oldChat = chatsOnly.hits.find((h) => h.turn_uuid === 'dr0-u');
+  assert.deepEqual(oldChat?.changed_to, ['Fe0000011']);
+
+  // asOf respects changed_to visibility on chats as well
+  const chatBefore = await search(spy().db, WORD, { semantic: false, kind: 'chat', asOf: '2026-09-15', limit: 8 });
+  assert.equal(chatBefore.hits.find((h) => h.turn_uuid === 'dr0-u')?.changed_to, null);
+  const chatAfter = await search(spy().db, WORD, { semantic: false, kind: 'chat', asOf: '2026-09-25', limit: 8 });
+  assert.deepEqual(chatAfter.hits.find((h) => h.turn_uuid === 'dr0-u')?.changed_to, ['Fe0000011']);
+
+  // Windows path separators in sameTree / projectName
+  const { projectName, sameTree } = await import('../src/importer.ts');
+  assert.equal(sameTree('D:\\myapp\\packages\\x', 'd:/myapp'), true);
+  assert.equal(projectName('D:\\myapp\\'), 'myapp');
 
   // asOf = 2026-09-15 (before Fe0000011 replaced Fe0000010 on 2026-09-20): Fe0000010 is active and Fe0000011 does not exist yet
   const atMid = await search(spy().db, WORD, { semantic: false, kind: 'rule', asOf: '2026-09-15', limit: 8 });

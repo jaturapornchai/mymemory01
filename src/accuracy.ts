@@ -85,13 +85,18 @@ export function conflictPairs(facts: FactText[], only?: string): { a: string; b:
   }
   return [...out.values()];
 }
-/** Current visible facts (not cards) of this project's tree (sameTree) + global ones (all of them for a global fact), for conflictPairs. */
-export async function factTexts(db: pg.Pool, hide: string[], project?: string | null): Promise<FactText[]> {
-  return (await db.query(`SELECT f.fid, coalesce(f.project, '') project, f.kind, ${TEXT} text FROM facts f JOIN sources s ON s.id = f.source_id
+async function factRows(db: pg.Pool, hide: string[], project?: string | null) {
+  return (await db.query(`SELECT f.fid, coalesce(f.project, '') project, f.kind, s.path,
+      (SELECT count(*)::int FROM turns t WHERE t.source_id = s.id) turns, ${TEXT} text
+    FROM facts f JOIN sources s ON s.id = f.source_id
     WHERE ${ACTIVE} AND f.kind <> 'card' AND ${VISIBLE('$1')}
       AND ($2::text IS NULL OR f.project = ANY($3::text[]) OR starts_with(f.project, $4::text || '/') OR f.scope = 'global')`,
   [hide, project || null, project ? projectTree(project) : [], project && !catchAll(project) ? project : null]))
-    .rows.map((r) => ({ fid: r.fid, project: r.project, kind: r.kind, text: String(r.text ?? '') }));
+    .rows.map((r) => ({ fid: r.fid as string, project: String(r.project), kind: String(r.kind), path: String(r.path ?? ''), turns: Number(r.turns), text: String(r.text ?? '') }));
+}
+/** Current visible facts (not cards) of this project's tree (sameTree) + global ones (all of them for a global fact), for conflictPairs. */
+export async function factTexts(db: pg.Pool, hide: string[], project?: string | null): Promise<FactText[]> {
+  return (await factRows(db, hide, project)).map(({ fid, project, kind, text }) => ({ fid, project, kind, text }));
 }
 
 // ---- STALE: a local path the fact cites is gone ----
@@ -126,15 +131,16 @@ export function missingPaths(text: string, project?: string | null): string[] {
 export type AccuracyFlags = { pairs: { a: string; b: string; name: string; apath: string; bpath: string }[]; stale: { fid: string; path: string; paths: string[] }[] };
 /** CONFLICT pairs and STALE paths of the current facts a caller hiding `hide` may see (lint: the report, and with --fix the flags). */
 export async function accuracyFlags(db: pg.Pool, hide: string[]): Promise<AccuracyFlags> {
-  const facts = await factTexts(db, hide);
-  const paths = new Map((await db.query(`SELECT f.fid, s.path FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = ANY($1)`,
-    [facts.map((f) => f.fid)])).rows.map((r) => [r.fid as string, String(r.path)]));
-  const stale = facts.flatMap((f) => { // the note file is the truth: redaction may have masked a path in the DB text
-    const p = paths.get(f.fid) ?? '', body = p && existsSync(p) ? claim(readFileSync(p, 'utf8').replace(/^---\n[\s\S]*?\n---\n?/, '')) : claim(f.text);
+  const rows = await factRows(db, hide);
+  const paths = new Map(rows.map((r) => [r.fid, r.path]));
+  const stale = rows.flatMap((f) => { // disk only when multi-turn, redundant header, or redaction masked a literal path
+    const needDisk = f.turns !== 1 || /^# [^\n]*\n# /.test(f.text) || f.text.includes('[REDACTED:') || f.text.includes('[PRIVATE]');
+    const body = needDisk && f.path && existsSync(f.path)
+      ? claim(readFileSync(f.path, 'utf8').replace(/^---\n[\s\S]*?\n---\n?/, '')) : claim(f.text);
     const miss = missingPaths(body, f.project);
-    return miss.length ? [{ fid: f.fid, path: p, paths: miss }] : [];
+    return miss.length ? [{ fid: f.fid, path: f.path, paths: miss }] : [];
   });
-  return { pairs: conflictPairs(facts).map((x) => ({ ...x, apath: paths.get(x.a) ?? '', bpath: paths.get(x.b) ?? '' })), stale };
+  return { pairs: conflictPairs(rows).map((x) => ({ ...x, apath: paths.get(x.a) ?? '', bpath: paths.get(x.b) ?? '' })), stale };
 }
 /** lint --fix: every conflict:/stale: row replaced by these (a fixed or retired fact loses its flag). One transaction. */
 export async function saveFlags(db: pg.Pool, f: AccuracyFlags) {

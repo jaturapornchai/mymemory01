@@ -258,8 +258,9 @@ ev AS (  -- candidate raw chat → the best candidate active fact distilled from
 z AS (SELECT y.*, greatest(base, (SELECT max(e.base) FROM ev e WHERE e.fact_id = y.id)) * power(1 + $14::float8, tier) score,
              (SELECT array_agg(DISTINCT e.fact_id) FROM ev e WHERE e.raw_id = y.id) ev_of FROM y),
 sup AS (SELECT fx.fid, fx.superseded_by nxt, fx.source_uuids FROM facts fx JOIN sources sx ON sx.id = fx.source_id
-        WHERE sx.status = 'superseded' AND fx.superseded_by IS NOT NULL AND sx.id NOT IN (SELECT id FROM hide)
-          AND ($29::timestamptz IS NULL OR coalesce(fx.invalid_at, fx.expired_at) <= $29::timestamptz))
+        WHERE sx.status = 'superseded' AND fx.superseded_by IS NOT NULL AND sx.id NOT IN (${HIDDEN('$15')})
+          AND ($29::timestamptz IS NULL OR (coalesce(fx.invalid_at, fx.expired_at) <= $29::timestamptz
+            AND EXISTS (SELECT 1 FROM facts fb WHERE fb.fid = fx.superseded_by AND fb.valid_at < $29::timestamptz))))
 SELECT y.id, y.turn_uuid, y.ts, y.project, y.session_id, y.header, y.text, y.status, y.src_kind, y.tool, y.uses, y.last, y.fid, y.kind, y.fact_project,
        y.superseded_by, y.review_target, y.score, y.ev_of, (SELECT j FROM vs) vsig,
        CASE WHEN y.tool <> 'obsidian' THEN (  -- a later-superseded fact annotates its source chats (search() down-ranks them)
@@ -294,6 +295,7 @@ export function dateRange(since?: string, until?: string, untilName = 'until'): 
 // drops it, and an hour's TTL covers a long-lived MCP process (the hourly refresh runs in another one). A failed build = no project named.
 type Named = { name: string; raw: string[] };
 const CATALOGUE = new WeakMap<pg.Pool, { at: number; p: Promise<Named[]> }>();
+const PRIV_CHUNKS = new WeakMap<pg.Pool, { at: number; n: number }>();
 export function projectCatalogue(db: pg.Pool): Promise<Named[]> {
   const c = CATALOGUE.get(db);
   if (c && Date.now() - c.at < 36e5) return c.p;
@@ -338,10 +340,14 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   // One round trip: corpus size, document frequencies, and English stems (redaction → redact:* also finds redacted).
   // Corpus stats leave PRIVATE_TOOLS out (here and in term_df): Claude-only data never shifts another app's ranking.
   const latin = terms.filter((t) => LATIN.test(t.key)).map((t) => t.key);
+  const pc = PRIV_CHUNKS.get(db);
+  const cachedPriv = pc && Date.now() - pc.at < 60_000 ? pc.n : -1;
   const st = (await db.query(
-    `WITH st AS (SELECT w, (ts_lexize('english_stem', w))[1] s FROM unnest($2::text[]) w)
-     SELECT greatest((SELECT reltuples FROM pg_class WHERE oid = 'chunks'::regclass)
-              - (SELECT count(*) FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($3::text[]))), 1)::float8 n,
+    `WITH st AS (SELECT w, (ts_lexize('english_stem', w))[1] s FROM unnest($2::text[]) w),
+          pv AS (SELECT CASE WHEN $5::float8 >= 0 THEN $5::float8
+                   ELSE (SELECT count(*)::float8 FROM chunks WHERE source_id IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($3::text[]))) END n)
+     SELECT greatest((SELECT reltuples FROM pg_class WHERE oid = 'chunks'::regclass) - (SELECT n FROM pv), 1)::float8 n,
+            (SELECT n FROM pv) priv_n,
             coalesce((SELECT json_object_agg(word, ndoc) FROM term_df WHERE word = ANY($1::text[] || ARRAY(SELECT s FROM st))), '{}') df,
             coalesce((SELECT json_object_agg(w, s) FROM st WHERE s IS NOT NULL AND s <> w AND length(s) >= 3), '{}') stems,
             -- familiarity: a Latin word (names live there; Thai segmentation fragments do not count) no chunk has ever held, not even
@@ -351,8 +357,9 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
               AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.words @@ to_tsquery('simple', quote_literal(coalesce(st.s, st.w)) || ':*')
                 AND c.source_id NOT IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($4::text[])))), '[]') unseen`,
     // $4: what this caller may see (a word only Claude-only data holds is still "seen" for Claude)
-    [terms.map((t) => t.key), latin, [...PRIVATE_TOOLS], o.showPrivate ? [] : [...PRIVATE_TOOLS]],
+    [terms.map((t) => t.key), latin, [...PRIVATE_TOOLS], o.showPrivate ? [] : [...PRIVATE_TOOLS], cachedPriv],
   )).rows[0];
+  if (cachedPriv < 0) PRIV_CHUNKS.set(db, { at: Date.now(), n: Number(st.priv_n) });
   const n: number = st.n;
   // Unknown to term_df = newer than the last refresh → treat as rare.
   const scored = terms.map((t) => {
@@ -583,6 +590,7 @@ export async function refreshTermDf(db: pg.Pool) {
       (SELECT id FROM sources WHERE coalesce(hide_as, tool) IN (${[...PRIVATE_TOOLS].map((t) => `''${t}''`).join(', ')}))');
     COMMIT; ANALYZE chunks; ANALYZE term_df;`);
   CATALOGUE.delete(db);
+  PRIV_CHUNKS.delete(db);
 }
 
 /** ≤ max chars around the first query term, whitespace collapsed. */
@@ -672,8 +680,8 @@ SELECT c.id, c.seq_from seq, c.turn_uuid turn, s.tool, s.kind, s.session_id sid,
        NOT EXISTS (SELECT 1 FROM unnest(fa.source_uuids) x WHERE x NOT LIKE 'obs:%') saved, p.*, q.*
 FROM chunks c JOIN sources s ON s.id = c.source_id LEFT JOIN facts fa ON fa.source_id = c.source_id
 LEFT JOIN LATERAL (SELECT t.seq pseq, t.uuid pturn, t.ts pts, ps.tool ptool, ps.kind pkind, ps.session_id psid, ps.path ppath ${CITED}
-                   ORDER BY t.role = 'user' DESC, t.ts, t.seq LIMIT 1) p ON true
-LEFT JOIN LATERAL (SELECT count(DISTINCT t.source_id)::int n, coalesce(bool_or(t.role = 'user'), false) his ${CITED}) q ON true
+                   ORDER BY t.role = 'user' DESC, t.ts, t.seq LIMIT 1) p ON fa.fid IS NOT NULL
+LEFT JOIN LATERAL (SELECT count(DISTINCT t.source_id)::int n, coalesce(bool_or(t.role = 'user'), false) his ${CITED}) q ON fa.fid IS NOT NULL
 WHERE c.id = ANY($1::text[])`;
 
 /** origins of these chunk ids (hits, a memory_get chunk) for a caller that may not see `hide`. One query. */

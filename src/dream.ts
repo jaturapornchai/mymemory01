@@ -800,7 +800,7 @@ export async function hubDocs(db: pg.Pool): Promise<HubDoc[]> {
     db.query(
       `SELECT coalesce(s.project, '') project, count(DISTINCT s.session_id)::int n
        FROM sources s WHERE s.kind = 'main' AND s.tool NOT IN ('obsidian', 'github') AND s.hide_as IS NULL
-         AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND s.session_id = ANY(f.session_ids))
+         AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND s.session_id IS NOT NULL AND f.session_ids @> ARRAY[s.session_id])
          AND NOT EXISTS (SELECT 1 FROM state st WHERE st.k = 'dream:session:' || s.session_id)
        GROUP BY 1`),
     hiddenNameMask(db, [...PRIVATE_TOOLS]),

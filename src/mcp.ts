@@ -426,6 +426,7 @@ server.registerTool(
       content: z.string().min(1).max(4000).optional().describe('the fact/decision/rule, self-contained, in his language (omit only for a mute-only call)'),
       title: z.string().max(80).optional().describe('short note title'),
       kind: z.enum(['rule', 'preference', 'decision', 'fact', 'howto']).optional().describe('default fact'),
+      project: z.string().max(200).optional().describe('target project path or name when saving from another folder or an app without cwd (e.g. "myapp" or "D:\\myapp")'),
       global: z.boolean().optional().describe('applies to all projects (default: this project)'),
       replaces: z.array(z.string().regex(FID)).max(10).optional().describe('fids this corrects: they stop counting as current'),
       mute: z.array(z.string().regex(/^-?[FSI][0-9a-f]{8}$/)).max(20).optional().describe('fids to keep out of session start; "-<fid>" = unmute'),
@@ -433,19 +434,24 @@ server.registerTool(
       confirm_new: z.boolean().optional().describe('save even though a near-duplicate exists (it is a different claim)'),
     },
   },
-  async ({ content, title, kind, global, replaces = [], mute = [], user_quote, confirm_new }) => {
+  async ({ content, title, kind, project, global, replaces = [], mute = [], user_quote, confirm_new }) => {
     const no = off(); if (no) return text(no);
     // zod drops unknown keys: {text: …} arrives as nothing at all, so name the real ones
     if (!content && !mute.length) return text('nothing to do: memory_save takes content (the text to remember — not text/fact/note/memory), ' +
-      'plus optional title, kind, global, replaces, mute, user_quote, confirm_new');
+      'plus optional title, kind, project, global, replaces, mute, user_quote, confirm_new');
     const hide = hidden();
     const want = [...new Set([...replaces, ...mute.map((m) => m.replace(/^-/, ''))])];
     const seen = new Map(want.length ? (await db.query( // a fid this app may not see (Claude-only) = not found, as in memory_get
-      `SELECT f.fid, f.user_owned OR f.edited his, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
+      `SELECT f.fid, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE f.fid = ANY($1) AND ${factVisible('$2')}`, [want, hide])).rows.map((r) => [r.fid, r]) : []);
     const out: string[] = [];
-    const proj = content ? await getProject() : '';
-    const isGlobal = !proj || (global ?? isGlobalFact(content ?? '', title)); // no cwd: a project fact has nowhere to go
+    const explicitProj = content && project?.trim() ? toProject(project.trim()) : '';
+    const cwdProj = content && !explicitProj ? await getProject() : '';
+    const repProjs = content && !explicitProj && !cwdProj && global !== true
+      ? [...new Set(replaces.map((x) => seen.get(x)?.project).filter(Boolean))] : [];
+    const inheritedProj = repProjs.length === 1 ? repProjs[0] : '';
+    const proj = explicitProj ? await canonicalProject(db, explicitProj) : (cwdProj || (inheritedProj ? await canonicalProject(db, inheritedProj) : ''));
+    const isGlobal = !proj || (global ?? ((explicitProj || inheritedProj) ? false : isGlobalFact(content ?? '', title))); // no cwd and no project/replaced project: global
     const body = clean(content ?? '').trim(), fid = noteFid(content ?? '');
     // a near-duplicate waits for the caller to say which: replaces (merge into it) or confirm_new (a different claim)
     const near = content && !replaces.length && !confirm_new ? await nearFacts(db, body, isGlobal ? '' : proj, hide, [fid], { n: 3 }) : [];

@@ -188,14 +188,21 @@ const like = (s?: string) => (s ? `%${s.replace(/[\\%_]/g, (m) => '\\' + m)}%` :
 export async function codeSearch(db: pg.Pool, q: string, o: { repo?: string; path?: string; limit?: number } = {}): Promise<CodeHit[]> {
   const terms = queryTerms(q).map((t) => t.lit);
   if (!terms.length) return [];
-  const args = (op: string) => [terms.join(op), like(o.repo), like(o.path), o.limit ?? 10];
-  const sql = `SELECT c.blob, c.line0, c.text FROM code_chunks c
-    WHERE c.words @@ $1::tsquery AND EXISTS (SELECT 1 FROM code_files f WHERE f.blob = c.blob AND f.repo ILIKE $2 AND f.path ILIKE $3)
-    ORDER BY ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $4`;
+  const repo = o.repo ? like(o.repo) : null, path = o.path ? like(o.path) : null;
+  const filtered = Boolean(repo || path);
+  const args = (op: string) => (filtered ? [terms.join(op), repo, path, o.limit ?? 10] : [terms.join(op), o.limit ?? 10]);
+  const sql = filtered
+    ? `SELECT c.blob, c.line0, c.text FROM code_chunks c
+       WHERE c.words @@ $1::tsquery AND c.blob IN (SELECT f.blob FROM code_files f WHERE ($2::text IS NULL OR f.repo ILIKE $2) AND ($3::text IS NULL OR f.path ILIKE $3))
+       ORDER BY ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $4`
+    : `SELECT c.blob, c.line0, c.text FROM code_chunks c
+       WHERE c.words @@ $1::tsquery AND EXISTS (SELECT 1 FROM code_files f WHERE f.blob = c.blob)
+       ORDER BY ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $2`;
   let rows = (await db.query(sql, args(' & '))).rows;
   if (!rows.length && terms.length > 1) rows = (await db.query(sql, args(' | '))).rows;
-  const files = (await db.query('SELECT blob, repo, path FROM code_files WHERE blob = ANY($1) AND repo ILIKE $2 AND path ILIKE $3 ORDER BY repo, path',
-    [rows.map((r) => r.blob), like(o.repo), like(o.path)])).rows;
+  if (!rows.length) return [];
+  const files = (await db.query('SELECT blob, repo, path FROM code_files WHERE blob = ANY($1) AND ($2::text IS NULL OR repo ILIKE $2) AND ($3::text IS NULL OR path ILIKE $3) ORDER BY repo, path',
+    [rows.map((r) => r.blob), repo, path])).rows;
   return rows.map((r) => ({ line0: r.line0, text: r.text, files: files.filter((f) => f.blob === r.blob).map(({ repo, path }) => ({ repo, path })) }))
     .filter((h) => h.files.length); // the hourly index replaced that file between the two queries
 }

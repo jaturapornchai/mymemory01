@@ -184,8 +184,9 @@ try {
         const force = args.includes('--force');
         const tool = file && imp.toolFor(file);
         if (!file) console.log('redact requeued', await imp.requeueUnredacted(db)); // before the index pass that re-imports them
+        const tIdx = Date.now();
         console.log('index', file ? await (tool ? imp.indexToolFile(db, tool, file, force) : imp.indexFile(db, file, force))
-          : await imp.indexArchive(db, force), `${Date.now() - t0} ms`);
+          : await imp.indexArchive(db, force), `${Date.now() - tIdx} ms`);
         if (!file) console.log('claude memory', await (await import('./claude-memory.ts')).importClaudeMemory(db) // before vaults: indexed this run
           .then((r) => `saved ${r.saved.length}, dup ${r.dup.length}, gone ${r.gone}, unmapped ${r.unmapped.length}`, (e) => `failed: ${e.message}`));
         if (!file) console.log('vaults', await (await import('./obsidian.ts')).indexVaults(db));

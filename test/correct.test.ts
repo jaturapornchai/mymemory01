@@ -5,7 +5,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -28,9 +28,9 @@ const file = (rel: string) => join(MEMORY_VAULT, rel);
 const index = async () => { await guard(); await indexVault(db, MEMORY_VAULT); };
 const status = async (fid: string) => (await db.query(`SELECT s.status, f.superseded_by, f.review_target FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = $1`, [fid])).rows[0];
 
-async function mcp(name: string) {
+async function mcp(name: string, cwd = ROOT) {
   const client = new Client({ name, version: '0' });
-  await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, 'src', 'mcp.ts')], env: ENV, cwd: ROOT, stderr: 'ignore' }));
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(ROOT, 'src', 'mcp.ts')], env: ENV, cwd, stderr: 'ignore' }));
   const call = async (tool: string, args: Record<string, unknown>) =>
     ((await client.callTool({ name: tool, arguments: args })) as { content: { text: string }[] }).content[0].text;
   return { call, close: () => client.close() };
@@ -194,4 +194,37 @@ test('re-saving the text of an active note with replaces:[his note] keeps it act
   assert.match(r, new RegExp(`^\\[${rule}\\]: ไม่ได้เสนอแทน`, 'm'));
   assert.equal(fmOf(rel).status, 'active');
   assert.equal(fmOf(rel).review_target, '');
+});
+
+test('no-project cwd (desktop app): replaces inherits project and explicit project resolves via canonicalProject', async () => {
+  const at = new Date(Date.now() - 86400e3).toISOString();
+  await db.query(`INSERT INTO sources (tool, path, kind, mtime_ms, size, sha256, project, session_id) VALUES ('claude', 'ext-chat', 'main', 1, 1, 'sha-ext', 'd:/extproj', 's-ext') ON CONFLICT DO NOTHING`);
+  const oldFid = 'Fe6e6e6e6';
+  writeNote(`facts/extproj/${oldFid} old.md`, {
+    memhub: 'fact', id: oldFid, kind: 'howto', scope: 'project', project: 'd:/extproj', status: 'active',
+    valid_at: at, created_at: at, source_uuids: ['u-ext1'], run: 'r1', md5: md5('extproj old value\n'),
+  }, 'extproj old value\n');
+  await index();
+
+  const nocwd = await mcp('antigravity-client', homedir());
+  try {
+    const r1 = await nocwd.call('memory_save', { content: 'extproj new value via replaces', replaces: [oldFid] });
+    assert.match(r1, /^saved: facts\/extproj\//m);
+    assert.match(r1, new RegExp(`replaced \\(now OLD\\): \\[${oldFid}\\]`));
+    assert.equal(fmOf(`facts/extproj/${oldFid} old.md`).status, 'superseded');
+    const rel1 = r1.match(/^saved: (facts\/.*\.md) \(/m)![1];
+    assert.equal(fmOf(rel1).scope, 'project');
+    assert.equal(fmOf(rel1).project, 'd:/extproj');
+
+    const r2 = await nocwd.call('memory_save', { content: 'extproj note via explicit project arg', project: 'extproj', confirm_new: true });
+    assert.match(r2, /^saved: facts\/extproj\//m);
+    const rel2 = r2.match(/^saved: (facts\/.*\.md) \(/m)![1];
+    assert.equal(fmOf(rel2).scope, 'project');
+    assert.equal(fmOf(rel2).project, 'd:/extproj');
+
+    await index();
+    assert.equal((await status(oldFid)).status, 'superseded');
+  } finally {
+    await nocwd.close();
+  }
 });

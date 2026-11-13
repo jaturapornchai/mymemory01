@@ -100,7 +100,7 @@ try {
       `SELECT DISTINCT ON (t.session_id) t.session_id, t.ts, t.text_redacted q, array_position($1::text[], t.project) near
        FROM turns t JOIN sources s ON s.id = t.source_id
        WHERE s.kind = 'main' AND coalesce(s.hide_as, s.tool) <> ALL($3::text[]) AND t.project = ANY($1::text[]) AND t.role = 'user' AND t.session_id <> $2 AND left(t.text_redacted, 1) <> '['
-         AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND t.session_id = ANY(f.session_ids))
+         AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND f.session_ids @> ARRAY[t.session_id])
        ORDER BY t.session_id, t.seq`, [chain, session, [...PRIVATE_TOOLS]]),
     lastOtherApp(db, chain, app, session).catch(() => null), // best-effort: the rest still shows
     // cli.ts health(): last run of each background job; + the start time of every dream run still open (the plan itself holds whole pass-A results)

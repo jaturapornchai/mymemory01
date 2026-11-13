@@ -91,7 +91,7 @@ export async function backfill(db: pg.Pool, batch = 8, log = console.log) {
   const t0 = Date.now();
   for (;;) {
     const rows = (await db.query(
-      `SELECT id, ctx_header, text FROM chunks WHERE embedding IS NULL OR model_ver IS DISTINCT FROM $1 LIMIT $2`,
+      `SELECT id, ctx_header, text FROM chunks WHERE embedding IS NULL OR coalesce(model_ver, '') < $1 OR coalesce(model_ver, '') > $1 LIMIT $2`,
       [EMBED_MODEL, batch],
     )).rows;
     if (!rows.length) break;

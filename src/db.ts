@@ -20,7 +20,7 @@ export function connect(role: 'rw' | 'ro'): pg.Pool {
     database: 'memhub',
     user: `memhub_${role}`,
     password,
-    max: role === 'ro' ? 2 : 4,
+    max: 4,
     // ro = MCP hot path: keep one connection between calls (a new one costs ~16 ms: connect + cold catalog caches; the 10 s
     // idle timeout dropped it before ~30 % of real searches); allowExitOnIdle so scripts still exit without db.end()
     // A stalled PG fails a call instead of hanging it (ro only: the rw role runs imports and dreams). Slowest ro statement

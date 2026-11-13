@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE INDEX IF NOT EXISTS turns_source_seq ON turns (source_id, seq);
 CREATE INDEX IF NOT EXISTS turns_session ON turns (session_id);
+CREATE INDEX IF NOT EXISTS turns_project_user ON turns (project, session_id, seq) WHERE role = 'user';
 
 CREATE TABLE IF NOT EXISTS chunks (
   id          text PRIMARY KEY,              -- sha256(chunker_ver, source, text) → stable across re-imports
@@ -53,6 +54,9 @@ CREATE OR REPLACE FUNCTION proj_basename(p text) RETURNS text
   SELECT lower(regexp_replace(p, '^.*[/\\:]', ''))
 $$;
 CREATE INDEX IF NOT EXISTS chunks_proj_name ON chunks (proj_basename(project));
+CREATE INDEX IF NOT EXISTS chunks_turn ON chunks (turn_uuid);
+CREATE INDEX IF NOT EXISTS chunks_unembedded ON chunks (id) WHERE embedding IS NULL;
+CREATE INDEX IF NOT EXISTS chunks_model_ver ON chunks (coalesce(model_ver, ''));
 
 -- Document frequency per word lexeme (refreshed after bulk import) → IDF weighting + rare-term candidates.
 CREATE TABLE IF NOT EXISTS term_df (
@@ -126,6 +130,10 @@ CREATE TABLE IF NOT EXISTS forgotten (
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS status text;
 -- A Claude chat that was shown a Claude-only hit (guard.PRIVATE_TOOLS): hidden wherever that tool is (importer.indexFile).
 ALTER TABLE sources ADD COLUMN IF NOT EXISTS hide_as text;
+CREATE INDEX IF NOT EXISTS sources_hide_cls ON sources (coalesce(hide_as, tool), session_id);
+CREATE INDEX IF NOT EXISTS sources_session ON sources (session_id);
+CREATE INDEX IF NOT EXISTS sources_project ON sources (project);
+CREATE INDEX IF NOT EXISTS sources_status ON sources (status) WHERE status IS NOT NULL;
 
 -- Key/value state for background jobs (dream watermark, …).
 CREATE TABLE IF NOT EXISTS state (
@@ -162,6 +170,8 @@ CREATE INDEX IF NOT EXISTS facts_sessions ON facts USING gin (session_ids);
 CREATE INDEX IF NOT EXISTS facts_uuids ON facts USING gin (source_uuids);
 CREATE INDEX IF NOT EXISTS facts_md5 ON facts (md5);
 CREATE INDEX IF NOT EXISTS facts_proj_name ON facts (proj_basename(project));
+CREATE INDEX IF NOT EXISTS facts_project ON facts (project);
+CREATE INDEX IF NOT EXISTS facts_scope_global ON facts (scope) WHERE scope = 'global';
 
 -- Review queue = pending notes; ลุงจืด resolves them in Obsidian by setting status.
 CREATE OR REPLACE VIEW review_queue AS
@@ -193,6 +203,7 @@ CREATE TABLE IF NOT EXISTS injections (
   chars   int NOT NULL                       -- additionalContext length (budget 2000)
 );
 CREATE INDEX IF NOT EXISTS injections_ts ON injections (ts);
+CREATE INDEX IF NOT EXISTS injections_session ON injections (session);
 GRANT INSERT ON injections TO memhub_ro;
 GRANT USAGE ON SEQUENCE injections_id_seq TO memhub_ro;
 ALTER TABLE injections ADD COLUMN IF NOT EXISTS source text; -- Claude Code SessionStart source: startup | resume | clear | compact | fork

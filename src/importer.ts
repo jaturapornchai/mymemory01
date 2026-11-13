@@ -270,15 +270,19 @@ export function projectChain(project: string): string[] {
   }
   return chain;
 }
-export const projectName = (p: string) => p.split('/').filter(Boolean).at(-1) ?? p;
+export const projectName = (p: string) => p.split(/[/\\]/).filter(Boolean).at(-1) ?? p;
 const HOME_PROJECT = HOME.replace(/\\/g, '/').toLowerCase();
 /** A catch-all folder (drive root, c:/tmp, home and above): chats there are about anything, not about the folders under it. */
 export const catchAll = (p: string) => !p || /^[a-z]:\/?$/.test(p) || p === 'c:/tmp' || p === HOME_PROJECT || HOME_PROJECT.startsWith(p + '/');
 /** p and the folders above it that are one project with it (sameTree), nearest first. */
 export const projectTree = (p: string) => [p, ...projectChain(p).slice(1).filter((d) => !catchAll(d))];
+const normTree = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 /** One project tree: a is b, a folder above it or one below it, on whole segments (catch-alls never span). Search ranking,
  *  CONFLICT and lint all use it. ลุงจืด 2026-10-18: a session in D:\botstery\stories\x works on botstery. */
-export const sameTree = (a: string, b: string) => a === b || (b.startsWith(a + '/') && !catchAll(a)) || (a.startsWith(b + '/') && !catchAll(b));
+export const sameTree = (a: string, b: string) => {
+  const x = normTree(a), y = normTree(b);
+  return x === y || (!!x && y.startsWith(x + '/') && !catchAll(x)) || (!!y && x.startsWith(y + '/') && !catchAll(y));
+};
 
 const chainCache = new Map<string, { at: number; out: string[] }>(), knownProjects = new Set<string>();
 /**
@@ -493,7 +497,8 @@ export async function indexFile(db: pg.Pool, path: string, force = false, shared
   }
   const isSub = path.split(sep).includes('subagents');
   const hub: string[] = [];
-  const msgs: Msg[] = isSub ? parseSubagent(buf.toString('utf8'), hub) : parseClaude(buf.toString('utf8'), undefined, hub);
+  const raw = buf.toString('utf8');
+  const msgs: Msg[] = isSub ? parseSubagent(raw, hub) : parseClaude(raw, undefined, hub);
   // subagent / workflow journal: <project dir>/<parent session>/subagents/... — journals carry no sessionId or cwd
   const parts = path.split(sep);
   const parent = isSub ? parts[parts.indexOf('subagents') - 1] : undefined;
@@ -511,7 +516,7 @@ export async function indexFile(db: pg.Pool, path: string, force = false, shared
   const hideAs = (await hideAsOf(db, hub)) ?? (shared !== undefined ? shared
     : await sessionHideAs(db, [`${dir}.jsonl`, ...walk(join(dir, 'subagents'))].filter((f) => f.endsWith('.jsonl') && existsSync(f)), force));
   await store(db, {
-    tool: 'claude', path, kind: isSub ? 'subagent' : isHeadless(buf.toString('utf8')) ? 'headless' : 'main', sessionId, project,
+    tool: 'claude', path, kind: isSub ? 'subagent' : isHeadless(raw) ? 'headless' : 'main', sessionId, project,
     size: st.size, mtimeMs: st.mtimeMs, sha256: hash, label: projectName(project), isSub, hideAs,
     replace: !!old && st.size < Number(old.size), // rewritten (not appended): drop rows so seq numbers stay consistent
   }, turns, async (c) => {
@@ -640,10 +645,12 @@ export async function indexArchive(db: pg.Pool, force = false) {
   const stats: Record<string, number> = { skip: 0, excluded: 0, indexed: 0, empty: 0, failed: 0 };
   const known = force ? new Map<string, { size: string | number; mtime_ms: string | number }>()
     : new Map((await db.query('SELECT path, size, mtime_ms FROM sources')).rows.map((r) => [r.path, r]));
+  const stCache = new Map<string, ReturnType<typeof statSync>>();
   const unchanged = (f: string) => {
     const o = known.get(f);
     if (!o) return false;
-    const st = statSync(f);
+    let st = stCache.get(f);
+    if (!st) { st = statSync(f); stCache.set(f, st); }
     return Number(o.size) === st.size && Number(o.mtime_ms) === Math.round(st.mtimeMs);
   };
   const sessions = new Map<string, string[]>(); // <dir>/<sid>.jsonl + <dir>/<sid>/subagents/** = one batch (sessionHideAs)
@@ -659,6 +666,7 @@ export async function indexArchive(db: pg.Pool, force = false) {
     try { hideAs = await sessionHideAs(db, files, force); } // failed scan: skip the session (next run retries), never index it visible
     catch (e) { stats.failed += files.length; console.error(`index failed: ${files[0]}: ${(e as Error).message}`); continue; }
     for (const f of files) {
+      if (!force && unchanged(f)) { stats.skip++; continue; }
       try { stats[await indexFile(db, f, force, hideAs)]++; }
       catch (e) { stats.failed++; console.error(`index failed: ${f}: ${(e as Error).message}`); }
     }

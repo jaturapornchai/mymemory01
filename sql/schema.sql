@@ -72,8 +72,10 @@ CREATE TABLE IF NOT EXISTS links (
   src_id   bigint NOT NULL REFERENCES sources ON DELETE CASCADE,
   dst_name text NOT NULL,                    -- link target as written, lowercased, without alias/heading
   dst_id   bigint REFERENCES sources ON DELETE SET NULL,
+  rel      text NOT NULL DEFAULT 'link',     -- typed synapse relation: link | supersedes | from | uses_table | follows_rule | ...
   PRIMARY KEY (src_id, dst_name)
 );
+ALTER TABLE links ADD COLUMN IF NOT EXISTS rel text NOT NULL DEFAULT 'link';
 CREATE INDEX IF NOT EXISTS links_dst ON links (dst_id);
 CREATE INDEX IF NOT EXISTS links_dst_name ON links (dst_name);
 
@@ -158,6 +160,7 @@ CREATE TABLE IF NOT EXISTS facts (
   review_target text,                          -- pending notes: fid they propose to update/supersede
   source_uuids  text[] NOT NULL CHECK (cardinality(source_uuids) > 0),
   session_ids   text[] NOT NULL DEFAULT '{}',  -- derived from source_uuids at index time
+  related_projects text[] NOT NULL DEFAULT '{}', -- secondary canonical projects referenced by a cross-project fact
   confidence    real,
   importance    smallint,
   pinned        boolean NOT NULL DEFAULT false,
@@ -166,8 +169,10 @@ CREATE TABLE IF NOT EXISTS facts (
   md5           text NOT NULL,                 -- md5(lower(collapsed text)): dedupe + tombstones
   run           text                           -- dream run id; NULL = written by hand / memory_save
 );
+ALTER TABLE facts ADD COLUMN IF NOT EXISTS related_projects text[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS facts_sessions ON facts USING gin (session_ids);
 CREATE INDEX IF NOT EXISTS facts_uuids ON facts USING gin (source_uuids);
+CREATE INDEX IF NOT EXISTS facts_related_projects ON facts USING gin (related_projects);
 CREATE INDEX IF NOT EXISTS facts_md5 ON facts (md5);
 CREATE INDEX IF NOT EXISTS facts_proj_name ON facts (proj_basename(project));
 CREATE INDEX IF NOT EXISTS facts_project ON facts (project);

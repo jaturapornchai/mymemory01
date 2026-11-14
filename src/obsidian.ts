@@ -12,7 +12,8 @@ export const VAULTS = [...(process.env.MEMHUB_VAULTS ?? '')
   .split(',').map((s) => s.trim()).filter(Boolean), MEMORY_VAULT];
 
 const SKIP_DIRS = new Set(['.obsidian', '.trash', '.git', 'node_modules']);
-const WIKILINK = /(?<!!)\[\[([^\]|#^\n]+)(?:[#^][^\]|\n]*)?(?:\|[^\]\n]*)?\]\]/g; // [[target#heading|alias]], not ![[embeds]]
+// Supports both [[target#heading|alias]] and typed [[rel::target#heading|alias]], not ![[embeds]]
+const WIKILINK = /(?<!!)\[\[(?:([a-z][a-z0-9_]{1,24})::)?([^\]|#^\n]+)(?:[#^][^\]|\n]*)?(?:\|[^\]\n]*)?\]\]/g;
 
 function* notes(dir: string): Generator<string> {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -24,9 +25,30 @@ function* notes(dir: string): Generator<string> {
 /** Link target as Obsidian resolves it: last path segment, no .md, case-insensitive. */
 export const linkKey = (target: string) => basename(target.trim().replace(/\\/g, '/')).replace(/(?:\.md)+$/i, '').toLowerCase();
 
-export function wikilinks(md: string): string[] {
+const normRel = (r?: string) => {
+  const k = (r ?? '').trim().toLowerCase();
+  return !k || k === 'related' || k === 'review' ? 'link' : k;
+};
+
+/** Extract deduplicated wikilinks with typed synapse relations (`[[rel::target]]` or `- rel:: [[target]]`). */
+export function typedWikilinks(md: string): { dst: string; rel: string }[] {
   const cleanMd = md.replace(/```[\s\S]*?```|`[^`\n]+`/g, '');
-  return [...new Set([...cleanMd.matchAll(WIKILINK)].map((m) => linkKey(m[1])).filter((k) => /[\p{L}\p{N}]/u.test(k)))];
+  const byDst = new Map<string, string>();
+  for (const line of cleanMd.split('\n')) {
+    const lineRel = /^\s*-\s*([a-z][a-z0-9_]{1,24})::/i.exec(line)?.[1];
+    for (const m of line.matchAll(WIKILINK)) {
+      const dst = linkKey(m[2]);
+      if (!/[\p{L}\p{N}]/u.test(dst)) continue;
+      const rel = normRel(m[1] ?? lineRel);
+      const prev = byDst.get(dst);
+      if (prev === undefined || (prev === 'link' && rel !== 'link')) byDst.set(dst, rel);
+    }
+  }
+  return [...byDst.entries()].map(([dst, rel]) => ({ dst, rel }));
+}
+
+export function wikilinks(md: string): string[] {
+  return typedWikilinks(md).map((x) => x.dst);
 }
 
 export async function indexVault(db: pg.Pool, vault: string) {
@@ -38,9 +60,10 @@ export async function indexVault(db: pg.Pool, vault: string) {
   const existing = (await db.query(`SELECT id, path, size, mtime_ms FROM sources WHERE tool = 'obsidian' AND project = $1`, [project])).rows;
   const seenSet = new Set(seen);
   const gone = existing.filter((r) => !seenSet.has(r.path) && !existsSync(r.path)).map((r) => r.id);
-  if (gone.length && vault === MEMORY_VAULT) { // deleted fact file = ลุงจืด's decision → tombstone so the dream never re-creates it
-    await db.query(`INSERT INTO forgotten (key) SELECT 'fact:' || md5 FROM facts WHERE source_id = ANY($1) AND kind <> 'card'
-      ON CONFLICT DO NOTHING`, [gone]);
+  if (gone.length && vault === MEMORY_VAULT) { // deleted fact file = ลุงจืด's decision → tombstone (moved note keeps its fid in seen)
+    const liveFids = [...new Set(seen.map((p) => basename(p).match(/^([FSI][0-9a-f]{8})\b/)?.[1]).filter(Boolean) as string[])];
+    await db.query(`INSERT INTO forgotten (key) SELECT 'fact:' || md5 FROM facts WHERE source_id = ANY($1) AND kind <> 'card' AND NOT (fid = ANY($2::text[]))
+      ON CONFLICT DO NOTHING`, [gone, liveFids]);
   }
   if (gone.length) await db.query('DELETE FROM sources WHERE id = ANY($1)', [gone]);
   stats.removed = gone.length;
@@ -72,8 +95,14 @@ export async function indexVault(db: pg.Pool, vault: string) {
     }, [{ uuid, parentUuid: null, seq: 0, role: 'note', ts, text: clean(`# ${title}\n${body}`) }],
     async (c, sourceId) => {
       if (own) { await indexFact(c, sourceId, fm, body, uuid, st.mtime.toISOString()); await hideDreamed(c, null, sourceId); } // cites a hidden chat → hidden before commit
+      const links = typedWikilinks(raw);
       await c.query('DELETE FROM links WHERE src_id = $1', [sourceId]);
-      await c.query('INSERT INTO links (src_id, dst_name) SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING', [sourceId, wikilinks(raw)]);
+      if (links.length) {
+        await c.query(
+          'INSERT INTO links (src_id, dst_name, rel) SELECT $1, x.dst, x.rel FROM unnest($2::text[], $3::text[]) x(dst, rel) ON CONFLICT (src_id, dst_name) DO UPDATE SET rel = EXCLUDED.rel',
+          [sourceId, links.map((x) => x.dst), links.map((x) => x.rel)],
+        );
+      }
     });
     stats.indexed++;
   }
@@ -94,10 +123,11 @@ async function indexFact(c: pg.PoolClient, sourceId: string, fm: Fm, body: strin
   const pinned = fmStr(fm.pinned) === 'true';
   const uuids = fmList(fm.source_uuids).filter(Boolean);
   const created = isoOr(fmStr(fm.created_at), mtime)!;
+  const relProjs = fmStr(fm.scope) === 'global' ? [] : [...new Set(fmList(fm.related_projects).map((p) => normProject(p)).filter(Boolean))];
   await c.query(
-    `INSERT INTO facts (source_id, fid, kind, scope, project, lang, valid_at, invalid_at, created_at, expired_at, superseded_by,
+    `INSERT INTO facts (source_id, fid, kind, scope, project, related_projects, lang, valid_at, invalid_at, created_at, expired_at, superseded_by,
        review_target, source_uuids, session_ids, confidence, importance, pinned, user_owned, edited, md5, run)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text[],
+     VALUES ($1, $2, $3, $4, $5, $21::text[], $6, $7, $8, $9, $10, $11, $12, $13::text[],
        coalesce((SELECT array_agg(DISTINCT session_id) FROM turns WHERE uuid = ANY($13::text[])), '{}'),
        $14, $15, $16, $17, $18, $19, $20)
      ON CONFLICT (fid) DO NOTHING`, // ponytail: two files claiming one id → first indexed wins
@@ -107,7 +137,7 @@ async function indexFact(c: pg.PoolClient, sourceId: string, fm: Fm, body: strin
       isoOr(fmStr(fm.expired_at), null), fmStr(fm.superseded_by) || null, fmStr(fm.review_target) || null,
       uuids.length ? uuids : [uuid], Number(fmStr(fm.confidence)) || null, Math.min(10, Math.max(1, Number(fmStr(fm.importance)) || 5)),
       pinned, ['rule', 'feedback'].includes(kind) || fmStr(fm.owner) === 'user' || edited || pinned, edited,
-      fmStr(fm.md5) || md5(body), fmStr(fm.run) || null]);
+      fmStr(fm.md5) || md5(body), fmStr(fm.run) || null, relProjs]);
 }
 
 /** Resolve [[names]] to note sources across all vaults (a name may live in another vault). */

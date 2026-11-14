@@ -69,28 +69,28 @@ try {
   const chain = await resolveProjectChain(db, project); // includes cross-machine / moved-folder canonical project + parent folders
   const body = `(SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1)`;
   // this folder's facts, then each folder above it, then global ones (NULL sorts last)
-  const near = `CASE WHEN f.scope IS DISTINCT FROM 'global' THEN array_position($1::text[], f.project) END`;
+  const near = `CASE WHEN f.scope IS DISTINCT FROM 'global' THEN coalesce(array_position($1::text[], f.project), 99) END`;
   const unmuted = `NOT EXISTS (SELECT 1 FROM state m WHERE m.k = 'mute:' || f.fid)`; // memory_save mute (cli.ts mute)
   const [rules, prefs, model, cards, recent, otherApp, health, id] = await Promise.all([
     // this project's rules before global ones: the 15 global rules (importance 8-9) took the top slots in every project, and
     // most of them restate ~/.agents/AGENTS.md, which every AI here already loads. 8 shown at most; the rest feed "…อีก N"
     db.query(
       `SELECT f.fid, f.kind, ${body} txt FROM facts f JOIN sources s ON s.id = f.source_id
-       WHERE (f.project = ANY($1::text[]) OR f.scope = 'global') AND (f.pinned OR f.kind IN ('rule', 'feedback'))
+       WHERE (f.project = ANY($1::text[]) OR f.related_projects && $1::text[] OR f.scope = 'global') AND (f.pinned OR f.kind IN ('rule', 'feedback'))
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) -- dreamed from a chat hidden later (importer.hideDreamed)
        ORDER BY f.pinned DESC, ${near}, f.importance DESC NULLS LAST, f.created_at DESC, f.fid LIMIT 30`, [chain, [...PRIVATE_TOOLS]]),
     db.query( // what ลุงจืด prefers (he said it, or picked it from an AI's options): this project first, then most sessions behind it
       `SELECT f.fid, ${body} txt, (SELECT count(DISTINCT t.session_id) FROM turns t WHERE t.uuid = ANY(f.source_uuids))::int n
        FROM facts f JOIN sources s ON s.id = f.source_id
-       WHERE (f.project = ANY($1::text[]) OR f.scope = 'global') AND f.kind = 'preference' AND NOT f.pinned -- pinned ones are already rules above
+       WHERE (f.project = ANY($1::text[]) OR f.related_projects && $1::text[] OR f.scope = 'global') AND f.kind = 'preference' AND NOT f.pinned -- pinned ones are already rules above
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
        ORDER BY ${near}, n DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 30`, [chain, [...PRIVATE_TOOLS]]),
     db.query( // settled project Mental Model (decisions, debugging how-tos, high-importance facts): this project only, multi-session proof first
       `SELECT f.fid, f.kind, ${body} txt, greatest(cardinality(f.session_ids), 1)::int n
        FROM facts f JOIN sources s ON s.id = f.source_id
-       WHERE f.project = ANY($1::text[]) AND f.kind IN ('decision', 'howto', 'fact') AND NOT f.pinned
+       WHERE (f.project = ANY($1::text[]) OR f.related_projects && $1::text[]) AND f.kind IN ('decision', 'howto', 'fact') AND NOT f.pinned
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
-       ORDER BY array_position($1::text[], f.project), (cardinality(f.session_ids) > 1) DESC, f.kind IN ('decision', 'howto') DESC,
+       ORDER BY coalesce(array_position($1::text[], f.project), 99), (cardinality(f.session_ids) > 1) DESC, f.kind IN ('decision', 'howto') DESC,
          cardinality(f.session_ids) DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 20`, [chain, [...PRIVATE_TOOLS]]),
     db.query(
       `SELECT f.fid, f.valid_at, ${body} txt FROM facts f JOIN sources s ON s.id = f.source_id

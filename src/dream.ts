@@ -14,6 +14,7 @@ import { BRIEF } from './claude.ts';
 import { backfill } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { hideDreamed, projectName } from './importer.ts';
+import { inferFactProject } from './projects.ts';
 import { redactOffsite } from './redact.ts';
 import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
@@ -612,9 +613,12 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
       continue;
     }
     stats[op.op]++;
-    const base: Fm = { memhub: 'fact', kind: c.kind, scope: c.scope, project: c.scope === 'global' ? '' : c.d.project, lang: c.lang,
-      importance: String(c.importance), confidence: String(c.confidence), pinned: 'false', run: o.run, created_at: now.toISOString(),
-      tags: [`memhub/${c.kind}`, `project/${projectSlug(c.d.project)}`] };
+    const inf = await inferFactProject(db, c.text, { cwdProject: c.d.project, global: c.scope === 'global' ? true : undefined });
+    const effScope = inf.isGlobal ? 'global' : 'project', effProj = inf.isGlobal ? '' : (inf.project || c.d.project);
+    const base: Fm = { memhub: 'fact', kind: c.kind, scope: effScope, project: effProj,
+      ...(effScope === 'project' && inf.relatedProjects.length ? { related_projects: inf.relatedProjects } : {}),
+      lang: c.lang, importance: String(c.importance), confidence: String(c.confidence), pinned: 'false', run: o.run, created_at: now.toISOString(),
+      tags: [`memhub/${c.kind}`, `project/${projectSlug(effProj || undefined)}`] };
     const body = (text: string, extra: string[] = []) =>
       `${text}\n\n- from:: ${link(c.card)}\n${[...extra, ...op.links.map((l) => `- ${l.rel}:: ${link(l.e.rel)}`)].join('\n')}${extra.length || op.links.length ? '\n' : ''}`;
     const addNote = (text: string, uuids: string[], fm: Fm, extra: string[] = []) => {
@@ -626,7 +630,7 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
         return prev;
       }
       const fid = factId(text);
-      const rel = factRel(fid, text, c.scope, c.d.project);
+      const rel = factRel(fid, text, effScope, effProj);
       const res = writeNote(rel, { ...base, id: fid, md5: h, status: 'active', valid_at: c.validAt.toISOString(),
         invalid_at: c.invalidAt?.toISOString() ?? '', expired_at: '', superseded_by: '', review_target: '', source_uuids: uuids, ...fm }, body(text, extra));
       if (res === 'kept-user-edit') stats.kept_user_edit++;

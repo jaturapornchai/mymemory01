@@ -150,13 +150,13 @@ const HITS: any[] = [
   { ...base, id: '0000000000000008', ts: d('2026-09-25T00:00:00Z'), fid: 'F0000000e', kind: 'fact', status: 'pending', review_target: 'F0000000a', project: 'obsidian/memory-hub', fact_project: null, text: 'D: # F0000000e p\npending goldenport 7300' },
 ];
 
-// re-pinned 2026-10-03 for rank budgets + passage(), 2026-10-18 for the ✓ใช้ได้/บันทึก/✗เลิกใช้ labels + Thai-time day() (deliberate
-// format changes); any other change to it must stay byte-for-byte
+// re-pinned 2026-10-03 for rank budgets + passage(), 2026-10-18 for ✓ใช้ได้/บันทึก/✗เลิกใช้ + Thai day(), 2026-11-14 for global fact label
+// (fact_project: null renders 'global' instead of vault 'memory-hub'); any other change must stay byte-for-byte
 test('full mode is byte-for-byte what it was before brief mode (golden hash of searchText on the fixture)', () => {
   mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T00:00:00Z') }); // hitLine prints ages
   try {
     const outs = [searchText(HITS, 'goldenport 7100', true), searchText(HITS.slice(0, 2), 'goldenport', false), searchText([], 'x', true)];
-    assert.equal(createHash('sha256').update(outs.join('\0')).digest('hex'), '11b7f216885303fc7491512ec6282aa2603aebcfa0329e7c0df98cb0df76670c', outs[0]);
+    assert.equal(createHash('sha256').update(outs.join('\0')).digest('hex'), '10861a2e8d8668f1eff30c902f781820d81dafe26fdcd99925577e06f342acca', outs[0]);
   } finally { mock.timers.reset(); }
 });
 

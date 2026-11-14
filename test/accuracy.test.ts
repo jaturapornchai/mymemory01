@@ -301,3 +301,86 @@ test('CONFLICT spans the project tree like search: parent ↔ sub-folder facts a
   const saved = await c.call('memory_save', { content: 'acctestq: ส่ง event ผ่าน Kafka ทุกนาที', confirm_new: true });
   assert.match(saved, new RegExp(`⚠ CONFLICT: ขัดกับ \\[${noteFid('acctestsub ไม่ใช้ Kafka เด็ดขาด')}\\] เรื่อง kafka`), saved);
 });
+
+test('Antigravity live transcript userSaid, EOF line bounds, project resolver, and MCP synapse path', async () => {
+  const { clearResolverCache, inferFactProject, resolveProjectInput } = await import('../src/projects.ts');
+  const { extractTargets, hasOverrideProof } = await import('../src/accuracy.ts');
+  const { hitProject } = await import('../src/search.ts');
+
+  // 1) Global label never misattributed to memoryhub
+  assert.equal(hitProject({ fid: 'F12345678', kind: 'rule', fact_project: null, project: 'obsidian/memory-hub', tool: 'obsidian' }), '');
+
+  // 2) EOF line bounds check in missingPaths
+  mkdirSync(join(tmp, 'src'), { recursive: true });
+  writeFileSync(join(tmp, 'src', 'tiny.py'), 'a = 1\nb = 2\nc = 3\n');
+  assert.deepEqual(missingPaths('see src/tiny.py:1-3', normProject(tmp)), []);
+  const eofMiss = missingPaths('see src/tiny.py:10-25', normProject(tmp));
+  assert.equal(eofMiss.length, 1);
+  assert.match(eofMiss[0], /src\/tiny\.py:10-25 \(EOF=3\)/);
+
+  // 3) Parameter / proof override extraction
+  const tgs = extractTargets('ปรับ SHORT_MIN_VOL = 5_000_000 ใน market.py แทนที่ค่าเดิมหลัง backtest ไม่ผ่าน 0/16');
+  assert.ok(tgs.consts.has('SHORT_MIN_VOL'));
+  assert.ok(tgs.files.has('market.py'));
+  assert.equal(hasOverrideProof('หลังรัน OOS backtest ไม่ผ่าน 0/16 จึงถอดออก'), true);
+
+  // 4) Canonical project resolver + contrast reference handling
+  const projA = join(tmp, 'proj-alpha').replace(/\\/g, '/').toLowerCase();
+  const projKms = join(tmp, 'proj-kms').replace(/\\/g, '/').toLowerCase();
+  mkdirSync(projA, { recursive: true });
+  mkdirSync(projKms, { recursive: true });
+  await db.query(`INSERT INTO state (k, v) VALUES ('project:aliases', $1::jsonb) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [
+    { 'alpha-alias': projA },
+  ]);
+  clearResolverCache();
+  const resolved = await resolveProjectInput(db, 'alpha-alias');
+  assert.equal(resolved.canonical, projA);
+  const inferred = await inferFactProject(
+    db,
+    `โปรเจกต์ alpha-alias พัฒนาต่อยอดโดยใช้ ${projKms} เป็น KMS เท่านั้น`,
+    { cwdProject: PROJECT },
+  );
+  assert.equal(inferred.project, projA);
+  assert.ok(!inferred.relatedProjects.includes(projKms), 'contrast/KMS path is not added as target or related project');
+
+  // 5) Live Antigravity transcript.jsonl userSaid verification
+  const agHome = join(tmp, 'ag-home');
+  const agLogs = join(agHome, 'antigravity', 'brain', 'conv-test-1', '.system_generated', 'logs');
+  mkdirSync(agLogs, { recursive: true });
+  writeFileSync(
+    join(agLogs, 'transcript.jsonl'),
+    JSON.stringify({
+      type: 'USER_INPUT',
+      source: 'USER_EXPLICIT',
+      status: 'DONE',
+      content: '<USER_REQUEST>จำไว้ใน acctestag: ใช้พอร์ต 9123 เท่านั้น</USER_REQUEST><SYSTEM_MESSAGE>secret-system-only-text</SYSTEM_MESSAGE>',
+    }) + '\n',
+  );
+  process.env.MEMHUB_ANTIGRAVITY_HOME = agHome;
+  try {
+    assert.equal(await userSaid(db, 'จำไว้ใน acctestag: ใช้พอร์ต 9123 เท่านั้น', join(tmp, 'empty-live')), true);
+    assert.equal(await userSaid(db, 'secret-system-only-text', join(tmp, 'empty-live')), false, 'SYSTEM_MESSAGE stripped');
+  } finally {
+    delete process.env.MEMHUB_ANTIGRAVITY_HOME;
+  }
+
+  // 6) MCP memory_get to_id shortest synapse path
+  const n1 = saveNote('acctestpath1: ตารางสินค้าใช้ [[uses_table::acctest_tbl_stock]]', { project: PROJECT, reindex: false });
+  const n2 = saveNote('acctestpath2: โครงสร้างตารางหลัก', { title: 'acctest_tbl_stock', project: PROJECT, reindex: false });
+  await index();
+  await (await import('../src/obsidian.ts')).resolveLinks(db);
+  const fid1 = noteFid('acctestpath1: ตารางสินค้าใช้ [[uses_table::acctest_tbl_stock]]');
+  const fid2 = noteFid('acctestpath2: โครงสร้างตารางหลัก');
+  const pathOut = await c.call('memory_get', { id: fid1, to_id: fid2 });
+  assert.match(pathOut, /synapse path \(1 hop\):/);
+  assert.match(pathOut, /──\[uses_table\]──▶/);
+  assert.match(pathOut, /uses_table/, 'letter s in title must not be stripped as whitespace');
+  assert.doesNotMatch(pathOut, /D:\s*#\s*F[0-9a-f]{8}/i, 'fact heading prefix stripped cleanly');
+
+  // 7) polarity: conjunction glue ("ยกเลิกใช้ A และ B") + task/assistant-scoped clauses
+  const pNegBoth = polarity('ยกเลิกใช้ MongoDB และ Kafka ทั้งหมด');
+  assert.equal(pNegBoth.get('mongodb'), 'neg');
+  assert.equal(pNegBoth.get('kafka'), 'neg');
+  assert.equal(polarity('สำหรับงานสร้างตัวละคร และบอกว่าไม่เกี่ยวกับ Gemma').size, 0);
+  assert.equal(polarity('ห้ามใช้ Claude เป็นผู้ช่วยใน Antigravity').size, 0);
+});

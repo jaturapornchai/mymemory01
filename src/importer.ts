@@ -213,7 +213,9 @@ export function gitOrigin(dir: string): string | null {
   } catch { return null; }
 }
 
-function projectMap(): Record<string, string> {
+export function clearProjectCache() { roots.clear(); projMapCache = null; chainCache.clear(); }
+
+export function projectMap(): Record<string, string> {
   if (projMapCache && process.env.MEMHUB_PROJECT_MAP === undefined) return projMapCache;
   const m: Record<string, string> = {};
   // 1) Auto-discovered GitHub repo -> canonical local clone (skip default ~/ai-archive in hermetic test schemas)
@@ -311,17 +313,25 @@ export async function resolveProjectChain(db: pg.Pool, cwdOrProject: string, onl
        agg AS (SELECT project, sum(n)::int n FROM known GROUP BY 1),
        cur AS (SELECT coalesce((SELECT n FROM agg WHERE project = $1), 0) n),
        al AS (SELECT coalesce(v->>$1, CASE WHEN $2::text IS NOT NULL THEN v->>$2 END, v->>$3) target FROM state WHERE k = 'project:aliases'),
+       rev_al AS (
+         SELECT lower(key) AS project FROM state, jsonb_each_text(v)
+         WHERE k = 'project:aliases' AND lower(key) LIKE '%/%'
+           AND (lower(value) = $1 OR lower(value) = (SELECT lower(target) FROM al WHERE target IS NOT NULL LIMIT 1))
+       ),
        gh AS (SELECT project FROM sources WHERE $2::text IS NOT NULL AND tool = 'github' AND lower(session_id) = 'github:' || $2 AND project NOT LIKE 'github/%' LIMIT 1),
        same AS (
          SELECT a.project, (a.n > (SELECT n FROM cur) OR (a.n = (SELECT n FROM cur) AND length(a.project) < length($1))) canon FROM agg a
-         WHERE $4::bool AND a.project <> $1 AND (a.project = $3 OR right(a.project, length($3) + 1) = '/' || $3)
+         WHERE $4::bool AND a.project <> $1
+           AND (a.project = $3 OR right(a.project, length($3) + 1) = '/' || $3
+                OR (length($3) >= 4 AND regexp_replace(proj_basename(a.project), '[-_]', '', 'g') = regexp_replace($3, '[-_]', '', 'g')))
            AND NOT EXISTS (SELECT 1 FROM agg par WHERE par.project = ANY($5::text[]))
            AND NOT EXISTS (SELECT 1 FROM agg par WHERE par.project <> a.project AND starts_with(a.project, par.project || '/'))
          ORDER BY a.n DESC, length(a.project) ASC
        )
        SELECT target AS p, true canon FROM al WHERE target IS NOT NULL
        UNION ALL SELECT project, true FROM gh
-       UNION ALL SELECT project, canon FROM same`,
+       UNION ALL SELECT project, canon FROM same
+       UNION ALL SELECT project, false FROM rev_al`,
       [p, repo, name, !SCRATCH_NAMES.has(name), parents],
     );
     const out = [p];

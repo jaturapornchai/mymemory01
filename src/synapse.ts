@@ -131,7 +131,27 @@ type Arc = { to: number; w: number; kind: string };   // w = τ·weight
 type Cell = { cls: string; status: string | null; arcs: Arc[] };
 export type Graph = { cells: Map<number, Cell>; edges: { a: number; b: number; kind: string; w: number }[] };
 
-const TAU: Record<string, number> = { link: 1, prov: 0.8, spawn: 0.5, next: 0.3, entity: 0.5, cites: 0.8, sem: 0.8 }; // coaccess: its own w
+export const TAU: Record<string, number> = {
+  link: 1,
+  supports: 1,
+  supersedes: 0.25, // retired replacement pointer: weak relay so obsolete notes don't steal spreading activation
+  superseded_by: 0.25,
+  from: 0.8,
+  follows_rule: 1.1,
+  uses_table: 1,
+  writes_table: 1,
+  posts_rule: 1,
+  solves_issue: 1,
+  has_query: 1,
+  exposes_api: 1,
+  part_of_arch: 1,
+  prov: 0.8,
+  spawn: 0.5,
+  next: 0.3,
+  entity: 0.5,
+  cites: 0.8,
+  sem: 0.8,
+}; // coaccess: its own w
 const COACCESS_MIN = 0.15; // a co-access synapse spreads only once confirmed (≈ ≥ 2 sessions)
 const RELAY_MAX_DEGREE = 24; // p99 visible degree: hubs above it never relay (APL-like)
 /** Bridges (entity, cites) are fan-normalized on their own, at half gain: a node's many bridges never dilute its link/spawn/prov
@@ -145,14 +165,22 @@ function share(out: { kind: string; w: number }[]) {
 const HOP2 = 0.5;            // damping of the 2nd hop (HippoRAG PPR 0.5)
 const RELOAD_MS = 15 * 60e3;
 
-/** Links (resolved, src ≠ dst) + edges, both directions, without scaffolding (daily notes, memory-vault hubs/): those
- *  never relay or come out. Hidden tools stay in (cls) and are dropped per caller at query time. */
+/** Links (resolved, src ≠ dst, preserving typed [[rel::target]] / - supersedes::) + edges, both directions, without scaffolding. */
 export async function loadGraph(db: pg.Pool): Promise<Graph> {
   const SCAFFOLD = (s: string) => `coalesce(${s}.kind = 'daily' OR (${s}.project = $2 AND starts_with(${s}.session_id, $3)), false)`;
   const rows = (await db.query(`
-    WITH e AS (SELECT DISTINCT least(src_id, dst_id) a, greatest(src_id, dst_id) b, 'link' kind, 1::float8 w FROM links
-               WHERE dst_id IS NOT NULL AND src_id <> dst_id
-               UNION ALL SELECT a, b, kind, w FROM edges WHERE kind IN ('prov', 'spawn', 'next', 'entity', 'cites', 'sem') OR (kind = 'coaccess' AND w >= $1))
+    WITH l AS (
+      SELECT DISTINCT ON (least(src_id, dst_id), greatest(src_id, dst_id))
+        least(src_id, dst_id) a, greatest(src_id, dst_id) b,
+        CASE WHEN coalesce(rel, 'link') IN ('', 'related', 'review') THEN 'link' ELSE lower(rel) END kind,
+        1::float8 w
+      FROM links
+      WHERE dst_id IS NOT NULL AND src_id <> dst_id
+      ORDER BY least(src_id, dst_id), greatest(src_id, dst_id),
+        (CASE WHEN coalesce(rel, 'link') IN ('', 'link', 'related', 'review') THEN 1 ELSE 0 END), lower(rel)
+    ),
+    e AS (SELECT a, b, kind, w FROM l
+          UNION ALL SELECT a, b, kind, w FROM edges WHERE kind IN ('prov', 'spawn', 'next', 'entity', 'cites', 'sem') OR (kind = 'coaccess' AND w >= $1))
     SELECT e.a::float8 a, e.b::float8 b, e.kind, e.w, coalesce(sa.hide_as, sa.tool) acls, sa.status ast, coalesce(sb.hide_as, sb.tool) bcls, sb.status bst
     FROM e JOIN sources sa ON sa.id = e.a JOIN sources sb ON sb.id = e.b
     WHERE NOT ${SCAFFOLD('sa')} AND NOT ${SCAFFOLD('sb')}`, [COACCESS_MIN, MEMORY_PROJECT, `${basename(MEMORY_VAULT)}/hubs/`])).rows;
@@ -299,7 +327,160 @@ export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[];
 // Equal-slot competition (memory_search limit > 6; MEMHUB_COMPETE=0 = off). docs/decisions/0004
 // The graph adds no lines: it proposes candidates that compete with hits keep+1..n for the same slots.
 // no 'next' (3/168 precision), no 2nd hop (0/33); MEMHUB_COMPETE_KINDS = another list (eval arms)
-const competeKinds = () => (process.env.MEMHUB_COMPETE_KINDS ?? 'link,spawn,prov,coaccess').split(',').filter(Boolean);
+const competeKinds = () => (process.env.MEMHUB_COMPETE_KINDS ?? 'link,supports,follows_rule,uses_table,writes_table,solves_issue,posts_rule,has_query,exposes_api,part_of_arch,spawn,prov,coaccess').split(',').filter(Boolean);
+
+export type PathStep = {
+  sourceId: number;
+  chunkId: string;
+  displayId: string;
+  title: string;
+  project: string;
+  status: string | null;
+  viaKind?: string;
+};
+
+/** Shortest visible synapse path between two sources (≤ maxHops, default 6), avoiding high-degree hubs (> RELAY_MAX_DEGREE) first. */
+export async function findSynapsePath(
+  db: pg.Pool,
+  fromSrc: number,
+  toSrc: number,
+  o: { hide: string[]; maxHops?: number; graph?: Graph },
+): Promise<PathStep[] | null> {
+  const maxHops = Math.min(Math.max(o.maxHops ?? 6, 1), 8);
+  const hide = new Set(o.hide);
+  const runBfs = (g: Graph, avoidHubs: boolean): { nodes: number[]; kinds: string[] } | null => {
+    const live = (id: number) => {
+      const c = g.cells.get(id);
+      return c && !hide.has(c.cls) && c.status !== 'rejected' ? c : undefined;
+    };
+    if (!live(fromSrc) || !live(toSrc)) return null;
+    if (fromSrc === toSrc) return { nodes: [fromSrc], kinds: [] };
+    const arcs = (id: number) => [...(live(id)?.arcs.filter((e) => live(e.to)) ?? [])].sort((a, b) => b.w - a.w || a.to - b.to);
+    const prev = new Map<number, { from: number; kind: string }>();
+    const depth = new Map<number, number>([[fromSrc, 0]]);
+    const queue = [fromSrc];
+    while (queue.length) {
+      const cur = queue.shift()!;
+      const d = depth.get(cur)!;
+      if (d >= maxHops) continue;
+      const out = arcs(cur);
+      if (avoidHubs && cur !== fromSrc && out.length > RELAY_MAX_DEGREE) continue;
+      for (const e of out) {
+        if (depth.has(e.to)) continue;
+        prev.set(e.to, { from: cur, kind: e.kind });
+        if (e.to === toSrc) {
+          const nodes = [toSrc], kinds: string[] = [];
+          let x = toSrc;
+          while (x !== fromSrc) {
+            const p = prev.get(x)!;
+            kinds.push(p.kind);
+            nodes.push(p.from);
+            x = p.from;
+          }
+          return { nodes: nodes.reverse(), kinds: kinds.reverse() };
+        }
+        depth.set(e.to, d + 1);
+        queue.push(e.to);
+      }
+    }
+    return null;
+  };
+
+  let g = o.graph ?? await graphOf(db);
+  let found = runBfs(g, true) ?? runBfs(g, false);
+  if (!found) return null;
+
+  const fetchMeta = async (srcs: number[]) => (await db.query(
+    `SELECT s.id::float8 id, s.project, s.session_id, s.status, fa.fid, fa.kind, fa.project fact_project,
+            (SELECT c.id FROM chunks c WHERE c.source_id = s.id ORDER BY c.seq_from, c.id LIMIT 1) cid,
+            (SELECT left(regexp_replace(c.text, '[[:space:]]+', ' ', 'g'), 90) FROM chunks c WHERE c.source_id = s.id ORDER BY c.seq_from, c.id LIMIT 1) txt
+     FROM sources s LEFT JOIN facts fa ON fa.source_id = s.id
+     WHERE s.id = ANY($1::bigint[]) AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) AND s.status IS DISTINCT FROM 'rejected'`,
+    [srcs, o.hide],
+  )).rows;
+
+  let metaRows = await fetchMeta(found.nodes);
+  if (metaRows.length < found.nodes.length && !o.graph) {
+    g = await loadGraph(db);
+    found = runBfs(g, true) ?? runBfs(g, false);
+    if (!found) return null;
+    metaRows = await fetchMeta(found.nodes);
+    if (metaRows.length < found.nodes.length) return null;
+  } else if (metaRows.length < found.nodes.length) {
+    return null;
+  }
+
+  const byId = new Map(metaRows.map((r) => [Number(r.id), r]));
+  return found.nodes.map((sid, idx) => {
+    const r = byId.get(sid)!;
+    const isFact = r.fid && r.kind !== 'card';
+    const rawTitle = String(r.txt ?? r.session_id ?? sid).replace(/^D:\s*#\s*[FSI][0-9a-f]{8}\s*/i, '').trim();
+    return {
+      sourceId: sid,
+      chunkId: String(r.cid ?? ''),
+      displayId: isFact ? String(r.fid) : String(r.cid ?? sid),
+      title: rawTitle.slice(0, 80),
+      project: String(r.fact_project || r.project || ''),
+      status: r.status ?? null,
+      ...(idx > 0 ? { viaKind: found!.kinds[idx - 1] } : {}),
+    };
+  });
+}
+
+export type SharedNeighbor = {
+  sourceId: number;
+  shared: number;
+  score: number;
+  via: { sourceId: number; kind: string }[];
+};
+
+/** Multi-seed bridge finder: visible non-hub nodes directly connected to ≥ 2 distinct seed sources, ranked by shared count then weight. */
+export async function sharedNeighbors(
+  db: pg.Pool,
+  seedSrcs: number[],
+  o: { hide: string[]; excludeSrcs?: Iterable<number>; limit?: number; graph?: Graph },
+): Promise<SharedNeighbor[]> {
+  const uniqSeeds = [...new Set(seedSrcs)];
+  if (uniqSeeds.length < 2) return [];
+  const g = o.graph ?? await graphOf(db);
+  const hide = new Set(o.hide);
+  const excl = new Set([...uniqSeeds, ...(o.excludeSrcs ?? [])]);
+  const live = (id: number) => {
+    const c = g.cells.get(id);
+    return c && !hide.has(c.cls) && c.status !== 'rejected' ? c : undefined;
+  };
+  const cand = new Map<number, { score: number; bySeed: Map<number, { kind: string; w: number }> }>();
+  for (const s of uniqSeeds) {
+    const cell = live(s);
+    if (!cell) continue;
+    for (const e of cell.arcs) {
+      if (excl.has(e.to)) continue;
+      const target = live(e.to);
+      if (!target) continue;
+      const visibleDeg = target.arcs.filter((a) => live(a.to)).length;
+      if (visibleDeg > RELAY_MAX_DEGREE) continue;
+      const entry = cand.get(e.to) ?? cand.set(e.to, { score: 0, bySeed: new Map() }).get(e.to)!;
+      const prev = entry.bySeed.get(s);
+      if (!prev || e.w > prev.w) {
+        entry.score += e.w - (prev?.w ?? 0);
+        entry.bySeed.set(s, { kind: e.kind, w: e.w });
+      }
+    }
+  }
+  return [...cand.entries()]
+    .filter(([, v]) => v.bySeed.size >= 2)
+    .map(([sourceId, v]) => {
+      const mult = live(sourceId)?.status === 'superseded' ? 0.5 : 1;
+      return {
+        sourceId,
+        shared: v.bySeed.size,
+        score: v.score * mult,
+        via: [...v.bySeed.entries()].map(([sid, x]) => ({ sourceId: sid, kind: x.kind })),
+      };
+    })
+    .sort((a, b) => b.shared - a.shared || b.score - a.score || a.sourceId - b.sourceId)
+    .slice(0, o.limit ?? 3);
+}
 
 /** Candidates for the last slots: 1-hop neighbours of the top `keep` hits, each as its chunk nearest the query (qvec),
  *  act ≥ theta, at most `pool` by act; plus the query similarity of the chunks of hits keep+1.. (their rivals). */

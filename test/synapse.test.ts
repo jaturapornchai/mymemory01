@@ -200,3 +200,36 @@ test('compete: top 6 stay, the last slots go to the best of {hits 7.., proposals
   assert.deepEqual(ids({ bonus: 0 }, [prop('p1', 0.5, 0.2)]), ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7', 'p1']); // tie with h7: hit first
   assert.deepEqual(ids({ bonus: 0.3 }, []), hits.map((h) => h.id)); // no proposals → unchanged
 });
+
+test('typed synapses, findSynapsePath, and sharedNeighbors: supersedes weak weight, shortest path avoids hubs, multi-seed bridge', async () => {
+  await guard();
+  const { TAU, findSynapsePath, sharedNeighbors } = await import('../src/synapse.ts');
+  assert.equal(TAU.supersedes, 0.25);
+  assert.equal(TAU.follows_rule, 1.1);
+
+  const tA = await src('ta', 'obsidian', 'note', 'notes/ta.md', 'obsidian/notes');
+  const tOld = await src('told', 'obsidian', 'note', 'notes/told.md', 'obsidian/notes');
+  const tBridge = await src('tbridge', 'obsidian', 'note', 'notes/tbridge.md', 'obsidian/notes');
+  const tGoal = await src('tgoal', 'obsidian', 'note', 'notes/tgoal.md', 'obsidian/notes');
+
+  await db.query('INSERT INTO links (src_id, dst_name, dst_id, rel) VALUES ($1, $2, $3, $4)', [tA.id, 'told', tOld.id, 'supersedes']);
+  await db.query('INSERT INTO links (src_id, dst_name, dst_id, rel) VALUES ($1, $2, $3, $4)', [tA.id, 'tbridge', tBridge.id, 'uses_table']);
+  await db.query('INSERT INTO links (src_id, dst_name, dst_id, rel) VALUES ($1, $2, $3, $4)', [tBridge.id, 'tgoal', tGoal.id, 'follows_rule']);
+
+  const graph = await loadGraph(db);
+  const spread = await associate(db, [{ chunkId: tA.chunk, a: 1 }], { hide: HIDE, theta: 0, limit: 10, hops: 1, graph });
+  const byName = new Map(spread.map((x) => [Object.keys(S).find((k) => S[k].id === Number(x.chunk.source_id)), x]));
+  assert.equal(byName.get('told')?.kind, 'supersedes');
+  assert.equal(byName.get('tbridge')?.kind, 'uses_table');
+  assert.ok((byName.get('tbridge')?.act ?? 0) > (byName.get('told')?.act ?? 0) * 3.5, 'uses_table (1.0) >> supersedes (0.25)');
+
+  const path = await findSynapsePath(db, tA.id, tGoal.id, { hide: HIDE, graph });
+  assert.ok(path);
+  assert.deepEqual(path.map((p) => p.sourceId), [tA.id, tBridge.id, tGoal.id]);
+  assert.deepEqual(path.map((p) => p.viaKind), [undefined, 'uses_table', 'follows_rule']);
+
+  const shared = await sharedNeighbors(db, [tA.id, tGoal.id], { hide: HIDE, graph });
+  assert.equal(shared.length, 1);
+  assert.equal(shared[0].sourceId, tBridge.id);
+  assert.equal(shared[0].shared, 2);
+});

@@ -239,3 +239,19 @@ test('relative time: a window from the anchor; relative words leave the terms, m
   t = timeWindow('ไปเลยเมื่อไหร่', now);
   assert.deepEqual([t.from, t.recent, t.rest], [undefined, false, 'ไปเลยเมื่อไหร่']);
 });
+
+test('Thai variant normalization & ICU glue repair: length preserved, dotted/spaced tax forms unified', () => {
+  for (const [a, b] of [['ตัดสต๊อกสินค้า', 'ตัดสต็อกสินค้า'], ['ปลดล๊อกระบบ', 'ปลดล็อกระบบ'], ['เลือกแพ็คเกจรายปี', 'เลือกแพ็กเกจรายปี'], ['ใบเครมประกัน', 'ใบเคลมประกัน'], ['ออกอินวอยซ์', 'ออกอินวอยส์']]) {
+    assert.equal(normalize(a), normalize(b), `${a} == ${b}`);
+    assert.equal(normalize(a).length, a.length, `length preserved for ${a}`);
+    assert.deepEqual(words(a), words(b));
+  }
+  const forms = ['ยื่น ภ.ง.ด. 53', 'ยื่น ภ.ง.ด.53', 'ยื่น ภงด 53', 'ยื่น ภงด53'];
+  for (const f of forms) {
+    const ws = words(f);
+    assert.ok(ws.includes('ภงด') && ws.includes('53') && ws.includes('ภงด53'), `${f} -> ${ws.join('|')}`);
+    assert.deepEqual(bigramRuns(f), bigramRuns(forms[0]), `bigramRuns(${f})`);
+  }
+  const wGlue = words('ระบบซอฟต์แวร์อิเล็กทรอนิกส์คิดเป็นเปอร์เซ็นต์');
+  assert.ok(!wGlue.some((x) => /^[ก-ฮ][ัิ-ฺ]?์$/.test(x)), `no stranded karan fragment: ${wGlue.join('|')}`);
+});

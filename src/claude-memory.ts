@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type pg from 'pg';
 import { nearFacts } from './accuracy.ts';
 import { clean, LIVE_DIR, normProject } from './importer.ts';
+import { inferFactProject } from './projects.ts';
 import { md5, MEMORY_VAULT, noteFid, saveNote, writeNote } from './notes.ts';
 import { commitBatch } from './vault-git.ts';
 
@@ -60,10 +61,12 @@ export async function importClaudeMemory(db: pg.Pool, o: { dir?: string; dry?: b
       if (!m) continue;
       const now = writtenAt(m, join(mdir, f));
       const fid = noteFid(m.text), prev = old?.rel && old.fid !== fid ? old.rel : '';
-      const dup = prev ? null : (await nearFacts(db, clean(m.text).trim(), m.global ? '' : p, [], [fid], { min: 0.92, n: 1 }))[0];
+      const inf = await inferFactProject(db, m.text, { title: m.title, cwdProject: p, global: m.global ? true : undefined });
+      const targetProj = inf.isGlobal ? '' : inf.project;
+      const dup = prev ? null : (await nearFacts(db, clean(m.text).trim(), targetProj, [], [fid], { min: 0.92, n: 1 }))[0];
       (dup ? out.dup : out.saved).push(`${slug}/${f}${dup ? ` ≈ [${dup.fid}] ${dup.sim?.toFixed(2) ?? 'words'}` : ''}`);
       if (o.dry) continue;
-      const v = dup ? { sha, dup: dup.fid } : { sha, fid, rel: saveNote(m.text, { title: m.title, kind: m.kind, global: m.global, project: p, client: 'claude-memory', now,
+      const v = dup ? { sha, dup: dup.fid } : { sha, fid, rel: saveNote(m.text, { title: m.title, kind: m.kind, global: inf.isGlobal, project: targetProj, relatedProjects: inf.relatedProjects, client: 'claude-memory', now,
         supersede: prev ? [prev] : [], extra: { tags: ['memhub/claude-memory'], claude_memory: `${slug}/${f}` }, reindex: false, commit: false }) };
       await db.query(`INSERT INTO state (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [k, v]);
     }

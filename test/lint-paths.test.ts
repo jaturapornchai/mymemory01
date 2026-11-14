@@ -102,3 +102,19 @@ test('lintSummary: count only when there is one', async () => {
   assert.match(lintSummary(r), / · อ้างไฟล์ที่ไม่มีแล้ว 2$/);
   assert.doesNotMatch(lintSummary({ ...r, gone: [] }), /อ้างไฟล์/);
 });
+
+test('pathRefsWithLines and driftedIn: catches line bounds > EOF and code modified after fact timestamp', async () => {
+  const { driftedIn, pathRefsWithLines } = await import('../src/lint.ts');
+  assert.deepEqual(pathRefsWithLines('check `src/present.ts:5-12` and `src/nested.ts`', REPO), [
+    { path: 'src/present.ts', startLine: 5, endLine: 12 },
+    { path: 'src/nested.ts' },
+  ]);
+  const futureIso = new Date(Date.now() + 3600_000).toISOString();
+  const pastIso = '2026-01-01T00:00:00.000Z';
+  const rows = driftedIn([
+    { fid: 'Feof00001', project: repo, path: 'facts/demo/Feof00001.md', valid_at: futureIso, created_at: futureIso, body: '# t\nsee `src/present.ts:10-20`' },
+    { fid: 'Fmtime001', project: repo, path: 'facts/demo/Fmtime001.md', valid_at: pastIso, created_at: pastIso, body: '# t\nsee `src/present.ts:1`' },
+    { fid: 'Ffresh001', project: repo, path: 'facts/demo/Ffresh001.md', valid_at: futureIso, created_at: futureIso, body: '# t\nsee `src/present.ts:1`' },
+  ]);
+  assert.deepEqual(rows.map((r) => [r.fid, r.kind]), [['Feof00001', 'eof'], ['Fmtime001', 'mtime']]);
+});

@@ -3,7 +3,7 @@
 // there would vanish by morning. Newest dated section first, the last KEEP kept; an edited _lint.md is his → never rewritten.
 // Ids/titles only; Claude-only sources (guard.PRIVATE_TOOLS, hide_as) are filtered out of every query.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import type pg from 'pg';
 import { ORPHAN } from './dream.ts';
@@ -27,7 +27,7 @@ type Row = Record<string, any>;
 export async function lintReport(db: pg.Pool, now = new Date()) {
   const q = async (sql: string, ...params: unknown[]): Promise<Row[]> => (await db.query(sql, [[...PRIVATE_TOOLS], ...params])).rows;
   const active = `coalesce(s.status, 'active') = 'active'`;
-  const [acc, expired, dups, orphans, broken, support, conflictRows, replaced, gone] = await Promise.all([
+  const [acc, expired, dups, orphans, broken, support, conflictRows, replaced, gone, drift] = await Promise.all([
     accuracyFlags(db, [...PRIVATE_TOOLS]),
     // stated end passed: invalid_at = world time it stopped being true (dream), expired_at = learned it is no longer current
     q(`SELECT f.fid, s.path, least(f.invalid_at, f.expired_at) ended, count(*) OVER () total FROM facts f JOIN sources s ON s.id = f.source_id
@@ -73,6 +73,8 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
         WHERE o.fid <> n.fid) x ORDER BY 2, 4 LIMIT ${CAP}`),
     // a fact names a repo file (`src/x.ts`) that is neither on disk nor tracked any more: report only, the fact may still be right about history
     gonePaths(q, `${PUBLIC_FACT} AND ${active}`),
+    // a fact names an existing repo file whose code changed after the fact was saved, or cites line numbers beyond EOF
+    driftedPaths(q, `${PUBLIC_FACT} AND ${active}`),
   ]);
   return {
     // accuracy.ts: a name excluded in one current fact and used in another; a local path a fact cites is gone
@@ -80,7 +82,7 @@ export async function lintReport(db: pg.Pool, now = new Date()) {
     stale: withTotal(acc.stale),
     expired, dups, orphans, broken, support,
     conflicts: conflicting(conflictRows),
-    replaced, gone,
+    replaced, drift, gone,
   };
 }
 
@@ -129,10 +131,14 @@ function conflicting(rows: Row[]) {
 const SKIP_DIR = /^(?:tmp|logs|dist|\.git)\//i; // untracked, come and go
 const WENT_AWAY = /ลบ|เลิกใช้|ย้าย|เปลี่ยนชื่อ|ไม่มีแล้ว|remove|delete|rename|moved|drop/i; // the fact itself says the file is gone
 /** Repo-relative file paths a fact names: a whole backticked span, relative with a separator + extension, or absolute under `root`. */
-export function pathRefs(text: string, root: string): string[] {
-  const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase(), out = new Set<string>();
+export type PathRefWithLines = { path: string; startLine?: number; endLine?: number };
+export function pathRefsWithLines(text: string, root: string): PathRefWithLines[] {
+  const r = root.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const byPath = new Map<string, PathRefWithLines>();
   for (const m of text.matchAll(/`([^`\n]+)`/g)) {
-    let p = m[1].replace(/\\/g, '/').replace(/:\d+(?:-\d+)?$/, '');
+    const raw = m[1].replace(/\\/g, '/');
+    const lm = /^(.*?):(\d+)(?:-(\d+))?$/.exec(raw);
+    let p = lm ? lm[1] : raw;
     if (/\s|[*?{<>]|:\/\/|^~/.test(p)) continue;
     const abs = /^[a-z]:\//i.test(p);
     if (abs) { if (!r || !p.toLowerCase().startsWith(`${r}/`)) continue; p = p.slice(r.length + 1); } else if (p.startsWith('/')) continue;
@@ -140,9 +146,17 @@ export function pathRefs(text: string, root: string): string[] {
     if ((!abs && !p.includes('/')) || !/\.[A-Za-z][A-Za-z0-9]{0,7}$/.test(p)) continue;
     if (p.split('/').some((s) => s === '..' || s === 'node_modules') || SKIP_DIR.test(p)) continue;
     if (/(?:^|\/)\.[^/]*$/.test(p)) continue; // `Menu.cpp/.h` = shorthand for two files, not a path (measured on real facts 2026-11-12)
-    out.add(p);
+    const startLine = lm ? Number(lm[2]) : undefined;
+    const endLine = lm?.[3] ? Number(lm[3]) : undefined;
+    const prev = byPath.get(p);
+    if (!prev || (startLine !== undefined && (prev.startLine === undefined || (endLine ?? startLine) > (prev.endLine ?? prev.startLine)))) {
+      byPath.set(p, { path: p, ...(startLine !== undefined ? { startLine } : {}), ...(endLine !== undefined ? { endLine } : {}) });
+    }
   }
-  return [...out];
+  return [...byPath.values()];
+}
+export function pathRefs(text: string, root: string): string[] {
+  return pathRefsWithLines(text, root).map((x) => x.path);
 }
 const gitLines = (root: string, ...args: string[]) => execFileSync('git', ['-c', 'core.quotePath=false', '-C', root, ...args],
   { encoding: 'utf8', maxBuffer: 256 << 20, stdio: ['ignore', 'pipe', 'ignore'] }).toLowerCase().split('\n').filter(Boolean);
@@ -214,18 +228,78 @@ export function goneIn(facts: Row[]) {
     return gone ? [{ fid: f.fid, path: gone, note: f.path, deleted: rm.any.has(gone.toLowerCase()) }] : [];
   }).sort((a, b) => Number(b.deleted) - Number(a.deleted));
 }
+async function driftedPaths(q: (sql: string, ...params: unknown[]) => Promise<Row[]>, where: string) {
+  const facts = await q(`SELECT f.fid, f.project, f.valid_at, f.created_at, s.path,
+      (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body
+    FROM facts f JOIN sources s ON s.id = f.source_id WHERE ${where} AND f.kind <> 'card' AND coalesce(f.project, '') <> '' ORDER BY s.path`);
+  return withTotal(driftedIn(facts));
+}
+
+/** Active facts whose cited repo file still exists on disk, but either (a) cites line numbers > EOF or (b) file mtime > max(valid_at, created_at) + 60s. */
+export function driftedIn(facts: Row[]) {
+  const lineCache = new Map<string, number | null>();
+  const countLines = (fp: string): number | null => {
+    if (lineCache.has(fp)) return lineCache.get(fp)!;
+    try {
+      const st = statSync(fp);
+      if (!st.isFile() || st.size > 5 * 1024 * 1024) { lineCache.set(fp, null); return null; }
+      const buf = readFileSync(fp);
+      if (buf.subarray(0, 512).includes(0)) { lineCache.set(fp, null); return null; }
+      let n = buf.length === 0 ? 0 : 1;
+      for (let i = 0; i < buf.length; i++) if (buf[i] === 10) n++;
+      if (buf.length > 0 && buf[buf.length - 1] === 10) n--;
+      lineCache.set(fp, n);
+      return n;
+    } catch { lineCache.set(fp, null); return null; }
+  };
+  return facts.flatMap((f) => {
+    const root = String(f.project), text = claim(f.body);
+    if (!isAbsolute(root) || !existsSync(root) || WENT_AWAY.test(text)) return [];
+    const refs = pathRefsWithLines(text, root);
+    if (!refs.length) return [];
+    const factMs = Math.max(Date.parse(String(f.valid_at ?? '')) || 0, Date.parse(String(f.created_at ?? '')) || 0);
+    let best: { fid: string; path: string; note: string; kind: 'eof' | 'mtime'; detail: string; prio: number; gapMs: number } | null = null;
+    for (const ref of refs) {
+      const full = join(root, ref.path);
+      if (!existsSync(full)) continue;
+      let st;
+      try { st = statSync(full); if (!st.isFile()) continue; } catch { continue; }
+      if (ref.startLine !== undefined) {
+        const maxLine = Math.max(ref.startLine, ref.endLine ?? ref.startLine);
+        const totalLines = countLines(full);
+        if (totalLines !== null && maxLine > totalLines) {
+          const span = ref.endLine ? `${ref.startLine}-${ref.endLine}` : String(ref.startLine);
+          best = { fid: f.fid, path: `${ref.path}:${span}`, note: f.path, kind: 'eof', detail: `อ้างบรรทัดเกินไฟล์จริง (${totalLines} บรรทัด)`, prio: 2, gapMs: Number.MAX_SAFE_INTEGER };
+          break;
+        }
+      }
+      if (factMs > 0 && st.mtimeMs > factMs + 60_000) {
+        const prio = ref.startLine !== undefined ? 1 : 0;
+        const gapMs = st.mtimeMs - factMs;
+        const label = ref.startLine !== undefined ? `${ref.path}:${ref.startLine}${ref.endLine ? '-' + ref.endLine : ''}` : ref.path;
+        if (!best || prio > best.prio || (prio === best.prio && gapMs > best.gapMs)) {
+          best = { fid: f.fid, path: label, note: f.path, kind: 'mtime', detail: `ไฟล์แก้ ${day(new Date(st.mtimeMs))} หลังบันทึก ${day(new Date(factMs))}`, prio, gapMs };
+        }
+      }
+    }
+    return best ? [best] : [];
+  }).sort((a, b) => b.prio - a.prio || b.gapMs - a.gapMs);
+}
+
 export type LintReport = Awaited<ReturnType<typeof lintReport>>;
 
-const total = (rows: Row[]) => Number(rows[0]?.total ?? 0);
+const total = (rows?: Row[]) => Number(rows?.[0]?.total ?? 0);
 export const lintSummary = (r: LintReport) =>
   `เลยวันหมดอายุ ${total(r.expired)} · อาจซ้ำ ${total(r.dups)} คู่ · แชตต้นทางหายหมด ${total(r.orphans)} · ลิงก์เสีย ${total(r.broken)}` +
   ` · หลักฐานไม่ตรง ${total(r.support)} · อาจขัดกัน ${total(r.conflicts)} · บอกว่าแทนแล้วแต่ของเก่ายัง active ${total(r.replaced)}` +
-  ` · CONFLICT ${total(r.entity)} คู่ · STALE ${total(r.stale)}` + (r.gone.length ? ` · อ้างไฟล์ที่ไม่มีแล้ว ${total(r.gone)}` : '');
+  ` · CONFLICT ${total(r.entity)} คู่ · STALE ${total(r.stale)}` +
+  (r.drift?.length ? ` · โค้ดแก้หลังบันทึก ${total(r.drift)}` : '') +
+  (r.gone.length ? ` · อ้างไฟล์ที่ไม่มีแล้ว ${total(r.gone)}` : '');
 
 /** One dated section (Asia/Bangkok day). Wikilinks to notes; a broken target is plain code (a link would be broken itself). */
 export function renderLint(r: LintReport, now = new Date()): string {
-  const sec = (h: string, rows: Row[], line: (x: Row) => string) =>
-    (rows.length ? `\n### ${h} (${total(rows)}${total(rows) > rows.length ? `, แสดง ${rows.length}` : ''})\n${rows.map((x) => `- ${line(x)}`).join('\n')}\n` : '');
+  const sec = (h: string, rows: Row[] | undefined, line: (x: Row) => string) =>
+    (rows?.length ? `\n### ${h} (${total(rows)}${total(rows) > rows.length ? `, แสดง ${rows.length}` : ''})\n${rows.map((x) => `- ${line(x)}`).join('\n')}\n` : '');
   return `## ${day(now)}\n${lintSummary(r)}\n` +
     sec('ข้อเท็จจริงเลยวันหมดอายุแต่ยัง active', r.expired, (x) => `[[${title(x.path)}]] · หมด ${day(x.ended)}`) +
     sec(`อาจซ้ำกัน (โปรเจกต์ + ชนิดเดียวกัน, cosine ≥ ${DUP})`, r.dups, (x) => `[[${title(x.apath)}]] ≈ [[${title(x.bpath)}]] · ${Number(x.sim).toFixed(3)}`) +
@@ -238,6 +312,8 @@ export function renderLint(r: LintReport, now = new Date()): string {
     sec('CONFLICT: ข้อหนึ่งบอกไม่เกี่ยว/ห้าม/เลิกใช้ชื่อนี้ อีกข้อใช้ชื่อนี้อยู่ (ทั้งคู่ active)', r.entity,
       (x) => `[[${title(x.apath)}]] ↔ [[${title(x.bpath)}]] · ${x.name}`) +
     sec('STALE: อ้าง path ในเครื่องที่ไม่มีแล้ว', r.stale, (x) => `[[${title(x.path)}]] · ไม่พบ \`${x.paths.join(' ').replace(/`/g, '')}\``) +
+    sec('DRIFT: โค้ดต้นทางแก้ใหม่กว่าความจำ หรืออ้างบรรทัดเกิน EOF', r.drift,
+      (x) => `[[${title(x.note)}]] · \`${String(x.path).replace(/`/g, '')}\` · ${x.detail}`) +
     sec('อ้างไฟล์ในโปรเจกต์ที่ไม่มีแล้ว (ไม่อยู่บนดิสก์ และไม่อยู่ใน branch ไหนของ git)', r.gone,
       (x) => `[[${title(x.note)}]] · ไม่พบ \`${String(x.path).replace(/`/g, '')}\` · ${x.deleted ? 'เคยอยู่ใน git แล้วถูกลบ' : 'ไม่เคยอยู่ใน git'}`) +
     sec('ลิงก์เสีย', r.broken, (x) => `[[${title(x.path)}]] → \`${String(x.dst_name).replace(/`/g, '')}\``);

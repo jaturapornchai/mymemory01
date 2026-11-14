@@ -114,14 +114,20 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
 export const projectSlug = (project?: string | null) => (project ? fileName(project.split('/').filter(Boolean).at(-1) ?? project, 40) : '_global');
 
 /** Keywords indicating a fact/rule/preference is cross-project or personal to ลุงจืด → defaults to scope: global when opts.global is omitted. */
-export const GLOBAL_HINT = /(?:กฎเหล็ก|ทุกโปรเจกต์|ทุก\s*(?:project|repo|เครื่อง)|all\s+projects|every\s+project|global\s+rule|ข้ามโปรเจกต์|google\s+timeline|ประวัติการเดินทาง|ข้อมูลส่วนตัวลุงจืด|(?:บ้าน|เบอร์โทร|อีเมล)ลุงจืด|ลุงจืดชอบ(?:กาแฟ|กิน|เที่ยว|ดื่ม|ให้สรุปท้ายงาน))/i;
-export const isGlobalFact = (text: string, title = '') => GLOBAL_HINT.test(`${title}\n${text}`);
+export const STRONG_GLOBAL_HINT = /(?:ทุกโปรเจกต์|ทุก\s*(?:project|repo|เครื่อง|ระบบ)|ทุก\s*AI(?:\s*ในเครื่อง|\s*ทุก\s*model)?|ทั้งเครื่อง|ทั้ง\s*Antigravity|ในโปรเจกต์ที่กำลังทำอยู่|ตอบทุกอย่าง|กฎกลาง|\bIRON\s*(?:RULE)?\s*\d+\b|all\s+projects|every\s+project|global\s+rule|ข้ามโปรเจกต์|\.agents[\\/]AGENTS\.md|google\s+timeline|ประวัติการเดินทาง|ข้อมูลส่วนตัวลุงจืด|(?:บ้าน|เบอร์โทร|อีเมล)ลุงจืด|ลุงจืดชอบ(?:กาแฟ|กิน|เที่ยว|ดื่ม|ให้สรุปท้ายงาน))/i;
+const PROJECT_SCOPED_HINT = /(?:โปรเจ[กค]ต์\s+[\w.-]+|(?:^|[\s(`])[d-z]:[\\/][a-z0-9_-]{3,})/i;
+export const GLOBAL_HINT = STRONG_GLOBAL_HINT;
+export const isGlobalFact = (text: string, title = '') => {
+  const s = `${title}\n${text}`;
+  if (STRONG_GLOBAL_HINT.test(s)) return true;
+  return /กฎเหล็ก/.test(s) && !PROJECT_SCOPED_HINT.test(s);
+};
 
 /** memory_save: ลุงจืด asked to remember → a user-owned fact note (redacted), indexed in the background. replaces (mcp.ts):
  *  supersede = AI-owned notes it corrects, made OLD at once as the dream does; review = fid of his own note it would replace →
  *  this note is saved pending with review_target (hubs/_review.md: he sets it active = accept, consolidate applies it).
  *  A pending note supersedes nothing yet (else neither would be current); the same text already active stays active. */
-export function saveNote(content: string, opts: { title?: string; project?: string; kind?: string; global?: boolean; client?: string; now?: Date;
+export function saveNote(content: string, opts: { title?: string; project?: string; relatedProjects?: string[]; kind?: string; global?: boolean; client?: string; now?: Date;
   supersede?: string[]; review?: string; activate?: boolean; extra?: Fm; reindex?: boolean; commit?: boolean } = {}) {
   const now = opts.now ?? new Date();
   const text = clean(content).trim();
@@ -143,6 +149,7 @@ export function saveNote(content: string, opts: { title?: string; project?: stri
   try {
     writeNote(rel, {
       memhub: 'fact', id: fid, kind: opts.kind ?? (fmStr(old?.kind) || 'fact'), scope, project: scope === 'global' ? '' : opts.project ?? '',
+      ...(scope !== 'global' && opts.relatedProjects?.length ? { related_projects: opts.relatedProjects } : {}),
       ...(old && !opts.activate ? {} : { status, review_target: review }),
       owner: 'user', importance: fmStr(old?.importance) || '8', valid_at: fmStr(old?.valid_at) || now.toISOString(), created_at: fmStr(old?.created_at) || now.toISOString(),
       source_uuids: [noteUuid(path)], tags: ['memhub/saved'], md5: md5(text), ...(opts.client ? { client: opts.client } : {}), ...opts.extra,

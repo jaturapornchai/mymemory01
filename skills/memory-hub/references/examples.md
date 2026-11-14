@@ -59,11 +59,11 @@ If the old fid is already visible (session-start block or an earlier result), sk
 memory_search {"query": "proj-a API server port", "project": "proj-a", "limit": 3}
 → [F1a2b3c4d] ... proj-a | fact cur | ... port 8080 ...
 memory_save {"content": "proj-a API server listens on port 9090 (was 8080).", "kind": "fact",
-             "replaces": ["F1a2b3c4d"]}
+             "replaces": ["F1a2b3c4d"], "user_quote": "ที่จำไว้ว่า proj-a ใช้ port 8080 ผิดนะ ตอนนี้ใช้ 9090"}
 → saved: <path> (searchable in new sessions)
   replaced (now OLD): [F1a2b3c4d]
 ```
-If the old one was the user's own note, the reply says the new one is pending review; tell the user.
+Passing `user_quote` with the user's exact words from the active chat (any supported AI app, last 48h) lets user-owned notes replace immediately; without a verified quote, replacing a user-owned note goes to pending review.
 Why: without replaces both stay current, and hand-saved facts get the top ranking tier.
 
 ## 7. Remember, then mute

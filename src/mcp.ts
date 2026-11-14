@@ -11,11 +11,12 @@ import { connect } from './db.ts';
 import { warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
 import { canonicalProject, clean, normProject, projectName, resolveProjectChain } from './importer.ts';
+import { inferFactProject } from './projects.ts';
 import { redact } from './redact.ts';
 import { aliasRe, conflictPairs, factTexts, type Flags, flagsFor, identityOf, locations, nearFacts, userSaid } from './accuracy.ts';
 import { fmStr, isEdited, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
-import { day, HIDDEN, hitLine, isOtherProject, keepCmd, LABEL, layerOf, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, SEARCH_KINDS, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
-import { type Assoc, associate, compete, proposals } from './synapse.ts';
+import { day, HIDDEN, hitLine, hitProject, isOtherProject, keepCmd, LABEL, layerOf, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, SEARCH_KINDS, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
+import { type Assoc, associate, compete, findSynapsePath, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
 
@@ -153,7 +154,7 @@ server.registerTool(
     const [og, cost, mask, flags] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined,
       hiddenNameMask(db, hidden()), flagsFor(db, hits.map((h) => ({ key: h.id, fid: h.kind !== 'card' ? h.fid : null, turn: h.turn_uuid,
         project: h.fact_project || h.project, ts: h.ts, text: h.text })), hidden()).catch(() => new Map<string, Flags>())]);
-    for (const h of hits) { const f = flags.get(h.id); if (f) { h.flags = f.tags; h.notes = f.lines; } }
+    for (const h of hits) { const f = flags.get(h.id); if (f) { h.flags = [...new Set([...(h.flags ?? []), ...f.tags])]; h.notes = f.lines; } }
     // mask before passage(): its window may start inside a hidden note's [[id title]], after the id the output mask needs
     for (const h of hits) for (const x of [h, ...(h.evidence ?? [])]) x.text = mask(x.text);
     const parts = [brief ? briefText(hits, query, semantic, cost!, og, scopeProj) : searchText(hits, query, semantic, og, scopeProj)];
@@ -183,7 +184,7 @@ const whatOf = (h: Pick<Hit, 'kind' | 'tool' | 'project' | 'session_id' | 'src_k
 const ASSOC_LINE = 220;
 function assocLine(r: Assoc, query: string, inSearch = true, currentProject?: string): string {
   const c = r.chunk, fact = c.fid && c.kind !== 'card';
-  const proj = projectName(c.fact_project ?? c.project ?? '') || 'global';
+  const proj = projectName(hitProject(c)) || 'global';
   const outTag = isOtherProject(c, currentProject, query) ? `นอกโปรเจกต์ (เคยคุยใน "${proj}"): ` : '';
   const head = `${inSearch ? '⇢ linked ' : ''}[${idOf(c)}] ${day(c.ts)} ${proj} ${whatOf(c)}` +
     `${c.status === 'superseded' ? ' OLD' : ''} · ${inSearch ? `via [${r.via}] ` : ''}${r.kind}: ${outTag}`;
@@ -257,7 +258,7 @@ export function hitText(h: Hit, query: string, max = 400, o?: Origin, currentPro
   const fact = h.fid && h.kind !== 'card';
   const text = fact ? factBody(h.text) : h.text, q = fact ? '' : query;
   if (isOtherProject(h, currentProject, query)) {
-    const proj = projectName(h.fact_project ?? h.project ?? '') || (h.fact_project ?? h.project);
+    const proj = projectName(hitProject(h)) || hitProject(h);
     return `${hitLine(h, undefined, o)} | นอกโปรเจกต์\nเคยคุยในโปรเจกต์ "${proj}" (${day(h.ts)}, ${whatOf(h)}): ${passage(text, q, 140)}`;
   }
   if (!e) return `${hitLine(h, undefined, o)}\n${passage(text, q, max)}`;
@@ -292,7 +293,7 @@ export function briefLine(h: Hit, query: string, cost: Map<string, number>, o?: 
   const ev = h.evidence?.length ? ` ↳[${h.evidence[0].id}]${h.evidence.length > 1 ? `+${h.evidence.length - 1}` : ''}` : '';
   // brief = cheap: the src tag names the app/kind of a raw hit (what is dropped) and a fact's tag goes without date / ×N
   const src = o ? ` src ${o.tag}${o.ai ? ' AI-only' : ''}` : '';
-  const proj = projectName(h.fact_project ?? h.project ?? '') || 'global';
+  const proj = projectName(hitProject(h)) || 'global';
   const outTag = isOtherProject(h, currentProject, query) ? `นอกโปรเจกต์ (เคยคุยใน "${proj}"): ` : '';
   const head = `[${idOf(h)}] ${day(h.ts)} ${proj} ${LABEL[h.layer ?? layerOf(h)]}${o && !h.kind ? '' : ` ${what}`}${flag}${h.why ? ` (${h.why})` : ''}${tags}${src}` +
     ` ≈${cost.get(h.id) ?? '?'}t${ev}: ${outTag}`;
@@ -306,9 +307,10 @@ server.registerTool(
       '(its source turns with src ids, his first) and GitHub permalinks. "timeline": what happened around it — rounds before/after in its ' +
       'session, facts/cards from that session, the same project in other sessions/apps near then; one line each, ≈t = est. tokens of a ' +
       'text get, ≤1500 chars; a fact id centres on the chat it came from. "related": [[links]], backlinks, facts from the same session, ' +
-      'memories used together, synapse-linked (≤2 hops) and most similar — to follow a thread.',
+      'memories used together, synapse-linked (≤2 hops) and most similar — to follow a thread; pass to_id to find the shortest synapse path (≤6 hops) between two items.',
     inputSchema: {
       id: ID.describe('id from memory_search / memory_get'),
+      to_id: ID.optional().describe('optional target id: shortest synapse path from id to to_id (≤6 hops)'),
       view: z.enum(['text', 'timeline', 'related']).optional().describe('default text'),
       around: z.number().int().min(0).max(10).optional().describe('turns (text, default 1) / rounds (timeline, default 3) before+after'),
       max_chars: z.number().int().min(500).max(20000).optional().describe('text: default 6000'),
@@ -316,13 +318,29 @@ server.registerTool(
     },
     annotations: { readOnlyHint: true },
   },
-  async ({ id, view = 'text', around, max_chars = 6000, limit = 5 }) => {
+  async ({ id, to_id, view = 'text', around, max_chars = 6000, limit = 5 }) => {
     const t0 = performance.now();
     const no = off(); if (no) return text(no);
     const hide = hidden();
     const c = await chunkOf(id, hide);
     if (!c) return text(`not found: ${id}`);
     const mask = await hiddenNameMask(db, hide); // names of notes hidden from this caller inside visible text
+    if (to_id) {
+      const c2 = await chunkOf(to_id, hide);
+      if (!c2) return text(`not found: ${to_id}`);
+      const steps = await findSynapsePath(db, Number(c.source_id), Number(c2.source_id), { hide });
+      if (!steps) return text(`no synapse path (≤6 hops) between [${id}] and [${to_id}]`);
+      const lines = [`synapse path (${steps.length - 1} hop${steps.length - 1 === 1 ? '' : 's'}):`];
+      for (const st of steps) {
+        if (st.viaKind) lines.push(`  ──[${st.viaKind}]──▶`);
+        const proj = projectName(st.project) || 'global';
+        const flag = st.status && st.status !== 'active' ? ` (${st.status})` : '';
+        lines.push(`[${st.displayId}] ${proj}${flag}: ${st.title}`);
+      }
+      const out = mask(lines.join('\n'));
+      logAccess('related', [c, c2], { tool: 'related', t0, chars: out.length });
+      return text(out);
+    }
     if (view === 'related') return text(mask(await related(c, hide, limit, t0)));
     if (view === 'timeline') {
       const fr = freshness();
@@ -372,9 +390,9 @@ async function related(c: Record<string, any>, hide: string[], limit: number, t0
   const q = async (sql: string, p: unknown[]) => (await db.query(sql, p)).rows;
   const fresh = freshness(), own = fresh.own;
   const [out, back, prov, together, similar] = await Promise.all([
-    q(`SELECT l.dst_name name, ${first} cid FROM links l LEFT JOIN sources s ON s.id = l.dst_id WHERE l.src_id = $1 AND coalesce(s.hide_as, s.tool, '') <> ALL($2::text[])
+    q(`SELECT CASE WHEN coalesce(l.rel, 'link') NOT IN ('', 'link') THEN '[' || l.rel || '] ' ELSE '' END || l.dst_name name, ${first} cid FROM links l LEFT JOIN sources s ON s.id = l.dst_id WHERE l.src_id = $1 AND coalesce(s.hide_as, s.tool, '') <> ALL($2::text[])
        ORDER BY s.id IS NULL, ${fan}, 1`, [c.source_id, hide]),
-    q(`SELECT s.session_id name, ${first} cid FROM links l JOIN sources s ON s.id = l.src_id WHERE l.dst_id = $1 AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
+    q(`SELECT CASE WHEN coalesce(l.rel, 'link') NOT IN ('', 'link') THEN '[' || l.rel || '] ' ELSE '' END || s.session_id name, ${first} cid FROM links l JOIN sources s ON s.id = l.src_id WHERE l.dst_id = $1 AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
        ORDER BY ${fan}, 1`, [c.source_id, hide]),
     // provenance both ways: facts/cards distilled from this chat session, or the chat sessions a fact came from
     q(`SELECT f.fid || ' ' || f.kind || ' ' || coalesce(s.status, 'active') || ': ' || regexp_replace(s.session_id, '^.*/|[.]md$', '', 'g') name, ${first} cid
@@ -445,25 +463,39 @@ server.registerTool(
       `SELECT f.fid, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE f.fid = ANY($1) AND ${factVisible('$2')}`, [want, hide])).rows.map((r) => [r.fid, r]) : []);
     const out: string[] = [];
-    const explicitProj = content && project?.trim() ? toProject(project.trim()) : '';
-    const cwdProj = content && !explicitProj ? await getProject() : '';
-    const repProjs = content && !explicitProj && !cwdProj && global !== true
+    const explicitProj = content && project?.trim() ? project.trim() : '';
+    const rawCwdProj = content && !explicitProj ? await getProject() : '';
+    const repProjs = content && !explicitProj && global !== true
       ? [...new Set(replaces.map((x) => seen.get(x)?.project).filter(Boolean))] : [];
     const inheritedProj = repProjs.length === 1 ? repProjs[0] : '';
-    const proj = explicitProj ? await canonicalProject(db, explicitProj) : (cwdProj || (inheritedProj ? await canonicalProject(db, inheritedProj) : ''));
-    const isGlobal = !proj || (global ?? ((explicitProj || inheritedProj) ? false : isGlobalFact(content ?? '', title))); // no cwd and no project/replaced project: global
+    const useInheritedOverCwd = !!inheritedProj && (!rawCwdProj || (rawCwdProj.endsWith('/memoryhub') && !/\bmem(?:ory[-_]?)?hub\b/i.test(`${title ?? ''}\n${content ?? ''}`)));
+    const inf = content
+      ? await inferFactProject(db, content, { title, explicitProject: explicitProj, cwdProject: useInheritedOverCwd ? '' : rawCwdProj, inheritedProject: inheritedProj, global })
+      : { project: '', isGlobal: true, relatedProjects: [] as string[] };
+    const proj = inf.project, isGlobal = inf.isGlobal, relatedProjects = inf.relatedProjects;
     const body = clean(content ?? '').trim(), fid = noteFid(content ?? '');
-    // a near-duplicate waits for the caller to say which: replaces (merge into it) or confirm_new (a different claim)
-    const near = content && !replaces.length && !confirm_new ? await nearFacts(db, body, isGlobal ? '' : proj, hide, [fid], { n: 3 }) : [];
+    // Verify user_quote across all live AI apps first so parameter/proof overrides can auto-supersede immediately
+    const said = !!(content && user_quote) && await userSaid(db, user_quote!);
+    let effReplaces = [...replaces];
+    let near = content && !effReplaces.length && !confirm_new ? await nearFacts(db, body, isGlobal ? '' : proj, hide, [fid], { n: 4, forSave: true }) : [];
+    if (near.length) {
+      const autoSup = near.filter((x) => x.override && (!x.his || said));
+      if (autoSup.length) {
+        effReplaces = [...new Set([...effReplaces, ...autoSup.map((x) => x.fid)])];
+        const extra = (await db.query(
+          `SELECT f.fid, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
+           WHERE f.fid = ANY($1) AND ${factVisible('$2')}`, [autoSup.map((x) => x.fid), hide])).rows;
+        for (const r of extra) seen.set(r.fid, r);
+        near = near.filter((x) => !autoSup.some((a) => a.fid === x.fid));
+      }
+    }
     if (near.length) out.push(`ยังไม่บันทึก: มีความจำที่คล้ายกันอยู่แล้ว`, ...near.map((x) => `คล้าย [${x.fid}] ${x.txt} — ใช้ replaces:[${x.fid}] เพื่อแทน/รวม?`),
       'ถ้าเป็นเรื่องใหม่จริง ส่งซ้ำพร้อม confirm_new:true');
-    // he typed it himself (checked against the chat log, not taken on the caller's word) = his correction takes effect now
-    const said = !!(content && !near.length && user_quote && replaces.length) && await userSaid(db, user_quote!);
-    if (user_quote && replaces.length && !near.length && !said) out.push('user_quote: ไม่พบข้อความนี้ในแชทที่ลุงจืดพิมพ์ (2 วันล่าสุด / แชทที่เปิดอยู่) — ใช้ flow รออนุมัติตามเดิม');
+    if (user_quote && effReplaces.length && !near.length && !said) out.push('user_quote: ไม่พบข้อความนี้ในแชทที่ลุงจืดพิมพ์ (2 วันล่าสุด / แชทที่เปิดอยู่) — ใช้ flow รออนุมัติตามเดิม');
     if (content && !near.length) {
       const vault = MEMORY_VAULT.replace(/\\/g, '/') + '/';
       const sup: { fid: string; rel: string }[] = [], review: string[] = [], old: string[] = [];
-      for (const r of replaces.map((x) => seen.get(x)).filter((r) => r && r.fid !== fid)) {
+      for (const r of effReplaces.map((x) => seen.get(x)).filter((r) => r && r.fid !== fid)) {
         const path = String(r.path).replace(/\\/g, '/');
         const n = path.startsWith(vault) && existsSync(path) ? parseNote(readFileSync(path, 'utf8')) : null;
         // only a current note is replaced: an OLD one keeps its superseded_by chain (the file wins over a stale index)
@@ -475,7 +507,7 @@ server.registerTool(
         if (n && ((!r.his && !isHis(n.fm, n.body)) || (said && !isEdited(n.fm, n.body)))) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
       }
       const now = new Date();
-      const rel = saveNote(content, { title, kind, global: isGlobal, project: proj, client: client(), now, supersede: sup.map((x) => x.rel), review: review[0],
+      const rel = saveNote(content, { title, kind, global: isGlobal, project: proj, relatedProjects, client: client(), now, supersede: sup.map((x) => x.rel), review: review[0],
         ...(said ? { activate: !review.length, extra: { user_quote: user_quote!.slice(0, 300), quoted_at: now.toISOString() }, reindex: false } : {}) });
       if (said && !process.env.MEMHUB_NO_REINDEX) await run(process.execPath, [join(import.meta.dirname, 'cli.ts'), 'index-vault', MEMORY_VAULT],
         { env: { ...process.env, MEMORY_HUB_INTERNAL: '1' }, windowsHide: true, timeout: 120_000 }); // rw child; a search right after sees the new note
@@ -491,7 +523,7 @@ server.registerTool(
       if (old.length) out.push(`already OLD, left as is: ${old.join(' · ')}`);
       if (said) out.push(`user_quote ตรงกับที่ลุงจืดพิมพ์: มีผลทันที${sup.length ? '' : ' (ไม่มีโน้ตที่แทนได้)'}`);
       // a contradiction with a current fact of the same subject (accuracy.ts): flag both now, the nightly lint recomputes them
-      const facts = (await factTexts(db, hide, isGlobal ? null : proj)).filter((f) => f.fid !== fid && !replaces.includes(f.fid));
+      const facts = (await factTexts(db, hide, isGlobal ? null : proj)).filter((f) => f.fid !== fid && !effReplaces.includes(f.fid));
       const pairs = conflictPairs([...facts, { fid, project: isGlobal ? '' : proj, kind: kind ?? 'fact', text: body }], fid);
       const other = (p: { a: string; b: string }) => (p.a === fid ? p.b : p.a);
       if (pairs.length) {

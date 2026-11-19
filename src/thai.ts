@@ -86,6 +86,16 @@ export function words(s: string): string[] {
     const comb = (m[1] + m[2]).toLowerCase();
     if (!out.includes(comb)) out.push(comb);
   }
+  // External account / analytics IDs (e.g. Google Ads 123-456-7890, GA4 G-..., GTM-..., AW-...): emit both hyphenated & compact forms
+  for (const m of folded.matchAll(/\b\d{3}-\d{3}-\d{4}\b/g)) {
+    const hyph = m[0], compact = hyph.replace(/-/g, '');
+    if (!out.includes(hyph)) out.push(hyph);
+    if (!out.includes(compact)) out.push(compact);
+  }
+  for (const m of folded.matchAll(/\b(?:G-(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,12}|GTM-(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{5,10}|AW-\d{6,12})\b/gi)) {
+    const low = m[0].toLowerCase();
+    if (!out.includes(low)) out.push(low);
+  }
   return out;
 }
 

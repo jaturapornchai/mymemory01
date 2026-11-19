@@ -9,7 +9,8 @@ import { flagsFor, identityOf, notBcLine } from './accuracy.ts';
 import { connect } from './db.ts';
 import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { lastOtherApp } from './handoff.ts';
-import { normProject, resolveProjectChain } from './importer.ts';
+import { normProject, projectTree, resolveProjectChain } from './importer.ts';
+import { resolveProjectInput } from './projects.ts';
 import { cutAtWord } from './notes.ts';
 import { hiddenNameMask } from './search.ts';
 
@@ -66,50 +67,58 @@ try {
     await db.end();
     process.exit(0);
   }
-  const chain = await resolveProjectChain(db, project); // includes cross-machine / moved-folder canonical project + parent folders
+  const [resolved, rawChain] = await Promise.all([
+    resolveProjectInput(db, project).catch(() => null),
+    resolveProjectChain(db, project),
+  ]);
+  const chain = [...new Set([...(resolved?.family ?? []), ...rawChain, ...projectTree(project)])];
+  const factChain = [...new Set([...chain, ...(resolved?.sharedPeers ?? [])])];
   const body = `(SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id LIMIT 1)`;
-  // this folder's facts, then each folder above it, then global ones (NULL sorts last)
+  // this folder's facts, then each folder above it, then shared-account peers, then global ones (NULL sorts last)
   const near = `CASE WHEN f.scope IS DISTINCT FROM 'global' THEN coalesce(array_position($1::text[], f.project), 99) END`;
   const unmuted = `NOT EXISTS (SELECT 1 FROM state m WHERE m.k = 'mute:' || f.fid)`; // memory_save mute (cli.ts mute)
-  const [rules, prefs, model, cards, recent, otherApp, health, id] = await Promise.all([
+  const freshFact = `NOT EXISTS (SELECT 1 FROM state st WHERE st.k = 'stale:' || f.fid)`; // non-stale rules rank ahead of stale ones
+  const [rules, prefs, model, cards, recent, otherApp, health, id, mask] = await Promise.all([
     // this project's rules before global ones: the 15 global rules (importance 8-9) took the top slots in every project, and
     // most of them restate ~/.agents/AGENTS.md, which every AI here already loads. 8 shown at most; the rest feed "…อีก N"
     db.query(
       `SELECT f.fid, f.kind, ${body} txt FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE (f.project = ANY($1::text[]) OR f.related_projects && $1::text[] OR f.scope = 'global') AND (f.pinned OR f.kind IN ('rule', 'feedback'))
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) -- dreamed from a chat hidden later (importer.hideDreamed)
-       ORDER BY f.pinned DESC, ${near}, f.importance DESC NULLS LAST, f.created_at DESC, f.fid LIMIT 30`, [chain, [...PRIVATE_TOOLS]]),
+       ORDER BY f.pinned DESC, (${freshFact}) DESC, ${near}, f.importance DESC NULLS LAST, f.created_at DESC, f.fid LIMIT 30`, [factChain, [...PRIVATE_TOOLS]]),
     db.query( // what ลุงจืด prefers (he said it, or picked it from an AI's options): this project first, then most sessions behind it
-      `SELECT f.fid, ${body} txt, (SELECT count(DISTINCT t.session_id) FROM turns t WHERE t.uuid = ANY(f.source_uuids))::int n
+      `SELECT f.fid, ${body} txt, greatest(cardinality(f.session_ids), 1)::int n
        FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE (f.project = ANY($1::text[]) OR f.related_projects && $1::text[] OR f.scope = 'global') AND f.kind = 'preference' AND NOT f.pinned -- pinned ones are already rules above
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
-       ORDER BY ${near}, n DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 30`, [chain, [...PRIVATE_TOOLS]]),
+       ORDER BY ${near}, n DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 30`, [factChain, [...PRIVATE_TOOLS]]),
     db.query( // settled project Mental Model (decisions, debugging how-tos, high-importance facts): this project only, multi-session proof first
       `SELECT f.fid, f.kind, ${body} txt, greatest(cardinality(f.session_ids), 1)::int n
        FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE (f.project = ANY($1::text[]) OR f.related_projects && $1::text[]) AND f.kind IN ('decision', 'howto', 'fact') AND NOT f.pinned
          AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
-       ORDER BY coalesce(array_position($1::text[], f.project), 99), (cardinality(f.session_ids) > 1) DESC, f.kind IN ('decision', 'howto') DESC,
-         cardinality(f.session_ids) DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 20`, [chain, [...PRIVATE_TOOLS]]),
+       ORDER BY (${freshFact}) DESC, coalesce(array_position($1::text[], f.project), 99), (cardinality(f.session_ids) > 1) DESC, f.kind IN ('decision', 'howto') DESC,
+         cardinality(f.session_ids) DESC, f.importance DESC NULLS LAST, f.valid_at DESC, f.fid LIMIT 20`, [factChain, [...PRIVATE_TOOLS]]),
     db.query(
       `SELECT f.fid, f.valid_at, ${body} txt FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE f.kind = 'card' AND f.project = ANY($1::text[]) AND coalesce(s.status, 'active') = 'active' AND ${unmuted} AND coalesce(s.hide_as, s.tool) <> ALL($2::text[])
        ORDER BY array_position($1::text[], f.project), f.valid_at DESC LIMIT 3`, [chain, [...PRIVATE_TOOLS]]),
-    db.query( // sessions the dream hasn't carded yet: their first prompt (never a Claude-only Google source, for any app)
+    db.query( // recent sessions the dream hasn't carded/skipped yet (uses turns_project_user index)
       `SELECT DISTINCT ON (t.session_id) t.session_id, t.ts, t.text_redacted q, array_position($1::text[], t.project) near
        FROM turns t JOIN sources s ON s.id = t.source_id
        WHERE s.kind = 'main' AND coalesce(s.hide_as, s.tool) <> ALL($3::text[]) AND t.project = ANY($1::text[]) AND t.role = 'user' AND t.session_id <> $2 AND left(t.text_redacted, 1) <> '['
          AND NOT EXISTS (SELECT 1 FROM facts f WHERE f.kind = 'card' AND f.session_ids @> ARRAY[t.session_id])
-       ORDER BY t.session_id, t.seq`, [chain, session, [...PRIVATE_TOOLS]]),
+         AND NOT EXISTS (SELECT 1 FROM state ds WHERE ds.k = 'dream:session:' || t.session_id)
+       ORDER BY t.session_id, t.ts NULLS LAST, t.seq`, [chain, session, [...PRIVATE_TOOLS]]),
     lastOtherApp(db, chain, app, session).catch(() => null), // best-effort: the rest still shows
     // cli.ts health(): last run of each background job; + the start time of every dream run still open (the plan itself holds whole pass-A results)
     db.query(`SELECT k, CASE WHEN k LIKE 'health:%' THEN v ELSE jsonb_build_object('at', v->>'at') END v FROM state
               WHERE k LIKE 'health:%' OR k LIKE 'dream:plan:%' ORDER BY k LIKE 'dream:plan:%', k`).catch(() => ({ rows: [] })),
     identityOf(db, chain, [...PRIVATE_TOOLS]).catch(() => null), // cli.ts identity: what this repo is / is not, shown first
+    hiddenNameMask(db, [...PRIVATE_TOOLS]),
   ]);
   // fact note text = "# <file name>\n<fact>\n\n- from:: …"; card = "# <file>\n# <title>\n\n<summary>…"
-  const factText = (t: string) => t.replace(/^# [^\n]*\n/, '').split('\n\n- ')[0];
+  const factText = (t: string) => t.replace(/^# [^\n]*\n/, '').split('\n\n- ')[0].replace(/^\s*-\s+[a-z_]+::.*\[\[.*$/gm, '').trim();
   const head = '[memory-hub] (memory_search / memory_get(id) ได้รายละเอียด)';
   // one line, only when a background job failed or went stale; job names + redacted error only, so the same line for every app
   const now = Date.now();
@@ -168,7 +177,6 @@ try {
   }), 0, recent.rows.length ? 130 : 0); // one line of today's work the dream has not carded yet beats a 2nd older card
   const [fresh, freshIds] = block('งานล่าสุดที่ยังไม่สรุป:', recent.rows.sort((a, b) => a.near - b.near || b.ts - a.ts).slice(0, cards.rows.length ? 3 : 5)
     .map((x) => [`session:${x.session_id}`, `- ${x.ts.toISOString().slice(0, 10)} ${flat(x.q, 90)}`]));
-  const mask = await hiddenNameMask(db, [...PRIVATE_TOOLS]);
   const ctx = mask(warn + rule + pref + know + hand + card + fresh); // every app: a hidden note named in a visible one
   if (ctx || idHead) {
     const out = mask(idHead) + head + ctx;

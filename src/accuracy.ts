@@ -22,18 +22,21 @@ const TEXT = `(SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDE
 
 // ---- CONFLICT: one name, opposite polarity ("POS sync กับ BC AI Account" vs "myapp ไม่เกี่ยวกับ BC") ----
 // A name = a capitalized word or acronym (BC, CHAMP, ObjectBox), not inside a path; generic tech/domain acronyms name nothing.
-const STOP = new Set('ai api ui ux url id db sql json http https ok pr git mcp cli llm os pc ip utc sme dev the this that and for with from use it is if'.split(' '));
+const STOP = new Set('ai api ui ux url id db sql json http https ok pr git mcp cli llm os pc ip utc sme dev english thai the this that and for with from use it is if'.split(' '));
 // exclusion of a thing ("ไม่เกี่ยวกับ BC", "ห้ามนำ CHAMP", "ไม่ต้องใช้ Gemma", "not BC"), not "ห้ามแก้ X" (do not edit repo X) or "ไม่ต้อง commit".
 const CUE = /ไม่(?:ได้)?(?:เกี่ยว(?:ข้อง)?|ยุ่ง)(?:กับ)?|ไม่ใช่|ไม่(?:ต้อง)?(?:ใช้|พึ่ง)|เลิกใช้|ยกเลิก(?:การ)?(?:ใช้)?|(?:พร้อม)?ถอด(?=\s+[A-Z])|ห้าม(?:นำ|ใช้|ปน|อ้างอิง|เก็บ(?:ใน)?)?|อย่า(?!ง)|\b(?:not|never|no longer|instead of|without)\b|n't\b/gi;
 const CLAUSE = /[,;!?()\n]|\.\s|\sbut\s|แต่/i;
-// a clause about the past, a migration source ("ย้ายจาก Firebase"), old/legacy code, or task-local/assistant-only scope asserts nothing contradictory now.
-const HIST = /เปลี่ยนชื่อ|rename|แทน|instead|เดิม|ก่อนหน้า|previous|formerly|เคย|พูดว่า|เรียกว่า|\bold\b|\blegacy\b|\bstale\b|เก่าที่(?:ไม่|พยายาม)|ปิด\s+[A-Z]\w+\s+ไปแล้ว|ย้าย(?:[^,;\n]{0,35}\s)?จาก|เปลี่ยน(?:[^,;\n]{0,35}\s)?จาก|ถอด(?:\s+\S+){0,4}\s*ออกจาก|สำหรับงาน[^,;\n]*ไม่เกี่ยว|เป็นผู้ช่วย(?:ของ|ใน)|ห้าม\s+Claude\s+ส่งงาน|ไฟล์เดิม\s+drift|ห้ามส่ง\s+batch\s+ให้|ไม่มีเงื่อนไข\s+BTC|ไม่ใช่\s+BTC\//i;
+// a clause about the past, a migration source ("ย้ายจาก Firebase"), old/legacy code, cleanup/removal, or task-local/assistant-only scope asserts nothing contradictory now.
+const HIST = /เปลี่ยนชื่อ|rename|แทน|instead|เดิม|ก่อนหน้า|previous|formerly|เคย|พูดว่า|เรียกว่า|\bold\b|\blegacy\b|\bstale\b|เก่าที่(?:ไม่|พยายาม)|ปิด\s+[A-Z]\w+\s+ไปแล้ว|ย้าย(?:[^,;\n]{0,35}\s)?จาก|เปลี่ยน(?:[^,;\n]{0,35}\s)?จาก|ถอด(?:\s+\S+){0,4}\s*ออกจาก|ลบ(?:เนื้อหา|ไฟล์|โค้ด|ตาราง|ส่วน)?(?:\s+\S+){0,4}|ยังไม่มี\s+[A-Z]|ฝังใน\s|ชนกับ\s+[A-Z]|ก่อน\s+deploy|สแกนประวัติ\s+git|\bnot\s+(?:Claude|Codex|Gemini)'s\s+own\s+work\b|ห้าม\s+(?:Claude|Codex|Gemini|Antigravity)\s+[ก-๙]|\b(?:were|was|are|is)\s+(?:removed|dropped|retired|deleted|deprecated)\b|\b(?:retired|deprecated|removed)\s*(?:now|since|\)|$)|\bOn\s+\d{4}-\d\d-\d\d\s+one\s+[A-Z]|สำหรับงาน[^,;\n]*ไม่เกี่ยว|เป็นผู้ช่วย(?:ของ|ใน)|ห้าม\s+Claude\s+ส่งงาน|ไฟล์เดิม\s+drift|ห้ามส่ง\s+batch\s+ให้|ไม่มีเงื่อนไข\s+BTC|ไม่ใช่\s+BTC\//i;
 const RUN = /(?<![\w\\/.:-])[A-Z][A-Za-z0-9]+(?: [A-Z][A-Za-z0-9]*)*(?![\w-])/g;
 const GLUE = /^[\s"'`(]*(?:(?:และ|หรือ|and|or|\/|&)[\s"'`(]*)?$/i;
+// A lowercase English component word right after a capitalized tool ("Playwright keyboard", "MongoDB database model") scopes to that sub-feature, not the whole tool.
+const SUBFEATURE_AFTER = /^\s+(?!(?:and|or|in|on|at|to|for|with|from|by|as|is|are|was|were|not|never|instead|only|via)\b)[a-z][a-z0-9_-]{3,}\b/;
 
 export function polarity(text: string): Map<string, string> {
   const out = new Map<string, string>();
-  for (const cl of text.split(CLAUSE)) {
+  const cleaned = text.replace(/^\*\*Why:\*\*[^\n]*/gm, '').replace(/\((?:ฝังใน|ก่อน\s+deploy)[^)]*\)/gi, '');
+  for (const cl of cleaned.split(CLAUSE)) {
     if (HIST.test(cl)) continue;
     const cues = new Set([...cl.matchAll(CUE)].map((c) => c.index! + c[0].length));
     let last = -1, negEnd = -1;
@@ -43,7 +46,7 @@ export function polarity(text: string): Map<string, string> {
       const neg = [...cues].some((e) => e <= at && /^[\s"'`(]*$/.test(cl.slice(e, at))) || (negEnd === last && after(negEnd));
       last = at + m[0].length;
       if (neg) negEnd = last;
-      if (STOP.has(k)) continue;
+      if (STOP.has(k) || SUBFEATURE_AFTER.test(cl.slice(last))) continue;
       const p = neg ? 'neg' : 'pos';
       out.set(k, out.has(k) && out.get(k) !== p ? 'mix' : p);
     }
@@ -87,7 +90,7 @@ async function expandProjectFamily(db: pg.Pool, project?: string | null): Promis
   if (!project) return { canon: '', family: [], rootPrefix: null };
   const res = await resolveProjectInput(db, project);
   const canon = res.canonical || project;
-  const family = [...new Set([...res.family, ...projectTree(canon), ...projectTree(project)])].filter(Boolean);
+  const family = [...new Set([...res.family, ...res.sharedPeers, ...projectTree(canon), ...projectTree(project)])].filter(Boolean);
   return { canon, family, rootPrefix: canon && !catchAll(canon) ? canon : null };
 }
 
@@ -101,11 +104,9 @@ async function factRows(db: pg.Pool, hide: string[], project?: string | null) {
            OR ($4::text IS NOT NULL AND starts_with(f.project, $4::text || '/')) OR f.scope = 'global')`,
   [hide, project || null, exp.family, exp.rootPrefix])).rows;
 
-  const canonByProj = new Map<string, string>();
-  for (const p of new Set(rows.map((r) => String(r.project)).filter(Boolean))) {
-    const r = await resolveProjectInput(db, p);
-    canonByProj.set(p, r.canonical || p);
-  }
+  const uniqProjs = [...new Set(rows.map((r) => String(r.project)).filter(Boolean))];
+  const resolvedList = await Promise.all(uniqProjs.map((p) => resolveProjectInput(db, p).then((r) => [p, r.canonical || p] as const)));
+  const canonByProj = new Map<string, string>(resolvedList);
   return rows.map((r) => {
     const proj = String(r.project);
     return {
@@ -146,20 +147,27 @@ const SYSTEM_EXES = new Set([
   'robocopy.exe', 'xcopy.exe', 'where.exe', 'findstr.exe', 'reg.exe', 'icacls.exe', 'mklink.exe', 'notepad.exe', 'setup.exe',
 ]);
 
-const subdirs = new Map<string, string[]>();
-const branchTips = new Map<string, Set<string>>();
+const FS_CACHE_TTL_MS = 5 * 60_000;
+const MISS_CACHE_TTL_MS = 60_000;
+const MISS_CACHE_MAX = 512;
+const subdirs = new Map<string, { at: number; dirs: string[] }>();
+const branchTips = new Map<string, { at: number; files: Set<string> }>();
+const missCache = new Map<string, { at: number; out: string[] }>();
 
 function getSubdirs(root: string): string[] {
-  if (!subdirs.has(root)) {
-    try { subdirs.set(root, readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.')).map((d) => join(root, d.name))); }
-    catch { subdirs.set(root, []); }
-  }
-  return subdirs.get(root)!;
+  const hit = subdirs.get(root);
+  if (hit && Date.now() - hit.at < FS_CACHE_TTL_MS) return hit.dirs;
+  let dirs: string[];
+  try { dirs = readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('.')).map((d) => join(root, d.name)); }
+  catch { dirs = []; }
+  subdirs.set(root, { at: Date.now(), dirs });
+  return dirs;
 }
 
 function onOtherGitBranch(root: string, relPosix: string): boolean {
   if (!existsSync(join(root, '.git'))) return false;
-  if (!branchTips.has(root)) {
+  const hit = branchTips.get(root);
+  if (!hit || Date.now() - hit.at >= FS_CACHE_TTL_MS) {
     const files = new Set<string>();
     try {
       const branches = execFileSync('git', ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
@@ -169,9 +177,10 @@ function onOtherGitBranch(root: string, relPosix: string): boolean {
         for (const f of tree.split('\n')) if (f) files.add(f.trim());
       }
     } catch {}
-    branchTips.set(root, files);
+    branchTips.set(root, { at: Date.now(), files });
+    return files.has(relPosix);
   }
-  return branchTips.get(root)!.has(relPosix);
+  return hit.files.has(relPosix);
 }
 
 function hasExeInProject(root: string, exeLow: string): boolean {
@@ -219,6 +228,21 @@ function resolveExistingRoot(project?: string | null): string {
 
 /** Paths and runnable local artifacts in `text` that no longer exist on disk (D:\, C:\Users\jatur\, or project folder). */
 export function missingPaths(text: string, project?: string | null): string[] {
+  const useCache = !process.env.MEMHUB_PG_SCHEMA;
+  const key = useCache ? `${project ?? ''}\0${text}` : '';
+  if (useCache) {
+    const hit = missCache.get(key);
+    if (hit && Date.now() - hit.at < MISS_CACHE_TTL_MS) return hit.out;
+  }
+  const out = missingPathsUncached(text, project);
+  if (useCache) {
+    missCache.set(key, { at: Date.now(), out });
+    if (missCache.size > MISS_CACHE_MAX) missCache.delete(missCache.keys().next().value!);
+  }
+  return out;
+}
+
+function missingPathsUncached(text: string, project?: string | null): string[] {
   const out = new Set<string>();
   const home = homedir();
   const strippedUrls = text.replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, ' ').replace(MOVED_FROM, ' ');
@@ -457,8 +481,10 @@ export async function nearFacts(
   skip: string[],
   o: { kind?: string; min?: number; n?: number; forSave?: boolean } = {},
 ): Promise<NearFact[]> {
-  const vec = await embed([content], 1500).then((e) => toVec(e[0]), () => null);
-  const exp = await expandProjectFamily(db, project);
+  const [vec, exp] = await Promise.all([
+    embed([content], 1500).then((e) => toVec(e[0]), () => null),
+    expandProjectFamily(db, project),
+  ]);
   const rows = (await db.query(
     `SELECT f.fid, f.kind, coalesce(f.project, '') project, (f.user_owned OR f.edited) his, ${TEXT} txt,
             1 - ((SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) <=> $5::halfvec) sim
@@ -728,24 +754,34 @@ export async function userSaid(db: pg.Pool, quote: string, liveDir = LIVE_DIR): 
 
 // ---- "X อยู่ไหน / path X" ----
 const WHERE_Q = /อยู่(?:ที่)?ไหน|ที่อยู่|ตำแหน่ง|โฟลเดอร์|folder|director(?:y|ies)|\bpath\b|\bwhere\b|\blocation\b|\brepo\b/i;
-const WHERE_W = new Set('path where folder directory location repo github local machine find code source the file files'.split(' '));
+const WHERE_W = new Set('path where folder directory location repo github local machine find code source the file files and for are not how what this that from with into project projects'.split(' '));
 
 export async function locations(db: pg.Pool, query: string, hide: string[]): Promise<string> {
   if (!WHERE_Q.test(query)) return '';
-  const terms = [...new Set(query.toLowerCase().match(/[a-z][a-z0-9_]{3,}/g) ?? [])].filter((t) => !WHERE_W.has(t)).slice(0, 4);
-  const out: string[] = [];
-  for (const term of terms) {
+  const terms = [...new Set(query.toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) ?? [])]
+    .map((t) => t.replace(/^[-_]+|[-_]+$/g, ''))
+    .filter((t) => t.length >= 3 && !WHERE_W.has(t))
+    .slice(0, 4);
+  if (!terms.length) return '';
+  const perTerm = await Promise.all(terms.map(async (term) => {
+    const compact = term.replace(/[-_]+/g, '');
+    const parts = term.split(/[-_]+/).filter((p) => p.length >= 2);
+    const tsq = parts.length > 1
+      ? `(${parts.map((p) => `'${p}'`).join(' & ')}) | '${compact}'`
+      : `'${term}'`;
     const [chunks, gh] = await Promise.all([
-      db.query(`SELECT c.text, c.ts FROM chunks c JOIN sources s ON s.id = c.source_id WHERE c.words @@ to_tsquery('simple', $1)
-        AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) ORDER BY c.ts DESC NULLS LAST LIMIT 300`, [term, hide]),
-      db.query(`SELECT DISTINCT substring(session_id from '^github:([\\w.-]+/[\\w.-]+)') r FROM sources WHERE tool = 'github' AND session_id ILIKE $1`, [`github:%${term}%`]),
+      db.query(`SELECT c.text, c.ts FROM chunks c JOIN sources s ON s.id = c.source_id WHERE c.words @@ $1::tsquery
+        AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) ORDER BY c.ts DESC NULLS LAST LIMIT 300`, [tsq, hide]),
+      db.query(`SELECT DISTINCT substring(session_id from '^github:([\\w.-]+/[\\w.-]+)') r FROM sources WHERE tool = 'github' AND (session_id ILIKE $1 OR session_id ILIKE $2)`,
+        [`github:%${term}%`, `github:%${compact}%`]),
     ]);
+    const matchName = (s: string) => { const low = s.toLowerCase(); return low.includes(term) || (compact.length >= 4 && low.replace(/[-_]+/g, '').includes(compact)); };
     const local = new Map<string, { p: string; n: number; last: Date | null }>();
-    const repos = new Set<string>(gh.rows.map((r) => r.r).filter((r) => r && r.split('/')[1].toLowerCase().includes(term)));
+    const repos = new Set<string>(gh.rows.map((r) => r.r).filter((r) => r && matchName(r.split('/')[1] ?? '')));
     for (const c of chunks.rows) {
       const seen = new Set<string>();
       for (const m of String(c.text).match(ABS) ?? []) {
-        const segs = m.replace(/\\\\+/g, '\\').split(/[\\/]/), i = segs.findIndex((s) => s.toLowerCase().includes(term));
+        const segs = m.replace(/\\\\+/g, '\\').split(/[\\/]/), i = segs.findIndex((s) => matchName(s));
         if (i < 1) continue;
         const p = segs.slice(0, i + 1).join('\\'), k = p.toLowerCase();
         if (seen.has(k)) continue;
@@ -753,12 +789,12 @@ export async function locations(db: pg.Pool, query: string, hide: string[]): Pro
         const x = local.get(k) ?? local.set(k, { p, n: 0, last: c.ts }).get(k)!;
         x.n++;
       }
-      for (const m of String(c.text).matchAll(/github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?(?![\w.-])/gi)) if (m[1].split('/')[1].toLowerCase().includes(term)) repos.add(m[1]);
+      for (const m of String(c.text).matchAll(/github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?(?![\w.-])/gi)) if (matchName(m[1].split('/')[1] ?? '')) repos.add(m[1]);
     }
     const top = [...local.values()].sort((a, b) => b.n - a.n).slice(0, 3);
-    if (!top.length && !repos.size) continue;
-    out.push(`ตำแหน่ง "${term}" (จาก tool call/GitHub ในความจำ): ` + [...top.map((x) => `${x.p} (${existsSync(x.p) ? 'มีในเครื่องนี้' : 'ไม่พบในเครื่องนี้แล้ว'}, ${x.n} chunk, ล่าสุด ${day(x.last)})`),
-      ...(repos.size ? [`GitHub ${[...repos].slice(0, 3).join(', ')}`] : [])].join(' · '));
-  }
-  return out.join('\n');
+    if (!top.length && !repos.size) return '';
+    return `ตำแหน่ง "${term}" (จาก tool call/GitHub ในความจำ): ` + [...top.map((x) => `${x.p} (${existsSync(x.p) ? 'มีในเครื่องนี้' : 'ไม่พบในเครื่องนี้แล้ว'}, ${x.n} chunk, ล่าสุด ${day(x.last)})`),
+      ...(repos.size ? [`GitHub ${[...repos].slice(0, 3).join(', ')}`] : [])].join(' · ');
+  }));
+  return perTerm.filter(Boolean).join('\n');
 }

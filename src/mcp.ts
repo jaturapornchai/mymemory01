@@ -11,11 +11,11 @@ import { connect } from './db.ts';
 import { warmUp } from './embed.ts';
 import { offsiteBackend, PRIVATE_TOOLS, privateOk } from './guard.ts';
 import { canonicalProject, clean, normProject, projectName, resolveProjectChain } from './importer.ts';
-import { inferFactProject } from './projects.ts';
+import { clearResolverCache, inferFactProject, resolveProjectInput } from './projects.ts';
 import { redact } from './redact.ts';
 import { aliasRe, conflictPairs, factTexts, type Flags, flagsFor, identityOf, locations, nearFacts, userSaid } from './accuracy.ts';
 import { fmStr, isEdited, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
-import { day, HIDDEN, hitLine, hitProject, isOtherProject, keepCmd, LABEL, layerOf, type Origin, origins, originText, place, privateLabel, projectCatalogue, search, SEARCH_KINDS, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
+import { day, HIDDEN, hitLine, hitProject, isOtherProject, keepCmd, LABEL, layerOf, layers, type Origin, origins, originText, PAST, place, privateLabel, projectCatalogue, search, SEARCH_KINDS, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, findSynapsePath, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
 import { getTokens, timeline } from './timeline.ts';
@@ -127,33 +127,49 @@ server.registerTool(
     const no = off(); if (no) return text(no);
     const brief = detail === 'brief';
     const n = limit && Math.min(limit, 8); // ≤ 8 hits in both modes; default = search()'s 6
+    const hide = hidden();
     const filters = { project, kind, since, until, asOf: as_of, ...freshness() };
     const curProj = await getProject();
     const scopeProj = project ? undefined : curProj;
-    const res = await search(db, query, { ...filters, limit: n, currentProject: curProj, now: new Date(), showPrivate: privateOk(client()) });
+    // Run independent lookups (locations, hiddenNameMask, project identity) in parallel with search() instead of sequentially after
+    const [res, id, loc, mask] = await Promise.all([
+      search(db, query, { ...filters, limit: n, currentProject: curProj, now: new Date(), showPrivate: privateOk(client()) }),
+      curProj ? resolveProjectChain(db, curProj).then((c) => identityOf(db, c, hide)).catch(() => null) : Promise.resolve(null),
+      locations(db, query, hide).catch(() => ''),
+      hiddenNameMask(db, hide),
+    ]);
     const { semantic } = res;
     // Synapse competition (MEMHUB_COMPETE=0 turns it off): 1-hop graph neighbours of the top 6 compete with results 7..n for
     // those slots (no extra lines). Fresh N1b holdout: linked answer visible 13.5 → 22.4 % vs plain limit 8 (+22 −1), shuffled
     // graph no gain; detail set −3 net (n.s.). docs/decisions/0004
     const hits = process.env.MEMHUB_COMPETE !== '0' && n > 6 && res.hits.length > 0 && res.qvec
-      ? compete(res.hits, await proposals(db, res.hits, res.qvec, { hide: hidden(), filters, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), pool: Number(process.env.MEMHUB_COMPETE_POOL ?? 16), currentProject: scopeProj, query })
+      ? compete(res.hits, await proposals(db, res.hits, res.qvec, { hide, filters, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), pool: Number(process.env.MEMHUB_COMPETE_POOL ?? 16), currentProject: scopeProj, query })
         .catch(() => ({ props: [], sims: new Map<string, number>() })), { n, theta: Number(process.env.MEMHUB_COMPETE_THETA ?? 0.05), bonus: Number(process.env.MEMHUB_COMPETE_BONUS ?? 0.3), currentProject: scopeProj, query })
       : res.hits;
+    // Ensure synapse-promoted hits receive the same layers() / STALE / CONFLICT verdict as normal hits
+    if (hits !== res.hits && hits.some((h) => h.layer === undefined)) {
+      await layers(db, hits, query, scopeProj, hide, PAST.test(query) || !!(as_of || since || until));
+    }
     // an old name of this project in the query ("BC Ai" in a renamed repo) = what the repo is comes first, whatever ranked
-    const [id, loc] = await Promise.all([curProj ? resolveProjectChain(db, curProj).then((c) => identityOf(db, c, hidden())).catch(() => null) : null,
-      locations(db, query, hidden()).catch(() => '')]);
     if (id?.fid && !kind && id.aliases.some((a) => aliasRe(a).test(query))) {
       const at = hits.findIndex((h) => h.fid === id.fid && h.kind !== 'card');
       const top = at >= 0 ? hits.splice(at, 1)[0] : (await db.query(`SELECT c.id, c.turn_uuid, c.ts, c.project, c.session_id, c.ctx_header header, c.text,
-          s.status, s.tool, s.kind src_kind, 0 uses, NULL::timestamptz last, f.fid, f.kind, f.project fact_project, f.superseded_by, f.review_target,
+          s.status, s.tool, s.kind src_kind, 0 uses, NULL::timestamptz last, f.fid, f.kind, f.project fact_project, f.related_projects, f.superseded_by, f.review_target,
           NULL::text[] changed_to, NULL::text[] ev_of FROM facts f JOIN chunks c ON c.source_id = f.source_id JOIN sources s ON s.id = f.source_id
           WHERE f.fid = $1 ORDER BY c.seq_from, c.id LIMIT 1`, [id.fid])).rows[0];
       if (top) { hits.unshift({ ...top, score: hits[0]?.score ?? 1 }); if (at < 0 && hits.length > (n ?? 6)) hits.pop(); }
     }
     const ids = hits.map((h) => h.id); // origins after ranking: a citation never moves a hit; a failed lookup only drops the src parts
-    const [og, cost, mask, flags] = await Promise.all([origins(db, ids, hidden()).catch(() => new Map<string, Origin>()), brief ? getTokens(db, ids) : undefined,
-      hiddenNameMask(db, hidden()), flagsFor(db, hits.map((h) => ({ key: h.id, fid: h.kind !== 'card' ? h.fid : null, turn: h.turn_uuid,
-        project: h.fact_project || h.project, ts: h.ts, text: h.text })), hidden()).catch(() => new Map<string, Flags>())]);
+    const [og, cost, flags, linked] = await Promise.all([
+      origins(db, ids, hide).catch(() => new Map<string, Origin>()),
+      brief ? getTokens(db, ids) : Promise.resolve(undefined),
+      flagsFor(db, hits.map((h) => ({ key: h.id, fid: h.kind !== 'card' ? h.fid : null, turn: h.turn_uuid,
+        project: h.fact_project || h.project, ts: h.ts, text: h.text })), hide).catch(() => new Map<string, Flags>()),
+      process.env.MEMHUB_ASSOC === '1' && hits.length
+        ? associate(db, hits.slice(0, 3).map((h) => ({ chunkId: h.id, a: h.score / hits[0].score })),
+            { hide, exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters, currentProject: scopeProj, query }).catch(() => [])
+        : Promise.resolve([] as Assoc[]),
+    ]);
     for (const h of hits) { const f = flags.get(h.id); if (f) { h.flags = [...new Set([...(h.flags ?? []), ...f.tags])]; h.notes = f.lines; } }
     // mask before passage(): its window may start inside a hidden note's [[id title]], after the id the output mask needs
     for (const h of hits) for (const x of [h, ...(h.evidence ?? [])]) x.text = mask(x.text);
@@ -162,8 +178,6 @@ server.registerTool(
     if (hits.length && !loc && !since && !until && !as_of && !kind && unfamiliar(res.signal)) parts.unshift(UNFAMILIAR_HEAD);
     if (loc) parts.unshift(loc); // "X อยู่ไหน": the paths/repos tool calls named, before the hits
     parts.unshift(nowLine()); // ลุงจืด 2026-10-18 "ควรมีวัน เวลา ai จะได้เข้าใจ": ages and dates are read against it
-    const linked = process.env.MEMHUB_ASSOC === '1' && hits.length ? await associate(db, hits.slice(0, 3).map((h) => ({ chunkId: h.id, a: h.score / hits[0].score })),
-      { hide: hidden(), exclude: hits.flatMap((h) => [h.id, ...(h.evidence ?? []).map((e) => e.id)]), filters, currentProject: scopeProj, query }).catch(() => []) : [];
     for (const r of linked) r.chunk.text = mask(r.chunk.text);
     if (linked.length) parts.push(assocText(linked, query, scopeProj));
     const out = mask(parts.join(brief ? '\n' : '\n\n'));
@@ -239,8 +253,10 @@ function passage(text: string, query: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   if (flat.length <= max || !query) return snippet(text, query, max);
   const low = normalize(flat), occ: { i: number; k: string }[] = [];
-  for (const { key: k } of queryTerms(query)) for (let i = low.indexOf(k); i >= 0; i = low.indexOf(k, i + 1)) occ.push({ i, k });
-  const anchor = words(query).sort((a, b) => b.length - a.length).find((t) => low.includes(t));
+  const qts = queryTerms(query);
+  for (const { key: k } of qts) for (let i = low.indexOf(k); i >= 0; i = low.indexOf(k, i + 1)) occ.push({ i, k });
+  const keys = qts.length ? qts.map((t) => t.key) : words(query);
+  const anchor = [...keys].sort((a, b) => b.length - a.length).find((t) => low.includes(t));
   let best = 0, most = -1, bestAt = 0;
   for (let i = anchor ? low.indexOf(anchor) : -1; i >= 0; i = low.indexOf(anchor!, i + 1)) {
     const s = Math.max(0, Math.min(i - Math.floor(max / 4), flat.length - max));
@@ -322,11 +338,13 @@ server.registerTool(
     const t0 = performance.now();
     const no = off(); if (no) return text(no);
     const hide = hidden();
-    const c = await chunkOf(id, hide);
+    const [c, mask, c2] = await Promise.all([
+      chunkOf(id, hide),
+      hiddenNameMask(db, hide),
+      to_id ? chunkOf(to_id, hide) : Promise.resolve(undefined),
+    ]);
     if (!c) return text(`not found: ${id}`);
-    const mask = await hiddenNameMask(db, hide); // names of notes hidden from this caller inside visible text
     if (to_id) {
-      const c2 = await chunkOf(to_id, hide);
       if (!c2) return text(`not found: ${to_id}`);
       const steps = await findSynapsePath(db, Number(c.source_id), Number(c2.source_id), { hide });
       if (!steps) return text(`no synapse path (≤6 hops) between [${id}] and [${to_id}]`);
@@ -352,27 +370,39 @@ server.registerTool(
       return text(out);
     }
     around ??= 1;
-    const [turns, og] = await Promise.all([db.query(
-      `SELECT uuid, seq, role, ts, text_redacted FROM turns WHERE source_id = $1 AND seq BETWEEN $2 AND $3 ORDER BY seq`,
-      [c.source_id, c.seq_from - around, c.seq_to + around],
-    ).then((r) => r.rows), origins(db, [c.id], hide).catch(() => new Map<string, Origin>())]);
+    const [turns, og, f] = await Promise.all([
+      db.query(
+        `SELECT uuid, seq, role, ts, text_redacted FROM turns WHERE source_id = $1 AND seq BETWEEN $2 AND $3 ORDER BY seq`,
+        [c.source_id, c.seq_from - around, c.seq_to + around],
+      ).then((r) => r.rows),
+      origins(db, [c.id], hide).catch(() => new Map<string, Origin>()),
+      db.query(`SELECT f.*, s.status FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.source_id = $1`, [c.source_id]).then((r) => r.rows[0]),
+    ]);
     let body = turns.map((t) => `${t.role === 'user' ? 'U' : t.role === 'assistant' ? 'A' : t.role[0].toUpperCase()}: ${t.text_redacted}${ghUrl(t.uuid)}`).join('\n\n');
-    const f = (await db.query(
-      `SELECT f.*, s.status FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.source_id = $1`, [c.source_id])).rows[0];
-    if (f) { // a fact/card note: its validity and where it came from — his words first, ≤ PROV turns in full, the rest as src ids
-      const prov = (await db.query(
-        `SELECT t.uuid, t.seq, t.role, t.ts, s.tool, s.kind, s.session_id, s.path, t.source_id, left(t.text_redacted, 240) txt
-         FROM turns t JOIN sources s ON s.id = t.source_id WHERE t.uuid = ANY($1) AND t.uuid NOT LIKE 'obs:%'
-         AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) ORDER BY t.role = 'user' DESC, t.ts, t.seq`, [f.source_uuids, hide])).rows;
+    if (f) { // a fact/card note: its validity, accuracy flags, and provenance — his words first, ≤ PROV turns in full, the rest as src ids
+      const [prov, fFlags] = await Promise.all([
+        db.query(
+          `SELECT t.uuid, t.seq, t.role, t.ts, s.tool, s.kind, s.session_id, s.path, t.source_id, left(t.text_redacted, 240) txt
+           FROM turns t JOIN sources s ON s.id = t.source_id WHERE t.uuid = ANY($1) AND t.uuid NOT LIKE 'obs:%'
+           AND coalesce(s.hide_as, s.tool) <> ALL($2::text[]) ORDER BY t.role = 'user' DESC, t.ts, t.seq`, [f.source_uuids, hide]).then((r) => r.rows),
+        f.kind !== 'card'
+          ? flagsFor(db, [{ key: c.id, fid: f.fid, turn: c.turn_uuid, project: f.project || c.project, ts: f.valid_at, text: c.text }], hide).catch(() => new Map<string, Flags>())
+          : Promise.resolve(new Map<string, Flags>()),
+      ]);
       const src = (p: Record<string, any>) => place(p.tool, p.kind, p.session_id, p.path, p.seq, p.uuid);
       const shown = prov.slice(0, PROV).sort((a, b) => +a.ts - +b.ts), rest = prov.slice(PROV), n = new Set(prov.map((p) => p.source_id)).size;
       const from = f.source_uuids.every((u: string) => u.startsWith('obs:')) ? '\n\nfrom: memory_save (he asked to remember it)'
         : prov.length ? `\n\nfrom (${prov.length} turn${prov.length > 1 ? 's' : ''}, ${n} session${n > 1 ? 's' : ''}${prov.some((p) => p.role === 'user') ? '' : ', AI-only'}):\n` +
           shown.map((p) => `${p.role === 'user' ? 'U' : 'A'} ${day(p.ts)} ${src(p)}: ${p.txt}`).join('\n') +
           (rest.length ? `\n+${rest.length} more: ${rest.slice(0, 10).map(src).join(' ')}` : '') : '';
-      body = `${f.fid} ${f.kind} ${f.status ?? 'active'} · valid: ${day(f.valid_at)} → ${f.invalid_at ? day(f.invalid_at) : 'present'}` +
-        (f.superseded_by ? ` · superseded by [${f.superseded_by}]` : '') + (f.review_target ? ` · review vs [${f.review_target}]` : '') +
-        `\n\n${body}${from}`;
+      const validEnd = f.invalid_at ? day(f.invalid_at) : (f.status === 'superseded' && f.expired_at ? day(f.expired_at) : 'present');
+      const fl = fFlags.get(c.id);
+      const flagTag = fl?.tags.length ? ` · ${fl.tags.join(' · ')}` : '';
+      const flagLines = fl?.lines.length ? `\n${fl.lines.join('\n')}` : '';
+      body = `${f.fid} ${f.kind} ${f.status ?? 'active'} · valid: ${day(f.valid_at)} → ${validEnd}` +
+        (f.superseded_by ? ` · superseded by [${f.superseded_by}]` : '') +
+        (f.review_target && f.status === 'pending' ? ` · review vs [${f.review_target}]` : '') +
+        `${flagTag}${flagLines}\n\n${body}${from}`;
     }
     const o = og.get(c.id);
     const out = `${c.ctx_header} | session ${c.session_id} | ${c.project}${o ? ` | ${originText(o)}` : ''}\n\n${body || c.text}`;
@@ -460,7 +490,7 @@ server.registerTool(
     const hide = hidden();
     const want = [...new Set([...replaces, ...mute.map((m) => m.replace(/^-/, ''))])];
     const seen = new Map(want.length ? (await db.query( // a fid this app may not see (Claude-only) = not found, as in memory_get
-      `SELECT f.fid, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
+      `SELECT f.fid, f.kind, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
        WHERE f.fid = ANY($1) AND ${factVisible('$2')}`, [want, hide])).rows.map((r) => [r.fid, r]) : []);
     const out: string[] = [];
     const explicitProj = content && project?.trim() ? project.trim() : '';
@@ -469,6 +499,7 @@ server.registerTool(
       ? [...new Set(replaces.map((x) => seen.get(x)?.project).filter(Boolean))] : [];
     const inheritedProj = repProjs.length === 1 ? repProjs[0] : '';
     const useInheritedOverCwd = !!inheritedProj && (!rawCwdProj || (rawCwdProj.endsWith('/memoryhub') && !/\bmem(?:ory[-_]?)?hub\b/i.test(`${title ?? ''}\n${content ?? ''}`)));
+    if (content) clearResolverCache();
     const inf = content
       ? await inferFactProject(db, content, { title, explicitProject: explicitProj, cwdProject: useInheritedOverCwd ? '' : rawCwdProj, inheritedProject: inheritedProj, global })
       : { project: '', isGlobal: true, relatedProjects: [] as string[] };
@@ -483,7 +514,7 @@ server.registerTool(
       if (autoSup.length) {
         effReplaces = [...new Set([...effReplaces, ...autoSup.map((x) => x.fid)])];
         const extra = (await db.query(
-          `SELECT f.fid, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
+          `SELECT f.fid, f.kind, f.user_owned OR f.edited his, coalesce(f.project, '') project, s.path, s.status FROM facts f JOIN sources s ON s.id = f.source_id
            WHERE f.fid = ANY($1) AND ${factVisible('$2')}`, [autoSup.map((x) => x.fid), hide])).rows;
         for (const r of extra) seen.set(r.fid, r);
         near = near.filter((x) => !autoSup.some((a) => a.fid === x.fid));
@@ -494,10 +525,12 @@ server.registerTool(
     if (user_quote && effReplaces.length && !near.length && !said) out.push('user_quote: ไม่พบข้อความนี้ในแชทที่ลุงจืดพิมพ์ (2 วันล่าสุด / แชทที่เปิดอยู่) — ใช้ flow รออนุมัติตามเดิม');
     if (content && !near.length) {
       const vault = MEMORY_VAULT.replace(/\\/g, '/') + '/';
-      const sup: { fid: string; rel: string }[] = [], review: string[] = [], old: string[] = [];
+      const sup: { fid: string; rel: string }[] = [], review: string[] = [], old: string[] = [], targetKinds: string[] = [];
       for (const r of effReplaces.map((x) => seen.get(x)).filter((r) => r && r.fid !== fid)) {
         const path = String(r.path).replace(/\\/g, '/');
         const n = path.startsWith(vault) && existsSync(path) ? parseNote(readFileSync(path, 'utf8')) : null;
+        const tk = n ? fmStr(n.fm.kind) : String(r.kind ?? '');
+        if (tk) targetKinds.push(tk);
         // only a current note is replaced: an OLD one keeps its superseded_by chain (the file wins over a stale index)
         const st = n ? fmStr(n.fm.status) : r.status ?? '';
         if (st && st !== 'active') { old.push(`[${r.fid}] ${st}`); continue; }
@@ -506,13 +539,16 @@ server.registerTool(
         // his user_quote reaches his notes too, but never one he edited by hand (writeNote keeps those)
         if (n && ((!r.his && !isHis(n.fm, n.body)) || (said && !isEdited(n.fm, n.body)))) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
       }
+      const effKind = kind ?? (targetKinds.includes('rule') ? 'rule' : targetKinds.includes('decision') ? 'decision' : undefined);
       const now = new Date();
-      const rel = saveNote(content, { title, kind, global: isGlobal, project: proj, relatedProjects, client: client(), now, supersede: sup.map((x) => x.rel), review: review[0],
+      const rel = saveNote(content, { title, kind: effKind, global: isGlobal, project: proj, relatedProjects, client: client(), now, supersede: sup.map((x) => x.rel), review: review[0],
         ...(said ? { activate: !review.length, extra: { user_quote: user_quote!.slice(0, 300), quoted_at: now.toISOString() }, reindex: false } : {}) });
       if (said && !process.env.MEMHUB_NO_REINDEX) await run(process.execPath, [join(import.meta.dirname, 'cli.ts'), 'index-vault', MEMORY_VAULT],
         { env: { ...process.env, MEMORY_HUB_INTERNAL: '1' }, windowsHide: true, timeout: 120_000 }); // rw child; a search right after sees the new note
       // saveNote decides: pending (his note to review) supersedes nothing yet; the same text already active stays active
-      const pending = fmStr(parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.status) === 'pending';
+      const savedFm = parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm;
+      const pending = fmStr(savedFm.status) === 'pending';
+      const savedKind = fmStr(savedFm.kind) || effKind || 'fact';
       const ids = (xs: string[]) => xs.map((x) => `[${x}]`).join(' ');
       out.push(`saved: ${rel} (${pending ? 'pending: waits for his approval' : 'searchable in new sessions'})`);
       if (sup.length) out.push(pending ? `ยังไม่แทน ${ids(sup.map((x) => x.fid))}: โน้ตใหม่ยังรออนุมัติ — อนุมัติแล้วส่งข้อความเดิมพร้อม replaces อีกครั้ง`
@@ -524,7 +560,7 @@ server.registerTool(
       if (said) out.push(`user_quote ตรงกับที่ลุงจืดพิมพ์: มีผลทันที${sup.length ? '' : ' (ไม่มีโน้ตที่แทนได้)'}`);
       // a contradiction with a current fact of the same subject (accuracy.ts): flag both now, the nightly lint recomputes them
       const facts = (await factTexts(db, hide, isGlobal ? null : proj)).filter((f) => f.fid !== fid && !effReplaces.includes(f.fid));
-      const pairs = conflictPairs([...facts, { fid, project: isGlobal ? '' : proj, kind: kind ?? 'fact', text: body }], fid);
+      const pairs = conflictPairs([...facts, { fid, project: isGlobal ? '' : proj, kind: savedKind, text: body }], fid);
       const other = (p: { a: string; b: string }) => (p.a === fid ? p.b : p.a);
       if (pairs.length) {
         out.push(`⚠ CONFLICT: ขัดกับ ${pairs.map((p) => `[${other(p)}] เรื่อง ${p.name}`).join(' · ')} — ถ้าตัวเก่าผิด ส่ง replaces:[…] พร้อม user_quote; ติดธงทั้งคู่แล้ว (hubs/_review.md)`);
@@ -567,8 +603,10 @@ server.registerTool(
 if (import.meta.main) { // imported by scripts/eval.ts for searchText → no stdio server there
   server.server.oninitialized = () => console.error(`memory-hub: Claude-only sources (Google) ${privateOk(client()) ? 'shown' : 'hidden'} for ${client()}`);
   await server.connect(new StdioServerTransport());
-  if (!offsite) { // the first memory_search pays no cold start: bge-m3 load (seconds), PG connection + catalog caches (~20 ms)
+  if (!offsite) { // the first memory_search pays no cold start: bge-m3 load (seconds), PG connection + catalog/resolver caches
     warmUp();
+    getProject().catch(() => {});
+    resolveProjectInput(db, currentProject || 'memoryhub').catch(() => {});
     projectCatalogue(db).catch(() => {});
     search(db, 'warm up', { semantic: false, limit: 1 }).catch(() => {});
   }

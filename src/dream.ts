@@ -652,17 +652,20 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
       const text = op.op === 'UPDATE' && op.text ? op.text.trim() : c.text;
       const uuids = op.op === 'UPDATE' ? [...new Set([...c.uuids, ...t.uuids])] : c.uuids;
       // a note ลุงจืด wrote/edited/pinned is never changed; a dream-recorded rule yields only to ลุงจืด's own newer words
+      const inhKind = c.kind === 'fact' && (t.kind === 'rule' || t.kind === 'decision')
+        ? { kind: t.kind, tags: [`memhub/${t.kind}`, `project/${projectSlug(effProj || undefined)}`] }
+        : {};
       const review = t.hand || (t.owned && !c.byUser) || (KIND_ASSERTIVE.has(c.kind) && !c.byUser);
       if (review) {
         stats.pending_review++;
-        rel = addNote(text, uuids, { status: 'pending', review_target: t.fid }, [`- review:: ${op.op} ${link(t.rel)} — ${op.why ?? ''}`]);
+        rel = addNote(text, uuids, { ...inhKind, status: 'pending', review_target: t.fid }, [`- review:: ${op.op} ${link(t.rel)} — ${op.why ?? ''}`]);
       } else if (op.op === 'SUPERSEDE' && c.validAt < t.validAt) { // late-arriving older fact: born superseded (Zep §2.2.3)
-        rel = addNote(text, uuids, { status: 'superseded', superseded_by: t.fid, expired_at: now.toISOString(), invalid_at: t.validAt.toISOString() },
+        rel = addNote(text, uuids, { ...inhKind, status: 'superseded', superseded_by: t.fid, expired_at: now.toISOString(), invalid_at: t.validAt.toISOString() },
           [`- superseded_by:: ${link(t.rel)}`]);
       } else {
-        rel = addNote(text, uuids, {}, [`- supersedes:: ${link(t.rel)}`]);
+        rel = addNote(text, uuids, { ...inhKind }, [`- supersedes:: ${link(t.rel)}`]);
         const newFid = parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.id as string;
-        if (writeNote(t.rel, { status: 'superseded', superseded_by: newFid, expired_at: now.toISOString(), invalid_at: c.validAt.toISOString() }) === 'kept-user-edit') stats.kept_user_edit++;
+        if (writeNote(t.rel, { status: 'superseded', superseded_by: newFid, expired_at: now.toISOString(), invalid_at: c.validAt.toISOString(), review_target: '' }) === 'kept-user-edit') stats.kept_user_edit++;
         replaced.set(t.rel, { ...t, fid: newFid, text, rel, validAt: c.validAt, uuids, owned: false, hand: false, pinned: false });
       }
     }
@@ -712,18 +715,24 @@ export async function consolidate(db: pg.Pool, now = new Date()) {
   await writeHubs(db);
 }
 
-/** A pending note ลุงจืด set to active = accept: apply exactly the target's status change. */
+/** A pending note ลุงจืด set to active = accept: apply target's status/invalid_at + inherit rule/decision kind + clear stale review_target. */
 async function applyApprovals(db: pg.Pool, now: Date) {
   const rows = (await db.query(
-    `SELECT f.fid, f.review_target, s.path, t.fid tfid, ts.path tpath FROM facts f JOIN sources s ON s.id = f.source_id
-     JOIN facts t ON t.fid = f.review_target JOIN sources ts ON ts.id = t.source_id
-     WHERE s.status = 'active' AND f.review_target IS NOT NULL AND ts.status IS DISTINCT FROM 'superseded'`)).rows;
+    `SELECT f.fid, f.kind, f.valid_at, f.review_target, coalesce(s.status, 'active') status, s.path,
+            t.fid tfid, t.kind tkind, ts.status tstatus, ts.path tpath
+     FROM facts f JOIN sources s ON s.id = f.source_id
+     LEFT JOIN facts t ON t.fid = f.review_target LEFT JOIN sources ts ON ts.id = t.source_id
+     WHERE coalesce(f.review_target, '') <> '' AND coalesce(s.status, 'active') <> 'pending'`)).rows;
   const vault = MEMORY_VAULT.replace(/\\/g, '/');
   let changed = 0;
   for (const r of rows) {
     const rel = (p: string) => p.replace(/\\/g, '/').slice(vault.length + 1);
-    if (writeNote(rel(r.tpath), { status: 'superseded', superseded_by: r.fid, expired_at: now.toISOString() }) !== 'kept-user-edit') changed++;
-    writeNote(rel(r.path), { review_target: '' }); // ponytail: an edited approval note keeps its review_target; harmless (target already superseded)
+    if (r.status === 'active' && r.tpath && r.tstatus !== 'superseded') {
+      const invAt = r.valid_at ? new Date(r.valid_at).toISOString() : now.toISOString();
+      if (writeNote(rel(r.tpath), { status: 'superseded', superseded_by: r.fid, expired_at: now.toISOString(), invalid_at: invAt, review_target: '' }) !== 'kept-user-edit') changed++;
+    }
+    const inhKind = r.status === 'active' && r.kind === 'fact' && (r.tkind === 'rule' || r.tkind === 'decision') ? { kind: r.tkind } : {};
+    if (writeNote(rel(r.path), { ...inhKind, review_target: '' }) === 'written') changed++;
   }
   if (changed) { await indexVault(db, MEMORY_VAULT); await resolveLinks(db); }
 }

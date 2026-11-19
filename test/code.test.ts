@@ -102,3 +102,16 @@ test('hit text centres on the line holding the whole identifier, not the first l
   assert.match(t, /   20\| export const vaultSafe/);
   assert.match(code.codeHitText({ line0: 1, text: 'a\nb', files: [{ repo: 'me/app', path: 'x.ts' }] }, 'nothing'), /^me\/app\/x\.ts:1-2\n/); // no line matches → top
 });
+
+test('code_search: path-aware intersection and distinct-term-ranked OR fallback', async () => {
+  put(A, {
+    'svc/synapse_engine.ts': 'export function associateGraph() { return 1; }\n',
+    'svc/noisy.ts': 'export const helper = "alpha alpha alpha alpha alpha";\n',
+    'svc/precise.ts': 'export function calcAlphaBeta() { return "alpha beta"; }\n',
+  });
+  publish(A, 'me/app'); state(['me/app']);
+  await code.indexCode(db, () => {});
+  assert.deepEqual(await search('synapse associateGraph'), ['me/app/svc/synapse_engine.ts:1'], 'filename segment + symbol matches');
+  const orHits = await search('alpha beta nonexistentxyz');
+  assert.equal(orHits[0], 'me/app/svc/precise.ts:1', 'chunk matching 2 distinct query terms outranks chunk repeating 1 term 5x');
+});

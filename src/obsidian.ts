@@ -7,6 +7,7 @@ import { basename, join, relative } from 'node:path';
 import type pg from 'pg';
 import { clean, hideDreamed, normProject, store } from './importer.ts';
 import { type Fm, fmList, fmStr, isEdited, md5, MEMORY_VAULT, parseNote } from './notes.ts';
+import { clearResolverCache } from './projects.ts';
 
 export const VAULTS = [...(process.env.MEMHUB_VAULTS ?? '')
   .split(',').map((s) => s.trim()).filter(Boolean), MEMORY_VAULT];
@@ -106,6 +107,7 @@ export async function indexVault(db: pg.Pool, vault: string) {
     });
     stats.indexed++;
   }
+  if (stats.indexed + stats.removed > 0) clearResolverCache();
   return stats;
 }
 
@@ -114,7 +116,8 @@ const isoOr = (v: string, dflt: string | null) => (v && !Number.isNaN(Date.parse
 
 /** memory-hub note → sources.status + facts row (an index of the frontmatter; the file stays the truth). */
 async function indexFact(c: pg.PoolClient, sourceId: string, fm: Fm, body: string, uuid: string, mtime: string) {
-  await c.query('UPDATE sources SET status = $2 WHERE id = $1', [sourceId, fmStr(fm.status) || null]);
+  const status = fmStr(fm.status) || null;
+  await c.query('UPDATE sources SET status = $2 WHERE id = $1', [sourceId, status]);
   await c.query('DELETE FROM facts WHERE source_id = $1', [sourceId]);
   const type = fmStr(fm.memhub);
   if (!['fact', 'card', 'insight'].includes(type) || !fmStr(fm.id)) return; // a plain note ลุงจืด wrote
@@ -123,6 +126,7 @@ async function indexFact(c: pg.PoolClient, sourceId: string, fm: Fm, body: strin
   const pinned = fmStr(fm.pinned) === 'true';
   const uuids = fmList(fm.source_uuids).filter(Boolean);
   const created = isoOr(fmStr(fm.created_at), mtime)!;
+  const invalidAt = isoOr(fmStr(fm.invalid_at) || fmStr(fm.valid_until), status === 'superseded' ? isoOr(fmStr(fm.expired_at), created) : null);
   const relProjs = fmStr(fm.scope) === 'global' ? [] : [...new Set(fmList(fm.related_projects).map((p) => normProject(p)).filter(Boolean))];
   await c.query(
     `INSERT INTO facts (source_id, fid, kind, scope, project, related_projects, lang, valid_at, invalid_at, created_at, expired_at, superseded_by,
@@ -133,7 +137,7 @@ async function indexFact(c: pg.PoolClient, sourceId: string, fm: Fm, body: strin
      ON CONFLICT (fid) DO NOTHING`, // ponytail: two files claiming one id → first indexed wins
     [sourceId, fmStr(fm.id), kind, fmStr(fm.scope) === 'global' ? 'global' : 'project',
       fmStr(fm.scope) === 'global' ? null : (fmStr(fm.project) ? normProject(fmStr(fm.project)) : null),
-      fmStr(fm.lang) || null, isoOr(fmStr(fm.valid_at), created), isoOr(fmStr(fm.invalid_at), null), created,
+      fmStr(fm.lang) || null, isoOr(fmStr(fm.valid_at), created), invalidAt, created,
       isoOr(fmStr(fm.expired_at), null), fmStr(fm.superseded_by) || null, fmStr(fm.review_target) || null,
       uuids.length ? uuids : [uuid], Number(fmStr(fm.confidence)) || null, Math.min(10, Math.max(1, Number(fmStr(fm.importance)) || 5)),
       pinned, ['rule', 'feedback'].includes(kind) || fmStr(fm.owner) === 'user' || edited || pinned, edited,

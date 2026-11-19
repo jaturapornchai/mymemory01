@@ -383,4 +383,177 @@ test('Antigravity live transcript userSaid, EOF line bounds, project resolver, a
   assert.equal(pNegBoth.get('kafka'), 'neg');
   assert.equal(polarity('สำหรับงานสร้างตัวละคร และบอกว่าไม่เกี่ยวกับ Gemma').size, 0);
   assert.equal(polarity('ห้ามใช้ Claude เป็นผู้ช่วยใน Antigravity').size, 0);
+  assert.equal(polarity('ห้าม Claude เปิด futures position ซ้ำ').size, 0);
+  assert.equal(polarity('กฎ bccode: ห้าม rename field shopid (ฝังใน API path /shop/..., index, Kafka/PG/ClickHouse)').size, 0);
+});
+
+test('memory_save(replaces) & consolidate inherit rule/decision kind, close valid_until immediately, and clear review vs', async () => {
+  const { consolidate } = await import('../src/dream.ts');
+  const { clearResolverCache } = await import('../src/projects.ts');
+  const projAds = join(tmp, 'googleads').replace(/\\/g, '/').toLowerCase();
+  const projWeb = join(tmp, 'bcaiwebsite').replace(/\\/g, '/').toLowerCase();
+  mkdirSync(projAds, { recursive: true });
+  mkdirSync(projWeb, { recursive: true });
+  await db.query(`INSERT INTO state (k, v) VALUES ('project:aliases', $1::jsonb) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [
+    { 'alpha-alias': join(tmp, 'proj-alpha').replace(/\\/g, '/').toLowerCase(), 'bcaiwebsite-live': projWeb, [`${projWeb}-live`]: projWeb },
+  ]);
+  clearResolverCache();
+
+  // Seed initial active rule in googleads (dated 2 days ago)
+  const oldAt = '2026-10-25T01:00:00.000Z';
+  const oldRuleBody = 'กฎงบโฆษณา Google Ads บัญชี SMLSoft (123-456-7890) งบรายวันไม่เกิน 100 บาท/วัน สำหรับแคมเปญ bcaccount โปรแกรมบัญชี POS';
+  const oldFid = noteFid(oldRuleBody);
+  writeNote(`facts/googleads/${oldFid} old-budget.md`, {
+    memhub: 'fact', id: oldFid, kind: 'rule', scope: 'project', project: projAds, status: 'active',
+    owner: 'user', importance: '8', valid_at: oldAt, created_at: oldAt, source_uuids: ['obs:' + oldFid], md5: md5(oldRuleBody),
+  }, `# ${oldFid} กฎงบโฆษณา SMLSoft 100\n\n${oldRuleBody}\n`);
+  // Seed a fact in bcaiwebsite referencing the same Google Ads account 123-456-7890 and analytics ID G-9A8B7C6D5E
+  saveNote('เว็บ bcaccount.com เชื่อมบัญชี Google Ads 123-456-7890 และ GA4 G-9A8B7C6D5E', { project: projWeb, reindex: false });
+  await index();
+  clearResolverCache();
+
+  // First save without matching user_quote -> pending (has review vs), omitting `kind`
+  const newRuleBody = 'บัญชี Google Ads SMLSoft (123-456-7890) ปรับกฎเพิ่มงบเป็น 500 บาท/วัน (อนุมัติจากเพดานเดิม 100 บาท/วัน แยกแคมเปญ bcaccount โปรแกรมบัญชี และ POS)';
+  const newFid = noteFid(newRuleBody);
+  const pendReply = await c.call('memory_save', {
+    content: newRuleBody, project: projAds, replaces: [oldFid], confirm_new: true, user_quote: 'คำที่ยังไม่ได้พิมพ์จริง',
+  });
+  assert.match(pendReply, /pending/);
+
+  // User confirms in live chat -> memory_save(replaces:[oldFid]) WITHOUT specifying `kind`
+  writeFileSync(join(tmp, 'live', 'p', 's.jsonl'),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'acctest: PROJECT นี้ไม่เกี่ยวกับ BC นะ' } }) + '\n'
+    + JSON.stringify({ type: 'user', message: { role: 'user', content: 'อนุมัติปรับกฎเพิ่มงบเป็น 500 บาท/วัน บัญชี 123-456-7890' } }) + '\n');
+  const okReply = await c.call('memory_save', {
+    content: newRuleBody, project: projAds, replaces: [oldFid], confirm_new: true, user_quote: 'อนุมัติปรับกฎเพิ่มงบเป็น 500 บาท/วัน บัญชี 123-456-7890',
+  });
+  assert.match(okReply, new RegExp(`saved: facts/googleads/${newFid}`));
+  assert.match(okReply, new RegExp(`replaced \\(now OLD\\): \\[${oldFid}\\]`));
+  await index();
+
+  const oldDb = (await db.query(`SELECT s.status, f.kind, f.invalid_at, f.review_target, f.superseded_by FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = $1`, [oldFid])).rows[0];
+  const newDb = (await db.query(`SELECT s.status, f.kind, f.invalid_at, f.review_target, f.related_projects FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = $1`, [newFid])).rows[0];
+  assert.equal(oldDb.status, 'superseded');
+  assert.equal(oldDb.superseded_by, newFid);
+  assert.ok(oldDb.invalid_at instanceof Date, 'superseded rule must close invalid_at immediately');
+  assert.equal(oldDb.review_target, null);
+
+  assert.equal(newDb.status, 'active');
+  assert.equal(newDb.kind, 'rule', 'replacement without explicit kind must inherit kind="rule"');
+  assert.equal(newDb.review_target, null, 'verified replacement must clear review_target');
+  assert.ok(Array.isArray(newDb.related_projects) && newDb.related_projects.includes(projWeb), 'shared account 123-456-7890 links peer project');
+
+  const oldGet = await c.call('memory_get', { id: oldFid });
+  assert.doesNotMatch(oldGet, /→ present/, `superseded rule must not show "→ present":\n${oldGet}`);
+  assert.match(oldGet, new RegExp(`valid: 2026-10-25 → \\d{4}-\\d\\d-\\d\\d · superseded by \\[${newFid}\\]`));
+  const newGet = await c.call('memory_get', { id: newFid });
+  assert.match(newGet, new RegExp(`^${newFid} rule active · valid:`, 'm'));
+  assert.doesNotMatch(newGet, /review vs/, `active replacement must not show "review vs":\n${newGet}`);
+
+  // Also test applyApprovals (consolidate) when a pending note (saved as fact) is approved in Obsidian against a decision
+  const decOld = 'ตัดสินใจโครงสร้างแคมเปญ SMLSoft แยก 2 แคมเปญ';
+  const decOldFid = noteFid(decOld);
+  writeNote(`facts/googleads/${decOldFid} dec-old.md`, {
+    memhub: 'fact', id: decOldFid, kind: 'decision', scope: 'project', project: projAds, status: 'active',
+    owner: 'user', valid_at: oldAt, created_at: oldAt, source_uuids: ['obs:' + decOldFid], md5: md5(decOld),
+  }, `# ${decOldFid} dec-old\n\n${decOld}\n`);
+  const decNew = 'อัปเดตโครงสร้างแคมเปญ SMLSoft แยก 3 แคมเปญชัดเจน';
+  const decNewFid = noteFid(decNew);
+  const pendRel = `facts/googleads/${decNewFid} dec-new.md`;
+  writeNote(pendRel, {
+    memhub: 'fact', id: decNewFid, kind: 'fact', scope: 'project', project: projAds, status: 'pending',
+    review_target: decOldFid, valid_at: '2026-10-26T02:00:00.000Z', created_at: '2026-10-26T02:00:00.000Z',
+    source_uuids: ['obs:' + decNewFid], md5: md5(decNew),
+  }, `# ${decNewFid} dec-new\n\n${decNew}\n`);
+  await index();
+  // Simulate user changing status: pending -> active in Obsidian while leaving review_target & kind: fact
+  writeNote(pendRel, { status: 'active' });
+  await index();
+  await consolidate(db);
+  await index();
+  const decOldRow = (await db.query(`SELECT s.status, f.invalid_at, f.superseded_by FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = $1`, [decOldFid])).rows[0];
+  const decNewRow = (await db.query(`SELECT s.status, f.kind, f.review_target FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = $1`, [decNewFid])).rows[0];
+  assert.equal(decOldRow.status, 'superseded');
+  assert.ok(decOldRow.invalid_at instanceof Date, 'applyApprovals must close invalid_at on superseded target');
+  assert.equal(decNewRow.kind, 'decision', 'applyApprovals must inherit decision kind');
+  assert.equal(decNewRow.review_target, null, 'applyApprovals must clear review_target on approved note');
+});
+
+test('memory_search ranks active Google Ads budget rule #1 over minor facts with wikilinks and links across bcaiwebsite-live via 123-456-7890', async () => {
+  const { search, refreshTermDf } = await import('../src/search.ts');
+  const { clearResolverCache } = await import('../src/projects.ts');
+  const projAds = join(tmp, 'googleads').replace(/\\/g, '/').toLowerCase();
+  const projWeb = join(tmp, 'bcaiwebsite').replace(/\\/g, '/').toLowerCase();
+  const ruleText = 'บัญชี Google Ads SMLSoft (123-456-7890) ปรับกฎเพิ่มงบเป็น 500 บาท/วัน (อนุมัติจากเพดานเดิม 100 บาท/วัน แยกแคมเปญ bcaccount โปรแกรมบัญชี และ POS)';
+  const ruleFid = noteFid(ruleText);
+  const oldRuleText = 'กฎงบโฆษณา Google Ads บัญชี SMLSoft (123-456-7890) งบรายวันไม่เกิน 100 บาท/วัน สำหรับแคมเปญ bcaccount โปรแกรมบัญชี POS';
+  const oldFid = noteFid(oldRuleText);
+
+  // Seed 5 minor facts with ALL query keywords PLUS trailing `- supports:: [[oldFid กฎงบโฆษณา...]]` wikilinks + 1 unrelated rule with `- related::`
+  const minors = [
+    'แคมเปญ Google Ads โฆษณา SMLSoft bcaccount โปรแกรมบัญชี POS เพิ่ม Sitelink 4 รายการครบถ้วน',
+    'โฆษณา RSA ของ Google Ads SMLSoft bcaccount โปรแกรมบัญชี POS ได้คะแนน Ad Strength ระดับ Good',
+    'สถิติคลิก Google Ads โฆษณา SMLSoft bcaccount โปรแกรมบัญชี POS เฉลี่ย CPC 8.40 บาท',
+    'ตั้งค่า Conversion Tracking โฆษณา Google Ads SMLSoft bcaccount โปรแกรมบัญชี POS บนหน้าดาวน์โหลด',
+    'รายการคีย์เวิร์ด Negative ของ Google Ads โฆษณา SMLSoft bcaccount โปรแกรมบัญชี POS ตัดคำฟรีออก',
+  ];
+  minors.forEach((m, i) => {
+    const fid = noteFid(m);
+    writeNote(`facts/googleads/${fid} minor-${i}.md`, {
+      memhub: 'fact', id: fid, kind: 'fact', scope: 'project', project: projAds, status: 'active',
+      importance: '7', valid_at: '2026-10-26T03:00:00.000Z', created_at: '2026-10-26T03:00:00.000Z',
+      source_uuids: ['obs:' + fid], run: 'r-ads', md5: md5(m),
+    }, `# ${fid} minor-${i}\n\n${m}\n\n- supports:: [[${oldFid} กฎงบโฆษณา Google Ads SMLSoft ไม่เกิน 100]]\n`);
+  });
+  const otherRule = 'ห้ามทำหน้า Landing Page ส่งทราฟฟิกออกนอกโดเมนสำหรับโฆษณา Google Ads SMLSoft bcaccount โปรแกรมบัญชี POS';
+  const otherRuleFid = noteFid(otherRule);
+  writeNote(`facts/googleads/${otherRuleFid} lp-rule.md`, {
+    memhub: 'fact', id: otherRuleFid, kind: 'rule', scope: 'project', project: projAds, status: 'active',
+    owner: 'user', importance: '8', valid_at: '2026-10-26T04:00:00.000Z', created_at: '2026-10-26T04:00:00.000Z',
+    source_uuids: ['obs:' + otherRuleFid], md5: md5(otherRule),
+  }, `# ${otherRuleFid} lp-rule\n\n${otherRule}\n\n- related:: [[${oldFid} กฎงบโฆษณา Google Ads SMLSoft ไม่เกิน 100]]\n`);
+
+  await index();
+  await refreshTermDf(db);
+  clearResolverCache();
+
+  const q = 'Google Ads โฆษณา งบโฆษณา SMLSoft bcaccount โปรแกรมบัญชี POS';
+
+  // 1) Direct MCP memory_search(limit: 6)
+  const mcpOut = await c.call('memory_search', { query: q, limit: 6 });
+  const firstHitLine = mcpOut.split('\n').find((l) => l.startsWith('[')) ?? '';
+  assert.match(firstHitLine, new RegExp(`^\\[${ruleFid}\\].*✓ใช้ได้ rule`), `expected active budget rule [${ruleFid}] first:\n${mcpOut}`);
+
+  // 2) Cross-project search from bcaiwebsite-live (shares external account 123-456-7890 with googleads)
+  const fromWeb = await search(db, q, { limit: 6, currentProject: `${projWeb}-live`, semantic: false });
+  assert.equal(fromWeb.hits[0]?.fid, ruleFid, `expected [${ruleFid}] #1 from bcaiwebsite-live, got ${fromWeb.hits.map((h) => h.fid).join(',')}`);
+  assert.equal(fromWeb.hits[0]?.layer, 'use', 'shared external account rule must be layer="use" (✓ใช้ได้) in peer project');
+
+  // 3) Explicit project filter project="bcaiwebsite-live" also surfaces peer account rule via PF(factProjPaths)
+  const filteredWeb = await search(db, q, { limit: 6, project: 'bcaiwebsite-live', semantic: false });
+  assert.equal(filteredWeb.hits[0]?.fid, ruleFid, `expected [${ruleFid}] #1 with project="bcaiwebsite-live", got ${filteredWeb.hits.map((h) => h.fid).join(',')}`);
+});
+
+test('snippet/passage ignore stopwords, locations handles hyphenated & 3-char names, memory_get shows CONFLICT/STALE flags', async () => {
+  const { snippet } = await import('../src/search.ts');
+  const { locations } = await import('../src/accuracy.ts');
+
+  // 1) Stopword "อะไร" (4 chars) must not beat keyword "pos" (3 chars) in snippet anchoring
+  const longText = `อธิบายว่าอะไรคือระบบพื้นฐาน ${'ข้อมูลทั่วไป '.repeat(45)} ตั้งค่าเครื่อง pos พอร์ต 8089 สำหรับแคชเชียร์`;
+  const sn = snippet(longText, 'อะไร pos', 120);
+  assert.match(sn, /pos พอร์ต 8089/, `expected snippet centered on "pos", got: ${sn}`);
+
+  // 2) locations() finds hyphenated names ("acctest-hub") and 3-char names ("pos")
+  saveNote('acctestloc2: โค้ดอยู่ที่ C:\\temp\\acctest-hub และระบบย่อย C:\\temp\\sml', { project: PROJECT, reindex: false });
+  await index();
+  const locHyphen = await locations(db, 'acctest-hub อยู่ที่ไหน', []);
+  assert.match(locHyphen, /ตำแหน่ง "acctest-hub"/);
+  assert.match(locHyphen, /C:\\temp\\acctest-hub/);
+  const locShort = await locations(db, 'sml อยู่ที่ไหน', []);
+  assert.match(locShort, /ตำแหน่ง "sml"/);
+  assert.match(locShort, /C:\\temp\\sml/);
+
+  // 3) memory_get(fid) surfaces active CONFLICT flags directly on the fact note
+  const getId = await c.call('memory_get', { id: ID });
+  assert.match(getId, /⚠CONFLICT/, `memory_get must display active CONFLICT flag:\n${getId}`);
 });

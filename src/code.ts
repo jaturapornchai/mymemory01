@@ -184,22 +184,46 @@ export async function indexCode(db: pg.Pool, log = (s: string) => console.log(s)
 export type CodeHit = { line0: number; text: string; files: { repo: string; path: string }[] };
 const like = (s?: string) => (s ? `%${s.replace(/[\\%_]/g, (m) => '\\' + m)}%` : '%');
 
-/** Every query word must appear in the chunk; none does → any word. repo / path = substring filters. */
+/** Every query word must appear in the chunk; none does → any word (ranked by distinct matched terms first, then ts_rank).
+ *  Also matches filename/path segments when a term names a file/module. repo / path = substring filters. */
 export async function codeSearch(db: pg.Pool, q: string, o: { repo?: string; path?: string; limit?: number } = {}): Promise<CodeHit[]> {
-  const terms = queryTerms(q).map((t) => t.lit);
+  const qts = queryTerms(q);
+  const terms = qts.map((t) => t.lit);
   if (!terms.length) return [];
+  const lim = o.limit ?? 10;
   const repo = o.repo ? like(o.repo) : null, path = o.path ? like(o.path) : null;
   const filtered = Boolean(repo || path);
-  const args = (op: string) => (filtered ? [terms.join(op), repo, path, o.limit ?? 10] : [terms.join(op), o.limit ?? 10]);
-  const sql = filtered
+  const sqlAnd = filtered
     ? `SELECT c.blob, c.line0, c.text FROM code_chunks c
        WHERE c.words @@ $1::tsquery AND c.blob IN (SELECT f.blob FROM code_files f WHERE ($2::text IS NULL OR f.repo ILIKE $2) AND ($3::text IS NULL OR f.path ILIKE $3))
        ORDER BY ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $4`
     : `SELECT c.blob, c.line0, c.text FROM code_chunks c
        WHERE c.words @@ $1::tsquery AND EXISTS (SELECT 1 FROM code_files f WHERE f.blob = c.blob)
        ORDER BY ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $2`;
-  let rows = (await db.query(sql, args(' & '))).rows;
-  if (!rows.length && terms.length > 1) rows = (await db.query(sql, args(' | '))).rows;
+  let rows = (await db.query(sqlAnd, filtered ? [terms.join(' & '), repo, path, lim] : [terms.join(' & '), lim])).rows;
+  // If AND missed because one term is a filename/path segment (e.g. "synapse associate"), intersect path match + content match
+  if (!rows.length && terms.length > 1) {
+    const pathPats = qts.filter((t) => t.key.length >= 3).map((t) => like(t.key));
+    if (pathPats.length) {
+      const sqlPath = `SELECT c.blob, c.line0, c.text FROM code_chunks c
+        WHERE c.words @@ $1::tsquery AND c.blob IN (
+          SELECT f.blob FROM code_files f
+          WHERE ($2::text IS NULL OR f.repo ILIKE $2) AND ($3::text IS NULL OR f.path ILIKE $3)
+            AND (f.path ILIKE ANY($4::text[]) OR f.repo ILIKE ANY($4::text[])))
+        ORDER BY (SELECT count(*) FROM unnest($5::tsquery[]) q WHERE c.words @@ q) DESC, ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $6`;
+      rows = (await db.query(sqlPath, [terms.join(' | '), repo, path, pathPats, terms, lim])).rows;
+    }
+  }
+  if (!rows.length && terms.length > 1) {
+    const sqlOr = filtered
+      ? `SELECT c.blob, c.line0, c.text FROM code_chunks c
+         WHERE c.words @@ $1::tsquery AND c.blob IN (SELECT f.blob FROM code_files f WHERE ($2::text IS NULL OR f.repo ILIKE $2) AND ($3::text IS NULL OR f.path ILIKE $3))
+         ORDER BY (SELECT count(*) FROM unnest($4::tsquery[]) q WHERE c.words @@ q) DESC, ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $5`
+      : `SELECT c.blob, c.line0, c.text FROM code_chunks c
+         WHERE c.words @@ $1::tsquery AND EXISTS (SELECT 1 FROM code_files f WHERE f.blob = c.blob)
+         ORDER BY (SELECT count(*) FROM unnest($2::tsquery[]) q WHERE c.words @@ q) DESC, ts_rank(c.words, $1::tsquery) DESC, c.blob, c.line0 LIMIT $3`;
+    rows = (await db.query(sqlOr, filtered ? [terms.join(' | '), repo, path, terms, lim] : [terms.join(' | '), terms, lim])).rows;
+  }
   if (!rows.length) return [];
   const files = (await db.query('SELECT blob, repo, path FROM code_files WHERE blob = ANY($1) AND ($2::text IS NULL OR repo ILIKE $2) AND ($3::text IS NULL OR path ILIKE $3) ORDER BY repo, path',
     [rows.map((r) => r.blob), repo, path])).rows;
@@ -211,7 +235,12 @@ export async function codeSearch(db: pg.Pool, q: string, o: { repo?: string; pat
  *  (vaultSafe = vaultsafe + vault + safe: its own line, not the first line that only says "vault"); earliest on a tie. */
 export function codeHitText(h: CodeHit, q: string): string {
   const keys = queryTerms(q).map((t) => t.key), lines = h.text.split('\n');
-  const score = lines.map((l) => { const ws = words(l); return keys.filter((k) => ws.some((w) => w.startsWith(k))).length; });
+  const score = lines.map((l) => {
+    const low = l.toLowerCase();
+    if (!keys.some((k) => low.includes(k))) return 0; // fast pre-check avoids Intl.Segmenter on non-matching lines
+    const ws = words(l);
+    return keys.filter((k) => ws.some((w) => w.startsWith(k))).length;
+  });
   const at = score.indexOf(Math.max(...score));
   const from = Math.max(0, at - 4), to = Math.min(lines.length, from + 12);
   const [f, ...more] = h.files, a = h.line0 + from, b = h.line0 + to - 1;

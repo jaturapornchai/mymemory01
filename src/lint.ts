@@ -331,7 +331,8 @@ async function runFixLint(db: pg.Pool, now = new Date()) {
     for (const x of r.expired) {
       const n = load(x.path);
       if (!n || isHis(n.fm, n.body)) continue;
-      if (writeNote(rel(x.path), { status: 'superseded', expired_at: fmStr(n.fm.expired_at) || now.toISOString() }) === 'written') {
+      const endedIso = x.ended ? new Date(x.ended).toISOString() : now.toISOString();
+      if (writeNote(rel(x.path), { status: 'superseded', expired_at: fmStr(n.fm.expired_at) || now.toISOString(), invalid_at: fmStr(n.fm.invalid_at) || endedIso, review_target: '' }) === 'written') {
         retired.add(x.fid); out.expired++;
       }
     }
@@ -341,11 +342,16 @@ async function runFixLint(db: pg.Pool, now = new Date()) {
       if (retired.has(x.ofid)) continue;
       const n = load(x.opath);
       if (!n || !isDream(n)) continue;
-      if (writeNote(rel(x.opath), { status: 'superseded', superseded_by: x.nfid, expired_at: fmStr(n.fm.expired_at) || now.toISOString() }) === 'written') {
+      const nn = load(x.npath);
+      const repValid = nn ? fmStr(nn.fm.valid_at) : '';
+      const invIso = fmStr(n.fm.invalid_at) || (repValid && !Number.isNaN(Date.parse(repValid)) ? new Date(repValid).toISOString() : now.toISOString());
+      if (writeNote(rel(x.opath), { status: 'superseded', superseded_by: x.nfid, expired_at: fmStr(n.fm.expired_at) || now.toISOString(), invalid_at: invIso, review_target: '' }) === 'written') {
         retired.add(x.ofid); out.replaced++;
-        const nn = load(x.npath), otitle = title(x.opath);
-        if (nn && !isEdited(nn.fm, nn.body) && !nn.body.includes(`[[${otitle}]]`)) {
-          writeNote(rel(x.npath), {}, `${nn.body.trimEnd()}\n- supersedes:: [[${otitle}]]\n`);
+        const otitle = title(x.opath), okind = fmStr(n.fm.kind);
+        if (nn && !isEdited(nn.fm, nn.body)) {
+          const metaPatch: Fm = fmStr(nn.fm.kind) === 'fact' && (okind === 'rule' || okind === 'decision') ? { kind: okind } : {};
+          const nextBody = nn.body.includes(`[[${otitle}]]`) ? undefined : `${nn.body.trimEnd()}\n- supersedes:: [[${otitle}]]\n`;
+          if (Object.keys(metaPatch).length || nextBody !== undefined) writeNote(rel(x.npath), metaPatch, nextBody);
         }
       }
     }
@@ -361,7 +367,7 @@ async function runFixLint(db: pg.Pool, now = new Date()) {
         const merged = [...new Set([...fmList(kn.fm.source_uuids), ...fmList(dn.fm.source_uuids)])];
         writeNote(rel(kpath), { source_uuids: merged });
       }
-      if (writeNote(rel(dpath), { status: 'superseded', superseded_by: keep, expired_at: fmStr(dn.fm.expired_at) || now.toISOString() }) === 'written') {
+      if (writeNote(rel(dpath), { status: 'superseded', superseded_by: keep, expired_at: fmStr(dn.fm.expired_at) || now.toISOString(), invalid_at: fmStr(dn.fm.invalid_at) || now.toISOString(), review_target: '' }) === 'written') {
         retired.add(drop); out.dups++;
       }
     }
@@ -369,7 +375,7 @@ async function runFixLint(db: pg.Pool, now = new Date()) {
       if (retired.has(x.fid)) continue;
       const n = load(x.path);
       if (!n || !isDream(n)) continue;
-      if (writeNote(rel(x.path), { status: 'superseded', expired_at: fmStr(n.fm.expired_at) || now.toISOString() }) === 'written') {
+      if (writeNote(rel(x.path), { status: 'superseded', expired_at: fmStr(n.fm.expired_at) || now.toISOString(), invalid_at: fmStr(n.fm.invalid_at) || now.toISOString(), review_target: '' }) === 'written') {
         retired.add(x.fid); out.expired++;
       }
     }

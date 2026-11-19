@@ -46,7 +46,8 @@ const WEIGHTED: Record<string, string> = {
       SELECT DISTINCT u.lexeme w, c.source_id src, s.tool || ':' || coalesce(s.session_id, s.path) unit
       FROM chunks c JOIN sources s ON s.id = c.source_id CROSS JOIN LATERAL unnest(c.words) u JOIN term_df d ON d.word = u.lexeme
       WHERE d.ndoc BETWEEN 2 AND 60 AND length(u.lexeme) >= 5 AND u.lexeme !~ '^[0-9a-f]+$' -- hashes name nothing (shas: cites)
-        AND (u.lexeme ~ '[a-z]' AND u.lexeme ~ '[_.0-9]' OR u.lexeme ~ '^[0-9]+(\\.[0-9]+){2,}$') AND ${VIS}),
+        AND ((u.lexeme ~ '[a-z]' AND u.lexeme ~ '[-_.0-9]') OR u.lexeme ~ '^[0-9]+(\\.[0-9]+){2,}$' OR u.lexeme ~ '^[0-9]{3}-[0-9]{3}-[0-9]{4}$'
+          OR (length(u.lexeme) >= 9 AND u.lexeme ~ '^[a-z]{9,}$' AND d.ndoc BETWEEN 2 AND 12)) AND ${VIS}),
     df AS (SELECT w, count(DISTINCT unit) n FROM t GROUP BY w HAVING count(DISTINCT unit) BETWEEN ${ENTITY_DF[0]} AND ${ENTITY_DF[1]}),
     pr AS (SELECT x.src a, y.src b, sum(1 / ln(1 + df.n)) w FROM t x JOIN df USING (w) JOIN t y ON y.w = x.w AND y.unit <> x.unit AND x.src < y.src
            GROUP BY 1, 2),
@@ -228,22 +229,27 @@ export function shuffled(g: Graph, seed: number, only?: string[]): Graph { // on
 
 const cache = new WeakMap<pg.Pool, { at: number; g: Promise<Graph> }>();
 /** Per pool, reloaded stale-while-revalidate after 15 min (the old graph serves until the new one is in); the first call
- *  awaits the load, a failed first load is retried by the next call. */
+ *  awaits the load, a failed first load is retried by the next call, and a failed background reload retries after 60 s. */
 function graphOf(db: pg.Pool): Promise<Graph> {
   const c = cache.get(db);
   if (c && Date.now() - c.at < RELOAD_MS) return c.g;
   const g = loadGraph(db);
-  if (!c) g.catch(() => cache.delete(db));
-  else g.then(() => cache.set(db, { at: Date.now(), g }), () => {});
-  cache.set(db, c ? { at: Date.now(), g: c.g } : { at: Date.now(), g });
-  return cache.get(db)!.g;
+  if (!c) {
+    g.catch(() => cache.delete(db));
+    cache.set(db, { at: Date.now(), g });
+    return g;
+  }
+  // Keep serving c.g while refreshing; bump at to retry in 60 s while in flight or on error, and full RELOAD_MS on success
+  cache.set(db, { at: Date.now() - RELOAD_MS + 60_000, g: c.g });
+  g.then(() => cache.set(db, { at: Date.now(), g }), () => {});
+  return c.g;
 }
 
 export type Seed = { chunkId: string; a: number; sourceId?: number };
 export type AssocFilters = { project?: string; since?: string; until?: string; asOf?: string; kind?: string; before?: Date; own?: { since: Date; tool: string; project: string } };
 export type AssocChunk = { id: string; source_id: string; turn_uuid: string; ts: Date | null; project: string; session_id: string; text: string;
   tool: string; src_kind: string; status: string | null; fid: string | null; kind: string | null; fact_project: string | null;
-  superseded_by: string | null; review_target: string | null };
+  related_projects?: string[] | null; superseded_by: string | null; review_target: string | null; db_stale?: boolean };
 export type Assoc = { chunk: AssocChunk; via: string; kind: string; act: number; sim?: number }; // sim = cosine to o.qvec
 
 /**
@@ -292,7 +298,9 @@ export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[];
     for (const e of out) add(e.to, HOP2 * x.a * part(e), x.via, x.viaChunk, `${x.kind}→${e.kind}`);
   }
   const shown = new Set([...seedSrc, ...exclude.map((id) => ids.get(id)?.src)]);
-  const top = [...act].filter(([id, x]) => !shown.has(id) && x.a >= theta).sort((p, q) => q[1].a - p[1].a || p[0] - q[0]).slice(0, limit * 3);
+  const hasFilter = Boolean(f.project || f.kind || f.since || f.until || f.asOf);
+  const preSlice = hasFilter ? Math.max(limit * 8, 24) : limit * 3;
+  const top = [...act].filter(([id, x]) => !shown.has(id) && x.a >= theta).sort((p, q) => q[1].a - p[1].a || p[0] - q[0]).slice(0, preSlice);
   if (!top.length) return [];
   const { since, until } = dateRange(f.since, f.until);
   const asOf = f.asOf ? dateRange(undefined, f.asOf, 'as_of').until : null;
@@ -300,8 +308,11 @@ export async function associate(db: pg.Pool, seeds: Seed[], o: { hide: string[];
   const rows = (await db.query(`
     SELECT o.ord, c.id, c.source_id, c.turn_uuid, c.ts, c.project, c.session_id, c.text, s.tool, s.kind src_kind,
            CASE WHEN $14::timestamptz IS NOT NULL AND s.status = 'superseded' THEN 'active' ELSE s.status END AS status,
-           fa.fid, fa.kind, fa.project fact_project, CASE WHEN $14::timestamptz IS NOT NULL THEN NULL ELSE fa.superseded_by END AS superseded_by,
-           fa.review_target, 1 - (c.embedding <=> $12::halfvec) sim
+           fa.fid, fa.kind, fa.project fact_project, fa.related_projects,
+           CASE WHEN $14::timestamptz IS NOT NULL THEN NULL ELSE fa.superseded_by END AS superseded_by,
+           fa.review_target,
+           EXISTS (SELECT 1 FROM state st WHERE $14::timestamptz IS NULL AND fa.fid IS NOT NULL AND st.k = 'stale:' || fa.fid) AS db_stale,
+           1 - (c.embedding <=> $12::halfvec) sim
     FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY o(src, via, ord) JOIN sources s ON s.id = o.src LEFT JOIN facts fa ON fa.source_id = o.src
     CROSS JOIN LATERAL (
       SELECT c.* FROM chunks c WHERE c.source_id = o.src

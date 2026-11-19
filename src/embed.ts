@@ -53,18 +53,38 @@ export const toVec = (v: number[]) => `[${v.join(',')}]`;
 
 const COLD_WAIT_MS = 4000; // a cold bge-m3 load takes ~2.2 s
 const wait = <T>(ms: number, v: T) => sleep(ms, v, { ref: false });
+const QUERY_CACHE_MAX = 128;
+const QUERY_CACHE_TTL_MS = 10 * 60_000;
+const queryVecCache = new Map<string, { at: number; vec: number[] }>();
+export function clearEmbedCache() { queryVecCache.clear(); }
 
 /** Hot-path query vector, or null = search keyword-only. After waitMs: model resident = GPU busy → drop the request (late
  *  ones pile up and slow the next searches) and go keyword-only; not resident = loading (keep_alive expired, app restart,
  *  spawn warm-up) → wait ≤4 s and never abort: an abort also cancels Ollama's model load, so every later search stayed
  *  keyword-only (~20 recall points lost) until some other process reloaded the model. */
-export async function embedQuery(text: string, waitMs: number): Promise<number[] | null> {
+export async function embedQuery(text: string, waitMs: number, useCache = false): Promise<number[] | null> {
+  const key = useCache ? `${EMBED_MODEL}\0${text.trim()}` : '';
+  if (useCache && key) {
+    const hit = queryVecCache.get(key);
+    if (hit && Date.now() - hit.at < QUERY_CACHE_TTL_MS) {
+      queryVecCache.delete(key);
+      queryVecCache.set(key, hit);
+      return hit.vec;
+    }
+  }
   const busy = new AbortController();
   const p = embed([text], 60_000, busy.signal).then((e) => e[0], () => null);
   const quick = await Promise.race([p, wait(waitMs, undefined)]);
-  if (quick !== undefined) return quick;
-  if (await resident()) { busy.abort(); return null; }
-  return Promise.race([p, wait(COLD_WAIT_MS, null)]);
+  let out: number[] | null;
+  if (quick !== undefined) out = quick;
+  else if (await resident()) { busy.abort(); return null; }
+  else out = await Promise.race([p, wait(COLD_WAIT_MS, null)]);
+  if (useCache && key && out) {
+    queryVecCache.delete(key);
+    queryVecCache.set(key, { at: Date.now(), vec: out });
+    if (queryVecCache.size > QUERY_CACHE_MAX) queryVecCache.delete(queryVecCache.keys().next().value!);
+  }
+  return out;
 }
 
 /** Is the embed model loaded in Ollama? Unknown (error/slow) → true, i.e. don't wait. */
@@ -96,12 +116,27 @@ export async function backfill(db: pg.Pool, batch = 8, log = console.log) {
     )).rows;
     if (!rows.length) break;
     let vecs: number[][];
+    const inputs = rows.map((r) => `${r.ctx_header}\n${r.text}`);
     for (let tries = 1; ; tries++) {
-      try { vecs = await embed(rows.map((r) => `${r.ctx_header}\n${r.text}`)); break; }
+      try { vecs = await embed(inputs); break; }
       catch (e) {
-        if (tries === 1 && /fetch failed|ECONNREFUSED/i.test(String(e)) && !process.env.OLLAMA_URL && !process.env.MEMORY_HUB_INTERNAL && await ensureOllama()) continue;
+        const msg = String(e);
+        if (tries === 1 && /fetch failed|ECONNREFUSED/i.test(msg) && !process.env.OLLAMA_URL && !process.env.MEMORY_HUB_INTERNAL && await ensureOllama()) continue;
+        // One chunk over bge-m3's 8K-token context must not stall all remaining chunks forever: embed item-by-item, trimming only the oversized item
+        if (/context length|too long|exceeds|input length|max.*token/i.test(msg)) {
+          vecs = [];
+          for (const inp of inputs) {
+            let v: number[] | null = null;
+            for (const cap of [inp.length, 12_000, 6_000, 3_000]) {
+              try { v = (await embed([inp.slice(0, cap)]))[0]; break; }
+              catch (err) { if (!/context length|too long|exceeds|input length|max.*token/i.test(String(err)) || cap === 3_000) throw err; }
+            }
+            vecs.push(v!);
+          }
+          break;
+        }
         // Ollama opens a new socket to its runner per tokenize call; bulk backfills exhaust Windows' ports (TIME_WAIT 2 min)
-        if (tries >= 10 || !/socket address|connectex|ECONNRESET|ECONNREFUSED/i.test(String(e))) throw e;
+        if (tries >= 10 || !/socket address|connectex|ECONNRESET|ECONNREFUSED/i.test(msg)) throw e;
         log(`embed: ${(e as Error).message.slice(0, 80)}… retry ${tries}/9 in 60 s`);
         await new Promise((r) => setTimeout(r, 60_000));
       }

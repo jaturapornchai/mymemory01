@@ -142,20 +142,31 @@ export function saveNote(content: string, opts: { title?: string; project?: stri
   const old = existsSync(path) ? parseNote(readFileSync(path, 'utf8')).fm : undefined;
   // activate (memory_save user_quote: he typed the correction himself) = active now, even over its own pending copy
   const status = opts.activate ? 'active' : old ? fmStr(old.status) || 'active' : opts.review ? 'pending' : 'active';
-  const review = old || opts.activate ? '' : opts.review ?? '';
+  const review = status === 'pending' ? (opts.review || fmStr(old?.review_target) || '') : '';
   const sup = status === 'active' ? opts.supersede ?? [] : [];
+  let inheritedKind = fmStr(old?.kind);
+  if (opts.kind === undefined) {
+    const supKinds = (opts.supersede ?? []).map((r) => {
+      const sp = join(MEMORY_VAULT, r);
+      return existsSync(sp) ? fmStr(parseNote(readFileSync(sp, 'utf8')).fm.kind) : '';
+    });
+    if (supKinds.includes('rule') || inheritedKind === 'rule') inheritedKind = 'rule';
+    else if (supKinds.includes('decision') || inheritedKind === 'decision') inheritedKind = 'decision';
+  }
+  const effKind = opts.kind ?? (inheritedKind || 'fact');
   // the dream's "- supersedes:: [[old]]" (link edges / synapses); fid and md5 come from the text alone
   const body = `${text}\n${sup.length ? `\n${sup.map((r) => `- supersedes:: [[${basename(r, '.md')}]]`).join('\n')}\n` : ''}`;
   try {
     writeNote(rel, {
-      memhub: 'fact', id: fid, kind: opts.kind ?? (fmStr(old?.kind) || 'fact'), scope, project: scope === 'global' ? '' : opts.project ?? '',
+      memhub: 'fact', id: fid, kind: effKind, scope, project: scope === 'global' ? '' : opts.project ?? '',
       ...(scope !== 'global' && opts.relatedProjects?.length ? { related_projects: opts.relatedProjects } : {}),
-      ...(old && !opts.activate ? {} : { status, review_target: review }),
+      status, review_target: review,
+      ...(opts.activate ? { superseded_by: '', invalid_at: '', expired_at: '' } : {}),
       owner: 'user', importance: fmStr(old?.importance) || '8', valid_at: fmStr(old?.valid_at) || now.toISOString(), created_at: fmStr(old?.created_at) || now.toISOString(),
       source_uuids: [noteUuid(path)], tags: ['memhub/saved'], md5: md5(text), ...(opts.client ? { client: opts.client } : {}), ...opts.extra,
     }, body);
     for (const r of sup) // ponytail: an edit by him in the ms since mcp.ts checked it = writeNote keeps it
-      writeNote(r, { status: 'superseded', superseded_by: fid, expired_at: now.toISOString(), invalid_at: now.toISOString() });
+      writeNote(r, { status: 'superseded', superseded_by: fid, expired_at: now.toISOString(), invalid_at: now.toISOString(), review_target: '' });
   } finally { // a failed write (EPERM on a locked note) must still close the batch, or this process never snapshots again
     if (opts.commit !== false) commitBatch(MEMORY_VAULT, `memory_save (${opts.client ?? 'unknown'}): ${rel}`);
   }

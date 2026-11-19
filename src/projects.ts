@@ -16,34 +16,85 @@ const GENERIC_NAMES = new Set([
   'app', 'api', 'ai', 'bin', 'binance', 'bot', 'build', 'claude', 'cli', 'client', 'cmd', 'code', 'codex', 'config',
   'console', 'crm', 'd', 'data', 'db', 'demo', 'dev', 'dist', 'doc', 'docs', 'docker', 'engine', 'env', 'frontend',
   'backend', 'gemini', 'git', 'github', 'global', 'google', 'hooks', 'hub', 'hubs', 'images', 'install', 'internal',
-  'kimi', 'lib', 'linux', 'live', 'lmstudio', 'local', 'logs', 'main', 'mcp', 'memory', 'model', 'models', 'new',
-  'newfolder', 'node', 'notes', 'obsidian', 'out', 'pkg', 'present', 'prod', 'project', 'projects', 'raw', 'renders',
-  'repo', 'research', 'rule', 'rules', 'scripts', 'server', 'service', 'session', 'sessions', 'shop', 'site',
-  'skills', 'sql', 'src', 'system', 'temp', 'test', 'tests', 'tmp', 'tool', 'tools', 'ui', 'user', 'users', 'vault',
+  'kimi', 'kms', 'lib', 'linux', 'live', 'lmstudio', 'local', 'logs', 'main', 'mcp', 'memory', 'model', 'models', 'new',
+  'newfolder', 'node', 'notes', 'obsidian', 'out', 'pkg', 'pos', 'present', 'prod', 'project', 'projects', 'raw', 'renders',
+  'repo', 'research', 'rule', 'rules', 'scripts', 'seo', 'server', 'service', 'session', 'sessions', 'shop', 'site',
+  'skills', 'sql', 'src', 'system', 'temp', 'test', 'tests', 'tmp', 'tool', 'tools', 'uat', 'ui', 'user', 'users', 'vault',
   'verify', 'video', 'view', 'web', 'windows', 'work', 'worktrees', 'zcode',
 ]);
 
-const SYSTEM_PATH = /^[a-z]:\/(?:\$recycle\.bin|program files[^/]*|programdata|windows|system volume information|recovery|perflogs|onedrivetemp|temp|tmp|obsidian-vault)(?:\/|$)|^[a-z]:\/users\/[^/]+\/(?:appdata|\.agents|\.claude|\.codex|\.gemini|\.zcode|\.lmstudio|\.kimi-code|\.memhub|ai-archive)(?:\/|$)/i;
-const SCRATCH_PROJECT = /(?:^|\/)(?:tmp|temp|new folder(?:\s*\(\d+\))?|scratch-workspaces|cli-probe|temp-chrome-profile[^/]*)(?:\/|$)/i;
-const SCRATCH_CWD = /^(?:\/tmp|[a-z]:\/(?:tmp|temp|new folder(?:\s*\(\d+\))?|scratch-workspaces(?:\/[^/]+)?|cli-probe|temp-chrome-profile[^/]*))$/i;
+const SYSTEM_PATH = /^[a-z]:\/(?:\$recycle\.bin|program files[^/]*|programdata|windows|system volume information|recovery|perflogs|onedrivetemp|temp|tmp|obsidian-vault)(?:\/|$)|^[a-z]:\/users\/[^/]+\/(?:appdata(?!\/local\/temp\/[^/]+\/[^/]+)|\.agents|\.claude|\.codex|\.gemini|\.zcode|\.lmstudio|\.kimi-code|\.memhub|ai-archive)(?:\/|$)/i;
+const SCRATCH_PROJECT = /^(?:\/tmp|[a-z]:\/(?:tmp|temp))(?:\/|$)|(?:^|\/)(?:new folder(?:\s*\(\d+\))?|scratch-workspaces|cli-probe|temp-chrome-profile[^/]*)(?:\/|$)/i;
+const SCRATCH_CWD = /^(?:\/tmp|[a-z]:\/(?:tmp|temp|new folder(?:\s*\(\d+\))?|scratch-workspaces(?:\/.*)?|cli-probe(?:\/.*)?|temp-chrome-profile[^/]*))|(?:^|\/)(?:scratch-workspaces|cli-probe)(?:\/|$)/i;
 const CONTRAST_BEFORE = /(?:ไม่(?:ได้)?(?:เกี่ยว(?:ข้อง)?|ยุ่ง|ใช่)(?:กับ)?|ห้าม(?:ปน|นำ|อ้างอิง|แตะ|แก้)|อ้างอิง|แนวทางเดียวกับ|(?:ระบบ|โค้ด)\s*เดิม|ต้นฉบับ(?:หลัก)?(?:[^,\n]{0,25})?อยู่ที่|เป็น\s*KMS|ใช้.*เป็น\s*KMS|จากเดิม|ย้าย(?:.*?\s)?จาก|เปลี่ยน(?:.*?\s)?จาก|\b(?:not\s+related\s+to|instead\s+of|reference\s+only|moved\s+from)\b)[^,;\n]{0,45}$/i;
 const CONTRAST_AFTER = /^[^,;\n]{0,30}(?:เป็น\s*KMS(?:\s*เท่านั้น)?|แทน(?:\b|$))/i;
 
+const PUBLIC_DOMAINS = new Set([
+  'github.com', 'githubusercontent.com', 'gitlab.com', 'bitbucket.org', 'google.com', 'googleapis.com',
+  'googleusercontent.com', 'gstatic.com', 'gmail.com', 'youtube.com', 'youtu.be', 'facebook.com', 'fb.com',
+  'instagram.com', 'messenger.com', 'meta.com', 'tiktok.com', 'line.me', 'x.com', 'twitter.com', 'linkedin.com',
+  'openai.com', 'chatgpt.com', 'anthropic.com', 'claude.ai', 'deepseek.com', 'kimi.com', 'moonshot.cn',
+  'huggingface.co', 'ollama.com', 'higgsfield.ai', 'atlascloud.ai', 'elevenlabs.io', 'vercel.app', 'vercel.com',
+  'netlify.app', 'cloudflare.com', 'workers.dev', 'pages.dev', 'railway.app', 'render.com', 'fly.io',
+  'supabase.co', 'supabase.com', 'mongodb.com', 'mongodb.net', 'docker.com', 'npmjs.com', 'pypi.org',
+  'binance.com', 'tradingview.com', 'shopee.co.th', 'shopee.com', 'lazada.co.th', 'lazada.com', 'stripe.com',
+  'example.com', 'test.com', 'acctest.com', 'acctest2.com', 'acctest3.com',
+]);
+
+/** Extract shared external account/analytics IDs (Google Ads, GA4, GTM, AW, Meta act_) and owned web domains. */
+export function extractSharedEntities(text: string): { ids: string[]; domains: string[]; idQueries: string[] } {
+  const clean = text.replace(/[\w.+-]+@[a-z0-9.-]+/gi, ' ');
+  const ids = new Set<string>(), domains = new Set<string>(), idQueries = new Set<string>();
+  const addAcctDigits = (a: string, b: string, c: string) => {
+    const compact = `${a}${b}${c}`, hyph = `${a}-${b}-${c}`;
+    ids.add(`id:${compact}`);
+    idQueries.add(`'${hyph}'`);
+    idQueries.add(`'${compact}'`);
+    idQueries.add(`('${a}' & '${b}' & '${c}')`);
+  };
+  for (const m of clean.matchAll(/\b(?!0[1-9]\d-)(\d{3})-(\d{3})-(\d{4})\b/g)) {
+    addAcctDigits(m[1], m[2], m[3]);
+  }
+  for (const m of clean.matchAll(/(?:\bcustomer(?:\s*id)?|\baccount(?:\s*id)?|บัญชี(?:\s*google\s*ads)?)\s*[:#-]?\s*(?!0[1-9]\d)(\d{3})(\d{3})(\d{4})\b/gi)) {
+    addAcctDigits(m[1], m[2], m[3]);
+  }
+  for (const m of clean.matchAll(/\b(G-(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,12}|GTM-(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{5,10}|AW-\d{6,12}|act_\d{6,20})\b/gi)) {
+    const low = m[1].toLowerCase();
+    ids.add(`id:${low}`);
+    idQueries.add(`'${low}'`);
+    if (low.includes('-')) {
+      const tail = low.split('-')[1];
+      if (tail && tail.length >= 6) idQueries.add(`'${tail}'`); // exact rare ID tail avoids scanning common single-letter 'g'
+    }
+  }
+  for (const m of clean.matchAll(/(?<![@\w.-])(?:https?:\/\/)?(?:[a-z0-9-]+\.)*([a-z0-9][a-z0-9-]{2,}\.(?:co\.th|in\.th|ac\.th|go\.th|or\.th|com|net|org|ai|io|app|dev|me|asia|shop|store|online|site|tech|cloud))\b/gi)) {
+    const d = m[1].toLowerCase();
+    if (!PUBLIC_DOMAINS.has(d)) domains.add(`dom:${d}`);
+  }
+  return { ids: [...ids], domains: [...domains], idQueries: [...idQueries] };
+}
+
 type Catalogue = {
   at: number;
-  byPath: Map<string, string>;      // normalized path -> canonical path
-  byName: Map<string, string>;      // exact/compact alias or basename -> canonical path
-  roots: string[];                  // known project root prefixes sorted longest-first
+  byPath: Map<string, string>;             // normalized path -> canonical path
+  byName: Map<string, string>;             // exact/compact alias or basename -> canonical path
+  roots: string[];                         // known project root prefixes sorted longest-first
+  entityProjects: Map<string, string[]>;   // 'id:...' | 'dom:...' -> canonical project paths
+  accountPeers: Map<string, string[]>;     // canonical project -> peer canonical projects sharing an external account ID
 };
 
+const CAT_TTL_MS = 10 * 60_000;
 const catCache = new Map<string, Catalogue>();
-export function clearResolverCache() { catCache.clear(); }
+const catInFlight = new Map<string, Promise<Catalogue>>();
+let diskRootsCache: { at: number; roots: string[] } | null = null;
+export function clearResolverCache() { catCache.clear(); catInFlight.clear(); diskRootsCache = null; }
 
 function diskProjectRoots(): string[] {
   if (process.env.MEMHUB_PROJECT_ROOTS !== undefined) {
     return process.env.MEMHUB_PROJECT_ROOTS.split(',').map((s) => s.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()).filter(Boolean);
   }
   if (process.env.MEMHUB_PG_SCHEMA) return []; // hermetic unit tests only see their own DB + explicit env
+  if (diskRootsCache && Date.now() - diskRootsCache.at < CAT_TTL_MS) return diskRootsCache.roots;
   const out: string[] = [];
   for (const drive of ['d:/', 'c:/']) {
     if (!existsSync(drive)) continue;
@@ -62,13 +113,22 @@ function diskProjectRoots(): string[] {
       }
     } catch {}
   }
+  diskRootsCache = { at: Date.now(), roots: out };
   return out;
 }
 
 async function loadCatalogue(db: pg.Pool): Promise<Catalogue> {
   const key = `${process.env.MEMHUB_PG_SCHEMA ?? ''}|${process.env.MEMHUB_PROJECT_MAP ?? ''}|${process.env.MEMHUB_PROJECT_ROOTS ?? ''}`;
   const hit = catCache.get(key);
-  if (hit && Date.now() - hit.at < 15_000) return hit;
+  if (hit && Date.now() - hit.at < CAT_TTL_MS) return hit;
+  const inflight = catInFlight.get(key);
+  if (inflight) return inflight;
+  const p = buildCatalogue(db, key).finally(() => catInFlight.delete(key));
+  catInFlight.set(key, p);
+  return p;
+}
+
+async function buildCatalogue(db: pg.Pool, key: string): Promise<Catalogue> {
 
   const byPath = new Map<string, string>();
   const byName = new Map<string, string>();
@@ -90,10 +150,11 @@ async function loadCatalogue(db: pg.Pool): Promise<Catalogue> {
     byPath.set(canon, canon);
   }
 
-  // 2) DB projects (sources + facts) + state 'project:aliases'
+  // 2) DB projects (sources + facts) + state 'project:aliases' + active fact entities
   let dbAliases: Record<string, string> = {};
+  let activeFactRows: { project: string; text: string }[] = [];
   try {
-    const [pr, st] = await Promise.all([
+    const [pr, st, ef] = await Promise.all([
       db.query(`
         SELECT project, sum(n)::int n FROM (
           SELECT project, count(*)::int n FROM sources WHERE coalesce(project, '') <> '' AND project NOT LIKE 'obsidian/%' AND project NOT LIKE 'github/%' AND project NOT LIKE 'google/%' GROUP BY 1
@@ -101,8 +162,13 @@ async function loadCatalogue(db: pg.Pool): Promise<Catalogue> {
           SELECT project, count(*)::int * 3 n FROM facts WHERE coalesce(project, '') <> '' AND project NOT LIKE 'obsidian/%' AND project NOT LIKE 'github/%' GROUP BY 1
         ) x GROUP BY 1 ORDER BY 2 DESC`),
       db.query(`SELECT v FROM state WHERE k = 'project:aliases'`),
+      db.query(`
+        SELECT coalesce(f.project, '') project, t.text_redacted text
+        FROM facts f JOIN sources s ON s.id = f.source_id JOIN turns t ON t.source_id = s.id AND t.seq = 0
+        WHERE coalesce(s.status, 'active') = 'active' AND f.kind <> 'card' AND coalesce(f.project, '') <> ''`),
     ]);
     dbAliases = (st.rows[0]?.v as Record<string, string>) ?? {};
+    activeFactRows = ef.rows as { project: string; text: string }[];
     for (const r of pr.rows) {
       const p = String(r.project).toLowerCase();
       if (catchAll(p) || SYSTEM_PATH.test(p) || SCRATCH_PROJECT.test(p)) continue;
@@ -138,7 +204,65 @@ async function loadCatalogue(db: pg.Pool): Promise<Catalogue> {
   for (const c of canonList) registerName(projectName(c), c, false);
 
   const roots = [...byPath.keys()].filter((p) => /^[a-z]:\//.test(p) && !catchAll(p)).sort((a, b) => b.length - a.length);
-  const out = { at: Date.now(), byPath, byName, roots };
+
+  // 5) Cross-project shared external entities (account IDs & owned web domains)
+  const rawEntProjs = new Map<string, Set<string>>();
+  const allIdQueries = new Set<string>();
+  const canonOf = (rawProj: string): string => {
+    const p = rawProj.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+    if (!p || p.startsWith('obsidian/') || p.startsWith('github/') || p.startsWith('google/') || catchAll(p) || SYSTEM_PATH.test(p) || SCRATCH_PROJECT.test(p)) return '';
+    return byPath.get(p) ?? chase(normProject(p));
+  };
+  const recordEnt = (ent: string, proj: string) => {
+    if (!proj) return;
+    let s = rawEntProjs.get(ent);
+    if (!s) { s = new Set(); rawEntProjs.set(ent, s); }
+    s.add(proj);
+  };
+  for (const r of activeFactRows) {
+    const txt = String(r.text ?? '');
+    const proj = canonOf(String(r.project ?? ''));
+    if (!proj || proj.endsWith('/memoryhub')) continue; // memoryhub is the meta memory system: discussions here cite other projects' accounts/domains
+    const { ids, domains, idQueries } = extractSharedEntities(txt);
+    for (const id of ids) recordEnt(id, proj);
+    for (const d of domains) recordEnt(d, proj);
+    for (const q of idQueries) allIdQueries.add(q);
+  }
+  if (allIdQueries.size > 0) {
+    try {
+      // No DISTINCT: DISTINCT tricked Postgres into scanning chunks_project_ts (109k rows, ~209 ms) instead of GIN chunks_words (~2 ms); JS deduplicates via Set.
+      const cRes = await db.query(
+        `SELECT c.project, c.text FROM chunks c
+         WHERE c.words @@ $1::tsquery AND coalesce(c.project, '') <> ''
+           AND c.project NOT LIKE 'obsidian/%' AND c.project NOT LIKE 'github/%' LIMIT 200`,
+        [[...allIdQueries].join(' | ')],
+      );
+      for (const r of cRes.rows) {
+        const txt = String(r.text ?? '');
+        const proj = canonOf(String(r.project ?? ''));
+        if (!proj || proj.endsWith('/memoryhub')) continue;
+        for (const id of extractSharedEntities(txt).ids) recordEnt(id, proj);
+      }
+    } catch {}
+  }
+
+  const entityProjects = new Map<string, string[]>();
+  const peerMap = new Map<string, Set<string>>();
+  for (const [ent, set] of rawEntProjs) {
+    const list = [...set];
+    const isId = ent.startsWith('id:');
+    if (list.length >= 1 && list.length <= (isId ? 8 : 5)) entityProjects.set(ent, list);
+    if (isId && list.length >= 2 && list.length <= 8) {
+      for (const a of list) {
+        for (const b of list) {
+          if (a !== b && !sameTree(a, b)) (peerMap.get(a) ?? peerMap.set(a, new Set()).get(a)!).add(b);
+        }
+      }
+    }
+  }
+  const accountPeers = new Map<string, string[]>([...peerMap.entries()].map(([k, v]) => [k, [...v]]));
+
+  const out: Catalogue = { at: Date.now(), byPath, byName, roots, entityProjects, accountPeers };
   catCache.set(key, out);
   return out;
 }
@@ -207,12 +331,12 @@ function extractSubjectProject(title: string, content: string, cat: Catalogue): 
 
 /** Resolve any caller project filter/input ("MyApp", "memory-hub", "D:\\myapp\\main.py", "proj-v2", "_global")
  *  for memory_save, memory_search, and scripts. */
-export async function resolveProjectInput(db: pg.Pool, input: string): Promise<{ isGlobal: boolean; vaultOnly: boolean; canonical: string; family: string[]; substr: string }> {
+export async function resolveProjectInput(db: pg.Pool, input: string): Promise<{ isGlobal: boolean; vaultOnly: boolean; canonical: string; family: string[]; sharedPeers: string[]; substr: string }> {
   const raw = input.trim();
   const low = raw.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-  if (!low) return { isGlobal: false, vaultOnly: false, canonical: '', family: [], substr: '' };
-  if (low === '_global' || low === 'global') return { isGlobal: true, vaultOnly: false, canonical: '', family: [], substr: '' };
-  if (low.startsWith('obsidian/')) return { isGlobal: false, vaultOnly: true, canonical: low, family: [low], substr: low };
+  if (!low) return { isGlobal: false, vaultOnly: false, canonical: '', family: [], sharedPeers: [], substr: '' };
+  if (low === '_global' || low === 'global') return { isGlobal: true, vaultOnly: false, canonical: '', family: [], sharedPeers: [], substr: '' };
+  if (low.startsWith('obsidian/')) return { isGlobal: false, vaultOnly: true, canonical: low, family: [low], sharedPeers: [], substr: low };
 
   const cat = await loadCatalogue(db);
   let cand = '';
@@ -225,12 +349,37 @@ export async function resolveProjectInput(db: pg.Pool, input: string): Promise<{
       if (norm !== low || cat.byPath.has(norm)) cand = await canonicalProject(db, norm);
     }
   }
-  if (!cand) return { isGlobal: false, vaultOnly: false, canonical: '', family: [], substr: low };
+  if (!cand) return { isGlobal: false, vaultOnly: false, canonical: '', family: [], sharedPeers: [], substr: low };
   const chain = await resolveProjectChain(db, cand, false);
   // Include any path mapped to `cand` in our catalogue (e.g. d:/myapp-old -> d:/myapp, d:/proj/sub-v2 -> d:/proj)
   const family = [...new Set([cand, ...chain, ...[...cat.byPath.entries()].filter(([, v]) => v === cand).map(([k]) => k)])]
     .filter((p) => !catchAll(p));
-  return { isGlobal: false, vaultOnly: false, canonical: cand, family, substr: projectName(cand).toLowerCase() };
+  const sharedPeers = cat.accountPeers.get(cand) ?? [];
+  return { isGlobal: false, vaultOnly: false, canonical: cand, family, sharedPeers, substr: projectName(cand).toLowerCase() };
+}
+
+/** Canonical projects linked to any shared external account ID or owned domain named in `text`. */
+export async function sharedEntityProjects(db: pg.Pool, text: string): Promise<string[]> {
+  const { ids, domains } = extractSharedEntities(text);
+  if (!ids.length && !domains.length) return [];
+  const cat = await loadCatalogue(db);
+  const out = new Set<string>();
+  for (const ent of [...ids, ...domains]) {
+    for (const p of cat.entityProjects.get(ent) ?? []) out.add(p);
+  }
+  return [...out];
+}
+
+function addSharedEntityRelated(relatedSet: Set<string>, project: string, fullText: string, cat: Catalogue) {
+  const { ids, domains } = extractSharedEntities(fullText);
+  for (const ent of [...ids, ...domains]) {
+    for (const p of cat.entityProjects.get(ent) ?? []) {
+      if (p !== project && !sameTree(p, project)) relatedSet.add(p);
+    }
+  }
+  for (const p of cat.accountPeers.get(project) ?? []) {
+    if (ids.length && p !== project && !sameTree(p, project)) relatedSet.add(p);
+  }
 }
 
 /** Canonical project + scope + relatedProjects for a fact at save, import, dream, or retroactive audit time. */
@@ -242,15 +391,17 @@ export async function inferFactProject(
   const title = opts.title ?? '';
   if (opts.global === true) return { project: '', isGlobal: true, relatedProjects: [] };
 
+  const fullText = `${title}\n${content}`;
   const cat = await loadCatalogue(db);
-  const paths = extractPathProjects(`${title}\n${content}`, cat);
+  const paths = extractPathProjects(fullText, cat);
 
   if (opts.explicitProject?.trim()) {
     const res = await resolveProjectInput(db, opts.explicitProject);
     if (res.isGlobal) return { project: '', isGlobal: true, relatedProjects: [] };
     const project = res.canonical || normProject(opts.explicitProject);
-    const relatedProjects = paths.positive.filter((p) => p !== project && !sameTree(p, project));
-    return { project, isGlobal: !project, relatedProjects };
+    const relatedSet = new Set(paths.positive.filter((p) => p !== project && !sameTree(p, project)));
+    if (project) addSharedEntityRelated(relatedSet, project, fullText, cat);
+    return { project, isGlobal: !project, relatedProjects: [...relatedSet] };
   }
 
   if (opts.global === undefined && !opts.inheritedProject && isGlobalFact(content, title)) {
@@ -267,9 +418,10 @@ export async function inferFactProject(
 
   // Did head/text explicitly name cwdCanon itself?
   const cwdName = cwdCanon ? projectName(cwdCanon).toLowerCase() : '';
+  const cwdSlug = slugKey(cwdName);
   const headLow = `${title}\n${content.split('\n')[0] ?? ''}`.toLowerCase();
-  const namesCwdInHead = !!cwdCanon && (paths.positive[0] === cwdCanon || (cwdName.length >= 4 && headLow.includes(cwdName)));
-  const mentionsMemoryHub = /\bmem(?:ory[-_]?)?hub\b/i.test(`${title}\n${content}`);
+  const namesCwdInHead = !!cwdCanon && (paths.positive[0] === cwdCanon || (cwdName.length >= 4 && (headLow.includes(cwdName) || slugKey(headLow).includes(cwdSlug))));
+  const mentionsMemoryHub = /\bmem(?:ory[-_]?)?hub\b/i.test(fullText);
 
   let project = cwdCanon;
   if (!cwdCanon) {
@@ -288,5 +440,6 @@ export async function inferFactProject(
   for (const p of paths.positive) {
     if (p !== project && !sameTree(p, project)) relatedSet.add(p);
   }
+  addSharedEntityRelated(relatedSet, project, fullText, cat);
   return { project, isGlobal: false, relatedProjects: [...relatedSet] };
 }

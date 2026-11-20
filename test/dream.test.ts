@@ -19,10 +19,11 @@ process.env.MEMORY_HUB_INTERNAL = '1';
 process.env.MEMHUB_DREAM_LIMIT = '25';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
-const { dream, deepseekRunner, ollamaRunner, filesRunner, buildDigests, renderBatch, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
+const { dream, consolidate, deepseekRunner, ollamaRunner, filesRunner, buildDigests, renderBatch, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
 const { rebuildSynapses } = await import('../src/synapse.ts');
-const { parseNote, saveNote, fileName, sha, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
+const { parseNote, saveNote, writeNote, inheritKind, fileName, sha, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
+const { backfill } = await import('../src/embed.ts');
 const { search, hitLine } = await import('../src/search.ts');
 const { searchText } = await import('../src/mcp.ts');
 type LlmReq = { id: string; system: string; user: string; schema: object };
@@ -746,4 +747,54 @@ test('two chats in one run replacing the same fact chain onto each other: one st
   const [e, f, g] = await Promise.all(['sup0', 'sup1', 'sup2'].map((s) => of(s)()));
   assert.deepEqual([e.status, f.status, g.status], ['superseded', 'superseded', 'active']);
   assert.equal(f.superseded_by, g.fid); // G replaced F, not the already-replaced E
+});
+
+test('a replacement of a rule stays a rule, whatever kind the model gave it (direct, review queue, approval of an older pending note)', async () => {
+  const of = async (s: string) => (await factRows()).find((x) => x.source_uuids.some((u: string) => u.startsWith(`${s}-`)))!;
+  const fmOf = (fid: string) => parseNote(readFileSync(join(MEMORY_VAULT, 'facts', notes('facts').find((f) => f.includes(fid))!), 'utf8')).fm;
+  assert.deepEqual([inheritKind('decision', ['rule']), inheritKind('howto', ['rule']), inheritKind('fact', ['decision']), inheritKind('howto', ['decision']), inheritKind('decision', ['fact']), inheritKind('fact', [])],
+    ['rule', 'rule', 'decision', 'howto', 'decision', 'fact']);
+
+  // direct: a dream-recorded rule replaced by his newer words that pass A labelled "decision"
+  await indexFile(db, session('k0', '2026-09-20', ['FACT: กฎ kindtest deploy ต้องรัน smoke ก่อนเสมอ']));
+  await run('k-0');
+  const rule = await of('k0');
+  assert.equal(rule.kind, 'rule');
+  await indexFile(db, session('k1', '2026-09-21', ['FACT: ตัดสินใจ แทน kindtest deploy ต้องรัน smoke ก่อนเสมอ เปลี่ยนเป็นรัน e2e']));
+  const r = await run('k-a');
+  assert.equal(r.stats.pending_review, 0, JSON.stringify(r.stats));
+  const next = await of('k1');
+  assert.equal((await of('k0')).superseded_by, next.fid);
+  assert.equal(next.kind, 'rule', 'a "decision" that replaces a rule is the rule now');
+  assert.ok((fmOf(next.fid).tags as string[]).includes('memhub/rule'));
+
+  // review queue: his own rule; the proposal waits as a rule too
+  saveNote('ลุงจืดสั่ง: kindtest snapshot เก็บ 14 วัน', { project: 'd:/demo', kind: 'rule', now: NOW });
+  await indexVault(db, MEMORY_VAULT);
+  await backfill(db, 8, () => {}).catch(() => 0); // as the dream does after each batch: a note without a vector ranks below the 12 neighbours it reads
+  await indexFile(db, session('k2', '2026-09-22', ['FACT: ตัดสินใจ แทน kindtest snapshot เก็บ 14 วัน เปลี่ยนเป็น 30 วัน']));
+  const rb = await run('k-b');
+  assert.equal(rb.stats.pending_review, 1, JSON.stringify(rb.stats));
+  const p = await of('k2');
+  assert.deepEqual([p.status, p.kind], ['pending', 'rule']);
+
+  // a pending note written before this rule existed still says "decision": he approves it → it becomes the rule
+  const pRel = join('facts', notes('facts').find((f) => f.includes(p.fid))!);
+  writeNote(pRel, { kind: 'decision', tags: (fmOf(p.fid).tags as string[]).map((t) => (t === 'memhub/rule' ? 'memhub/decision' : t)), status: 'active' });
+  await indexVault(db, MEMORY_VAULT);
+  await consolidate(db, NOW);
+  const rows = await factRows();
+  const done = rows.find((f) => f.fid === p.fid)!;
+  assert.deepEqual([done.status, done.kind, done.review_target], ['active', 'rule', null]);
+  assert.deepEqual((fmOf(p.fid).tags as string[]).filter((t) => t.startsWith('memhub/')), ['memhub/rule'], 'the kind tag follows the kind');
+  assert.equal(rows.find((f) => f.fid === p.review_target)!.status, 'superseded');
+});
+
+test('the model\'s "project" scope is kept: a word like กฎกลาง inside a project fact does not make it global', async () => {
+  await indexFile(db, session('sc1', '2026-09-23', ['FACT: demo backend: scopetest กฎกลางว่าแอปไหนรับเหตุการณ์ห้องอยู่ที่ไฟล์ client_app ยังไม่ได้ตั้งเป็นกฎกลางของทุกโปรเจกต์']));
+  await run('sc-a');
+  const f = (await factRows()).find((x) => x.source_uuids.some((u: string) => u.startsWith('sc1-')))!;
+  const row = (await db.query(`SELECT scope, project FROM facts WHERE fid = $1`, [f.fid])).rows[0];
+  assert.deepEqual([row.scope, row.project], ['project', 'd:/demo']);
+  assert.ok(notes('facts').some((n) => n.includes(f.fid) && !n.startsWith('_global')));
 });

@@ -14,7 +14,7 @@ import { canonicalProject, clean, normProject, projectName, resolveProjectChain 
 import { clearResolverCache, inferFactProject, resolveProjectInput } from './projects.ts';
 import { redact } from './redact.ts';
 import { aliasRe, conflictPairs, factTexts, type Flags, flagsFor, identityOf, locations, nearFacts, userSaid } from './accuracy.ts';
-import { fmStr, isEdited, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
+import { fmStr, inheritKind, isEdited, isGlobalFact, isHis, MEMORY_VAULT, noteFid, parseNote, saveNote } from './notes.ts';
 import { day, HIDDEN, hitLine, hitProject, isOtherProject, keepCmd, LABEL, layerOf, layers, type Origin, origins, originText, PAST, place, privateLabel, projectCatalogue, search, SEARCH_KINDS, snippet, type Hit, unfamiliar, hiddenNameMask } from './search.ts';
 import { type Assoc, associate, compete, findSynapsePath, proposals } from './synapse.ts';
 import { normalize, queryTerms, words } from './thai.ts';
@@ -539,7 +539,9 @@ server.registerTool(
         // his user_quote reaches his notes too, but never one he edited by hand (writeNote keeps those)
         if (n && ((!r.his && !isHis(n.fm, n.body)) || (said && !isEdited(n.fm, n.body)))) sup.push({ fid: r.fid, rel: path.slice(vault.length) }); else review.push(r.fid);
       }
-      const effKind = kind ?? (targetKinds.includes('rule') ? 'rule' : targetKinds.includes('decision') ? 'decision' : undefined);
+      // no kind given and nothing to inherit → undefined: saveNote keeps the kind a re-saved note already has
+      const inherited = inheritKind(kind ?? 'fact', targetKinds);
+      const effKind = kind === undefined && inherited === 'fact' ? undefined : inherited;
       const now = new Date();
       const rel = saveNote(content, { title, kind: effKind, global: isGlobal, project: proj, relatedProjects, client: client(), now, supersede: sup.map((x) => x.rel), review: review[0],
         ...(said ? { activate: !review.length, extra: { user_quote: user_quote!.slice(0, 300), quoted_at: now.toISOString() }, reindex: false } : {}) });

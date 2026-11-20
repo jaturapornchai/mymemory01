@@ -117,6 +117,15 @@ test('replaces on his own notes (memory_save rule, edited dream note) → review
   assert.match(await sessionStart(), /ห้ามแตะพอร์ต 5434 เด็ดขาด/, 'the old rule stays until he approves');
 });
 
+test('replaces on a rule with an explicit lower kind → the new note is still a rule', async () => {
+  const r = await claude.call('memory_save', { content: 'ตัดสินใจ corrtestrule: ห้ามแตะพอร์ต 5434 ถึง 5436 ทุกกรณี', kind: 'decision', replaces: [rule], confirm_new: true });
+  const rel = r.match(/^saved: (.+\.md) \(pending/m)?.[1];
+  assert.ok(rel, r);
+  assert.equal(parseNote(readFileSync(file(rel!), 'utf8')).fm.kind, 'rule');
+  rmSync(file(rel!));
+  await index();
+});
+
 test('a near-duplicate is not saved until confirm_new, and never replaced', async () => {
   const coffee = { content: 'ลุงจืดชอบกาแฟดำ ไม่ใส่น้ำตาล ทุกเช้า ที่บ้าน corrtestcoffee', kind: 'preference' };
   const r = await claude.call('memory_save', coffee);

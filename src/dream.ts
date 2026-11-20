@@ -16,7 +16,7 @@ import { offsiteBackend, PRIVATE_TOOLS } from './guard.ts';
 import { hideDreamed, projectName } from './importer.ts';
 import { inferFactProject } from './projects.ts';
 import { redactOffsite } from './redact.ts';
-import { fileName, type Fm, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
+import { fileName, type Fm, inheritKind, isEdited, isHis, md5, MEMORY_PROJECT, MEMORY_VAULT, parseNote, projectSlug, sha, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { day, deprecatedNames, GAP_DAYS, HIS, hiddenNameMask, SAID, search } from './search.ts';
 import { rebuildSynapses } from './synapse.ts';
@@ -613,7 +613,9 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
       continue;
     }
     stats[op.op]++;
-    const inf = await inferFactProject(db, c.text, { cwdProject: c.d.project, global: c.scope === 'global' ? true : undefined });
+    // pass A read the whole chat and always gives a scope: its "project" stands (false = no keyword guess; a project fact
+    // that says "ยังไม่ตั้งเป็นกฎกลาง" was filed as a global rule and shown at every session start)
+    const inf = await inferFactProject(db, c.text, { cwdProject: c.d.project, global: c.scope === 'global' });
     const effScope = inf.isGlobal ? 'global' : 'project', effProj = inf.isGlobal ? '' : (inf.project || c.d.project);
     const base: Fm = { memhub: 'fact', kind: c.kind, scope: effScope, project: effProj,
       ...(effScope === 'project' && inf.relatedProjects.length ? { related_projects: inf.relatedProjects } : {}),
@@ -652,9 +654,8 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
       const text = op.op === 'UPDATE' && op.text ? op.text.trim() : c.text;
       const uuids = op.op === 'UPDATE' ? [...new Set([...c.uuids, ...t.uuids])] : c.uuids;
       // a note ลุงจืด wrote/edited/pinned is never changed; a dream-recorded rule yields only to ลุงจืด's own newer words
-      const inhKind = c.kind === 'fact' && (t.kind === 'rule' || t.kind === 'decision')
-        ? { kind: t.kind, tags: [`memhub/${t.kind}`, `project/${projectSlug(effProj || undefined)}`] }
-        : {};
+      const kind = inheritKind(c.kind, [t.kind]);
+      const inhKind = kind !== c.kind ? { kind, tags: [`memhub/${kind}`, `project/${projectSlug(effProj || undefined)}`] } : {};
       const review = t.hand || (t.owned && !c.byUser) || (KIND_ASSERTIVE.has(c.kind) && !c.byUser);
       if (review) {
         stats.pending_review++;
@@ -731,8 +732,8 @@ async function applyApprovals(db: pg.Pool, now: Date) {
       const invAt = r.valid_at ? new Date(r.valid_at).toISOString() : now.toISOString();
       if (writeNote(rel(r.tpath), { status: 'superseded', superseded_by: r.fid, expired_at: now.toISOString(), invalid_at: invAt, review_target: '' }) !== 'kept-user-edit') changed++;
     }
-    const inhKind = r.status === 'active' && r.kind === 'fact' && (r.tkind === 'rule' || r.tkind === 'decision') ? { kind: r.tkind } : {};
-    if (writeNote(rel(r.path), { ...inhKind, review_target: '' }) === 'written') changed++;
+    const kind = r.status === 'active' ? inheritKind(r.kind, [r.tkind]) : r.kind;
+    if (writeNote(rel(r.path), { ...(kind !== r.kind ? { kind } : {}), review_target: '' }) === 'written') changed++;
   }
   if (changed) { await indexVault(db, MEMORY_VAULT); await resolveLinks(db); }
 }

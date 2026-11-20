@@ -10,7 +10,7 @@ import { ORPHAN } from './dream.ts';
 import { PRIVATE_TOOLS } from './guard.ts';
 import { projectName, sameTree } from './importer.ts';
 import { accuracyFlags, claim, saveFlags } from './accuracy.ts';
-import { type Fm, fmList, fmStr, isEdited, isHis, MEMORY_PROJECT, MEMORY_VAULT, parseNote, writeNote } from './notes.ts';
+import { type Fm, fmList, fmStr, inheritKind, isEdited, isHis, MEMORY_PROJECT, MEMORY_VAULT, parseNote, writeNote } from './notes.ts';
 import { indexVault, resolveLinks } from './obsidian.ts';
 import { commitBatch } from './vault-git.ts';
 
@@ -349,7 +349,8 @@ async function runFixLint(db: pg.Pool, now = new Date()) {
         retired.add(x.ofid); out.replaced++;
         const otitle = title(x.opath), okind = fmStr(n.fm.kind);
         if (nn && !isEdited(nn.fm, nn.body)) {
-          const metaPatch: Fm = fmStr(nn.fm.kind) === 'fact' && (okind === 'rule' || okind === 'decision') ? { kind: okind } : {};
+          const nkind = fmStr(nn.fm.kind), kind = inheritKind(nkind, [okind]);
+          const metaPatch: Fm = kind !== nkind ? { kind } : {};
           const nextBody = nn.body.includes(`[[${otitle}]]`) ? undefined : `${nn.body.trimEnd()}\n- supersedes:: [[${otitle}]]\n`;
           if (Object.keys(metaPatch).length || nextBody !== undefined) writeNote(rel(x.npath), metaPatch, nextBody);
         }

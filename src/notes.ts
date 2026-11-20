@@ -100,7 +100,10 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
   }
   // CRLF text (a Windows-written Claude memory file): parseNote reads \n only, so a \r kept here = body_sha never matches = "his edit"
   const nextBody = vaultSafe((body ?? cur ?? '').replace(/\r\n/g, '\n'));
-  const safeFm = Object.fromEntries(Object.entries({ ...fm, ...meta }).map(([k, v]) => [k, Array.isArray(v) ? v.map(vaultSafe) : vaultSafe(v)]));
+  // a kind change takes the note's `memhub/<kind>` tag along: the tag pane in Obsidian groups notes by it
+  const from = `memhub/${fmStr(fm.kind)}`, tags = fmList(fm.tags);
+  const retag: Fm = meta.kind && meta.kind !== fm.kind && !meta.tags && tags.includes(from) ? { tags: tags.map((t) => (t === from ? `memhub/${fmStr(meta.kind)}` : t)) } : {};
+  const safeFm = Object.fromEntries(Object.entries({ ...fm, ...retag, ...meta }).map(([k, v]) => [k, Array.isArray(v) ? v.map(vaultSafe) : vaultSafe(v)]));
   const next = renderNote({ ...safeFm, body_sha: sha(nextBody) }, nextBody);
   if (cur !== undefined && existsSync(path) && readFileSync(path, 'utf8').replace(/\r\n/g, '\n') === next) return 'unchanged';
   beforeMachineWrite(MEMORY_VAULT, rel); // git history: ลุงจืด's pending edits get their own commit before the batch's first write
@@ -122,6 +125,12 @@ export const isGlobalFact = (text: string, title = '') => {
   if (STRONG_GLOBAL_HINT.test(s)) return true;
   return /กฎเหล็ก/.test(s) && !PROJECT_SCOPED_HINT.test(s);
 };
+
+/** Kind of a note that replaces others (dream op, approval, lint --fix, memory_save replaces). What replaces a rule is the rule
+ *  now, whatever the model labelled it: session start shows a decision only inside its own project and search ranks rules higher,
+ *  so a "decision" would drop his rule from every other project. A plain fact that replaces a decision becomes one. */
+export const inheritKind = (kind: string, replaced: (string | null | undefined)[]) =>
+  replaced.includes('rule') ? 'rule' : kind === 'fact' && replaced.includes('decision') ? 'decision' : kind;
 
 /** memory_save: ลุงจืด asked to remember → a user-owned fact note (redacted), indexed in the background. replaces (mcp.ts):
  *  supersede = AI-owned notes it corrects, made OLD at once as the dream does; review = fid of his own note it would replace →

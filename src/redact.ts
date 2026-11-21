@@ -64,8 +64,8 @@ const RULES: Rule[] = [
   // bare key/pass only with a quoted secret-shaped value: "key": "<16+ alnum with a digit>", pass: "<6+ with a digit/symbol>"
   { kind: 'kv', re: /(["']?\bkey["']?\s*:\s*["'])((?=[A-Za-z]*\d)[A-Za-z0-9]{16,})(?=["'])/gi, group: 2 },
   { kind: 'kv', re: /(["']?\bpass["']?\s*[:=]\s*["'`])((?=[^"'`\s]*[\d!@#$%^&*+=?~])[^"'`\s]{6,})(?=["'`])/gi, group: 2 },
-  // markdown credentials: user `admin` pass `PW`, Secret key: `PW`, | S3 Secret Key | `PW` |
-  { kind: 'kv', re: /(\buser(?:name)?\s+[`'"][^`'"\s]+[`'"]\s*[,/]?\s*(?:pass(?:word)?|pwd|pw)\s*[:=]?\s*[`'"])([^`'"\s]{3,})(?=[`'"])/gi, group: 2 },
+  // markdown credentials: user `admin` pass `PW` (also "user `a` · pass `PW`"), Secret key: `PW`, | S3 Secret Key | `PW` |
+  { kind: 'kv', re: /(\buser(?:name)?\s+[`'"][^`'"\s]+[`'"]\s*[,/·|]?\s*(?:pass(?:word)?|pwd|pw)\s*[:=]?\s*[`'"])([^`'"\s]{3,})(?=[`'"])/gi, group: 2 },
   { kind: 'kv', re: /(\b(?:secret|access)[ _-]?key\s*[:=|]\s*[`'"])([^`'"\s|]{6,})(?=[`'"])/gi, group: 2 },
   // paramiko/ssh2 positional: .connect('host', 22, 'user', 'PASSWORD'); prose "(root / `PASSWORD`)"
   { kind: 'login', re: /(\.connect\(\s*["'][^"'\s]+["']\s*,\s*\d+\s*,\s*["'][^"'\s]+["']\s*,\s*["'])([^"'\s]{3,})(?=["'])/g, group: 2 },

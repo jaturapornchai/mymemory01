@@ -798,3 +798,44 @@ test('the model\'s "project" scope is kept: a word like กฎกลาง insid
   assert.deepEqual([row.scope, row.project], ['project', 'd:/demo']);
   assert.ok(notes('facts').some((n) => n.includes(f.fid) && !n.startsWith('_global')));
 });
+
+// review queue answers on notes written straight to the vault (as the stale review queues them): a retire proposal and a
+// proposal over a note he edited by hand
+const putFact = (rel: string, fid: string, fm: Record<string, string>, text: string) =>
+  writeNote(rel, { memhub: 'fact', id: fid, kind: 'rule', scope: 'project', project: 'd:/demo', owner: 'user', status: 'active',
+    valid_at: '2026-09-01T00:00:00.000Z', created_at: '2026-09-01T00:00:00.000Z', ...fm }, text);
+const statusOf = async (fid: string) => (await db.query(`SELECT s.status, f.superseded_by, f.review_target FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = $1`, [fid])).rows[0];
+
+test('review queue: an accepted retire proposal retires his note and is used up (nothing new becomes current)', async () => {
+  const old = 'facts/demo/Fae7e7e01 retiretest rule.md', prop = 'facts/demo/Fae7e7e02 retiretest proposal.md';
+  putFact(old, 'Fae7e7e01', {}, 'retiretest: always run old_tool.py first\n');
+  putFact(prop, 'Fae7e7e02', { status: 'pending', review_target: 'Fae7e7e01', review_op: 'retire' },
+    'retiretest proposal: old_tool.py is gone\n\n- review:: RETIRE [[Fae7e7e01 retiretest rule]] — test\n');
+  await indexVault(db, MEMORY_VAULT);
+  await consolidate(db, NOW);
+  assert.equal((await statusOf('Fae7e7e01')).status, 'active', 'a pending proposal changes nothing');
+  writeNote(prop, { status: 'active' }); // he accepts it in Obsidian
+  await indexVault(db, MEMORY_VAULT);
+  await consolidate(db, NOW);
+  assert.deepEqual(await statusOf('Fae7e7e01'), { status: 'superseded', superseded_by: null, review_target: null });
+  assert.deepEqual(await statusOf('Fae7e7e02'), { status: 'superseded', superseded_by: null, review_target: null });
+  assert.match(readFileSync(join(MEMORY_VAULT, old), 'utf8'), /always run old_tool\.py first/);
+});
+
+test('review queue: an accepted proposal over a note he edited by hand supersedes it; his text stays and it is still his edit', async () => {
+  const old = 'facts/demo/Fae7e7e03 handtest rule.md', prop = 'facts/demo/Fae7e7e04 handtest proposal.md';
+  putFact(old, 'Fae7e7e03', {}, 'handtest: deploy from d:/old/app\n');
+  const path = join(MEMORY_VAULT, old);
+  writeFileSync(path, readFileSync(path, 'utf8').replace('deploy from', 'deploy (his words) from'));
+  putFact(prop, 'Fae7e7e04', { status: 'pending', review_target: 'Fae7e7e03' },
+    'handtest: deploy (his words) from d:/new/app\n\n- review:: UPDATE [[Fae7e7e03 handtest rule]] — test\n');
+  await indexVault(db, MEMORY_VAULT);
+  writeNote(prop, { status: 'active' });
+  await indexVault(db, MEMORY_VAULT);
+  await consolidate(db, NOW);
+  assert.deepEqual(await statusOf('Fae7e7e03'), { status: 'superseded', superseded_by: 'Fae7e7e04', review_target: null });
+  assert.deepEqual(await statusOf('Fae7e7e04'), { status: 'active', superseded_by: null, review_target: null });
+  const n = parseNote(readFileSync(path, 'utf8'));
+  assert.match(n.body, /deploy \(his words\) from d:\/old\/app/);
+  assert.notEqual(n.fm.body_sha, sha(n.body), 'still counts as his edit');
+});

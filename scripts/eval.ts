@@ -172,8 +172,9 @@ for (const r of (await db.query(`SELECT g.i, array_agg(c.id ORDER BY c.id) ids F
     WHERE c.source_id NOT IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($5::text[])) GROUP BY g.i`,
   [spans.map(([, g]) => g.source_id), spans.map(([, g]) => g.seq), spans.map(([, g]) => g.end_seq ?? g.seq), before, hide])).rows)
   covered.set(spans[Number(r.i) - 1][0], r.ids);
-const factOk = new Set((await db.query(`SELECT fid FROM facts f WHERE fid = ANY($1) AND EXISTS (SELECT 1 FROM chunks c WHERE c.source_id = f.source_id AND c.ts < $2)`,
-  [want.filter((x) => x.gold?.fid).map((x) => x.gold.fid), before])).rows.map((r) => r.fid));
+const factOk = new Set((await db.query(`SELECT fid FROM facts f WHERE fid = ANY($1) AND EXISTS (SELECT 1 FROM chunks c WHERE c.source_id = f.source_id AND c.ts < $2)
+    AND f.source_id NOT IN (SELECT id FROM sources WHERE coalesce(hide_as, tool) = ANY($3::text[]))`, // a fact dreamed from a private chat: search hides it
+  [want.filter((x) => x.gold?.fid).map((x) => x.gold.fid), before, hide])).rows.map((r) => r.fid));
 const lost = want.filter((x) => x.gold?.fid ? !factOk.has(x.gold.fid) : x.gold && (!covered.has(x.id) || (x.cue && !covered.has(`${x.id}#cue`))));
 console.log(`gold reachability: ${want.length} items, ${lost.length} unreachable (excluded)${lost.length ? `: ${lost.map((x) => x.id).join(' ')}` : ''}`);
 out.unreachable = lost.map((x) => x.id);

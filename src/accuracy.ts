@@ -209,6 +209,12 @@ function hasAnyDesktopGuiApp(root: string): boolean {
 }
 
 /** "C:\Program" of "C:\Program Files\…": the path went on after a space. */
+// The token ending at `end` is the last segment of an absolute path that exists (C:\Program Files\App 4\bin\X.exe):
+// ABS stops at the spaces, so try every drive letter earlier on the same line as the start of the whole path.
+const inExistingAbsPath = (text: string, end: number) => {
+  const head = text.slice(text.lastIndexOf('\n', end - 1) + 1, end);
+  return [...head.matchAll(/\b[A-Za-z]:[\\/]/g)].some((d) => existsSync(head.slice(d.index).replace(/\\\\+/g, '\\')));
+};
 const cutAtSpace = (p: string) => {
   const i = p.search(/[^\\/]+$/), dir = p.slice(0, i), last = p.slice(i);
   try { return !!last && existsSync(dir) && readdirSync(dir).some((n) => n.startsWith(last + ' ')); } catch { return false; }
@@ -227,14 +233,14 @@ function resolveExistingRoot(project?: string | null): string {
 }
 
 /** Paths and runnable local artifacts in `text` that no longer exist on disk (D:\, C:\Users\jatur\, or project folder). */
-export function missingPaths(text: string, project?: string | null): string[] {
+export function missingPaths(text: string, project?: string | null, related: readonly string[] = []): string[] {
   const useCache = !process.env.MEMHUB_PG_SCHEMA;
-  const key = useCache ? `${project ?? ''}\0${text}` : '';
+  const key = useCache ? `${project ?? ''}\u0001${related.join('\u0001')}\0${text}` : '';
   if (useCache) {
     const hit = missCache.get(key);
     if (hit && Date.now() - hit.at < MISS_CACHE_TTL_MS) return hit.out;
   }
-  const out = missingPathsUncached(text, project);
+  const out = missingPathsUncached(text, project, related);
   if (useCache) {
     missCache.set(key, { at: Date.now(), out });
     if (missCache.size > MISS_CACHE_MAX) missCache.delete(missCache.keys().next().value!);
@@ -242,7 +248,7 @@ export function missingPaths(text: string, project?: string | null): string[] {
   return out;
 }
 
-function missingPathsUncached(text: string, project?: string | null): string[] {
+function missingPathsUncached(text: string, project: string | null | undefined, related: readonly string[]): string[] {
   const out = new Set<string>();
   const home = homedir();
   const strippedUrls = text.replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, ' ').replace(MOVED_FROM, ' ');
@@ -251,8 +257,9 @@ function missingPathsUncached(text: string, project?: string | null): string[] {
   const activeText = activeClauses.join('\n');
 
   // Expand ~/ and %USERPROFILE%\ (only when not inside hermetic test schemas unless HOME matches)
+  // ~/x/… only when x is in this home: ~/app/.env in a WSL or server home is not ours to check (as REL needs its first folder)
   const expanded = process.env.MEMHUB_PG_SCHEMA ? activeText : activeText
-    .replace(TILDE, (_, rel: string) => join(home, rel))
+    .replace(TILDE, (m, rel: string) => (existsSync(join(home, rel.split(/[\\/]/)[0])) ? join(home, rel) : m))
     .replace(ENV_HOME, (_, rel: string) => join(home, rel));
 
   const lineCache = new Map<string, number | null>();
@@ -296,6 +303,11 @@ function missingPathsUncached(text: string, project?: string | null): string[] {
   const root = resolveExistingRoot(project);
   if (!root) return [...out];
   const sdirs = getSubdirs(root);
+  // A cross-project fact cites files of its related projects relative to their roots (src/a.ts of d:/projB in a
+  // d:/projA fact): such a path is gone only when no related root has it either. Only ever clears a flag, never adds one.
+  const relRoots = related.map(resolveExistingRoot).filter((r) => r && r.toLowerCase() !== root.toLowerCase());
+  const inRelated = (m: string) => relRoots.some((r) => [r, ...getSubdirs(r)].some((d) => existsSync(join(d, m))));
+  const gone = (m: string) => { if (!inRelated(m)) out.add(m); };
 
   for (const raw of activeText.match(REL) ?? []) {
     if (PLACEHOLDER.test(raw)) continue;
@@ -306,13 +318,13 @@ function missingPathsUncached(text: string, project?: string | null): string[] {
     if (base.length) {
       const existingBase = base.find((d) => existsSync(join(d, m)));
       if (!existingBase) {
-        if (!onOtherGitBranch(root, m)) out.add(m);
+        if (!onOtherGitBranch(root, m)) gone(m);
       } else if (maxLine !== null) {
         const total = fileLineCount(join(existingBase, m));
         if (total !== null && maxLine > total) out.add(`${m}:${span} (EOF=${total})`);
       }
     } else if ((KNOWN_REPO_DIRS.has(firstLow) || (ARTIFACT_DIRS.has(firstLow) && ARTIFACT_EXT.test(m))) && !onOtherGitBranch(root, m)) {
-      out.add(m);
+      gone(m);
     }
   }
 
@@ -329,14 +341,15 @@ function missingPathsUncached(text: string, project?: string | null): string[] {
   // Explicit deleted sub-folder reference like `app/` or `dist/`
   for (const dm of activeText.matchAll(/(?:`|"|'|\s|\()((?:app|dist|frontend|backend|server|console|engine)\/)(?=`|"|'|\s|\)|,|$)/g)) {
     const dirName = dm[1].slice(0, -1);
-    if (![root, ...sdirs].some((d) => existsSync(join(d, dirName))) && !onOtherGitBranch(root, dirName)) out.add(dm[1]);
+    if (![root, ...sdirs].some((d) => existsSync(join(d, dirName))) && !onOtherGitBranch(root, dirName) && !inRelated(dirName)) out.add(dm[1]);
   }
 
   // Standalone project .exe artifact (e.g. BotTread.exe) that no longer exists anywhere in the project
   for (const em of activeText.matchAll(/(?:`([\w-]{3,}\.exe)`|\b([A-Z][\w-]{2,}\.exe)\b)/g)) {
     const exe = em[1] ?? em[2], exeLow = exe.toLowerCase();
     if (SYSTEM_EXES.has(exeLow) || PLACEHOLDER.test(exe)) continue;
-    if (!hasExeInProject(root, exeLow)) out.add(exe);
+    if (inExistingAbsPath(activeText, em.index! + em[0].indexOf(exe) + exe.length)) continue;
+    if (!hasExeInProject(root, exeLow) && !relRoots.some((r) => hasExeInProject(r, exeLow))) out.add(exe);
   }
 
   // Windows desktop GUI launch instructions (WinSta0\Default) when the project no longer has any desktop GUI app/executable
@@ -356,7 +369,7 @@ export async function accuracyFlags(db: pg.Pool, hide: string[]): Promise<Accura
     const needDisk = f.turns !== 1 || /^# [^\n]*\n# /.test(f.text) || f.text.includes('[REDACTED:') || f.text.includes('[PRIVATE]');
     const body = needDisk && f.path && existsSync(f.path)
       ? claim(readFileSync(f.path, 'utf8').replace(/^---\n[\s\S]*?\n---\n?/, '')) : claim(f.text);
-    const miss = missingPaths(body, f.canon || f.project);
+    const miss = missingPaths(body, f.canon || f.project, f.related);
     return miss.length ? [{ fid: f.fid, path: f.path, paths: miss }] : [];
   });
   return { pairs: conflictPairs(rows).map((x) => ({ ...x, apath: paths.get(x.a) ?? '', bpath: paths.get(x.b) ?? '' })), stale };

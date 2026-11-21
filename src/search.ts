@@ -520,7 +520,7 @@ export async function search(db: pg.Pool, query: string, o: SearchOpts = {}): Pr
   if (!asOf && o.tier !== 0) {
     for (const r of rows) {
       if (r.fid && r.kind !== 'card' && (r.status ?? 'active') === 'active') {
-        const miss = missingPaths(claim(String(r.text ?? '').replace(/^D: /, '')), r.fact_project);
+        const miss = missingPaths(claim(String(r.text ?? '').replace(/^D: /, '')), r.fact_project, r.related_projects ?? []);
         if (miss.length || r.db_stale) {
           if (!r.db_stale) r.score = Number(r.score) * RANK.stale;
           r.db_stale = true;

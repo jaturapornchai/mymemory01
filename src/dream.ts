@@ -716,7 +716,9 @@ export async function consolidate(db: pg.Pool, now = new Date()) {
   await writeHubs(db);
 }
 
-/** A pending note ลุงจืด set to active = accept: apply target's status/invalid_at + inherit rule/decision kind + clear stale review_target. */
+/** A pending note ลุงจืด set to active = accept: apply target's status/invalid_at + inherit rule/decision kind + clear stale review_target.
+ *  A `review_op: retire` proposal (the stale review: what the note is about is gone) retires the target and is used up itself,
+ *  so nothing new becomes current. His approval may change a note he edited by hand (status only, never his text). */
 async function applyApprovals(db: pg.Pool, now: Date) {
   const rows = (await db.query(
     `SELECT f.fid, f.kind, f.valid_at, f.review_target, coalesce(s.status, 'active') status, s.path,
@@ -728,9 +730,15 @@ async function applyApprovals(db: pg.Pool, now: Date) {
   let changed = 0;
   for (const r of rows) {
     const rel = (p: string) => p.replace(/\\/g, '/').slice(vault.length + 1);
+    const retire = r.status === 'active' && existsSync(r.path) && parseNote(readFileSync(r.path, 'utf8')).fm.review_op === 'retire';
     if (r.status === 'active' && r.tpath && r.tstatus !== 'superseded') {
-      const invAt = r.valid_at ? new Date(r.valid_at).toISOString() : now.toISOString();
-      if (writeNote(rel(r.tpath), { status: 'superseded', superseded_by: r.fid, expired_at: now.toISOString(), invalid_at: invAt, review_target: '' }) !== 'kept-user-edit') changed++;
+      const invAt = !retire && r.valid_at ? new Date(r.valid_at).toISOString() : now.toISOString();
+      if (writeNote(rel(r.tpath), { status: 'superseded', ...(retire ? {} : { superseded_by: r.fid }), expired_at: now.toISOString(), invalid_at: invAt,
+        review_target: '' }, undefined, { approved: true }) !== 'kept-user-edit') changed++;
+    }
+    if (retire) {
+      if (writeNote(rel(r.path), { status: 'superseded', expired_at: now.toISOString(), invalid_at: now.toISOString(), review_target: '' }) === 'written') changed++;
+      continue;
     }
     const kind = r.status === 'active' ? inheritKind(r.kind, [r.tkind]) : r.kind;
     if (writeNote(rel(r.path), { ...(kind !== r.kind ? { kind } : {}), review_target: '' }) === 'written') changed++;
@@ -921,7 +929,7 @@ export async function hubDocs(db: pg.Pool): Promise<HubDoc[]> {
   };
   docs.push({ rel: 'hubs/_review.md', fm: { memhub: 'hub', tags: ['memhub/review'] }, body:
     `# Review queue\n\nDream proposals that touch your own notes or assistant-only claims. Open one and set **status**:\n` +
-    `- \`active\` = accept (the target gets superseded tonight)\n- \`rejected\` = reject (never proposed again)\n\n` +
+    `- \`active\` = accept (the target gets superseded tonight; a "เสนอเลิกใช้" proposal retires it, nothing replaces it)\n- \`rejected\` = reject (never proposed again)\n\n` +
     (pending.length ? pending.map((r) => `- [[${rel(r.path)}]] vs [[${fidRel.get(r.review_target) ?? r.review_target}]]`).join('\n') : '- (empty)') + '\n' +
     (conflicts.length ? `\n## CONFLICT: ขัดกันเอง\nสองข้อนี้ยัง active ทั้งคู่ แต่ข้อหนึ่งบอกว่าไม่เกี่ยว/ห้าม/เลิกใช้ชื่อนี้ อีกข้อใช้ชื่อนี้อยู่. ` +
       `แก้ข้อที่ผิด (memory_save replaces:[fid]) หรือตั้ง status \`rejected\`\n\n` +

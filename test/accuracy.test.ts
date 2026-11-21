@@ -106,6 +106,42 @@ test('missingPaths: an absolute path gone, a relative one under the project root
   assert.deepEqual(missingPaths('backup docs/x.exe.bak-1-r2', normProject(tmp)), []);
 });
 
+test('missingPaths: a relative path that lives in a related project (cross-project fact) is not STALE', () => {
+  const main = join(tmp, 'relmain'), other = join(tmp, 'relother');
+  mkdirSync(join(main, 'src'), { recursive: true });
+  mkdirSync(join(other, 'src'), { recursive: true });
+  mkdirSync(join(other, 'backend'), { recursive: true });
+  writeFileSync(join(other, 'src', 'mcp.ts'), '');
+  const text = 'see src/mcp.ts and src/gone.ts, the `backend/` folder';
+  assert.deepEqual(missingPaths(text, normProject(main)).sort(), ['backend/', 'src/gone.ts', 'src/mcp.ts']);
+  assert.deepEqual(missingPaths(text, normProject(main), [normProject(other)]), ['src/gone.ts']);
+});
+
+test('missingPaths: ~/ is checked only when its first folder exists in this home (a WSL/server home like ~/wslonly is not ours)', () => {
+  const home = join(tmp, 'home'), saved = { s: process.env.MEMHUB_PG_SCHEMA, u: process.env.USERPROFILE, h: process.env.HOME };
+  mkdirSync(join(home, '.cfg'), { recursive: true });
+  writeFileSync(join(home, '.cfg', 'a.json'), '');
+  delete process.env.MEMHUB_PG_SCHEMA; // the hermetic test schema turns ~ expansion off
+  process.env.USERPROFILE = process.env.HOME = home;
+  try {
+    const got = missingPaths('see ~/.cfg/a.json, ~/.cfg/gone.json and the WSL file ~/wslonly/hotfix/x.ts', normProject(tmp));
+    assert.equal(got.length, 1, String(got));
+    assert.ok(got[0].endsWith('gone.json'), String(got));
+  } finally {
+    process.env.MEMHUB_PG_SCHEMA = saved.s;
+    if (saved.u === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.u;
+    if (saved.h === undefined) delete process.env.HOME; else process.env.HOME = saved.h;
+  }
+});
+
+test('missingPaths: an exe at the end of an existing absolute path with spaces is not STALE; a lone gone exe is', () => {
+  const proj = join(tmp, 'exeproj'), bin = join(tmp, 'Prog Files', 'App 4', 'bin');
+  mkdirSync(proj, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'MyApp4.exe'), '');
+  assert.deepEqual(missingPaths(`run ${join(bin, 'MyApp4.exe')} --x, not GoneApp.exe`, normProject(proj)), ['GoneApp.exe']);
+});
+
 test('SessionStart: the identity fact is line 1 (not one of the 5 rules), then the BC/CHAMP warning; the wrong rule carries its flags', async () => {
   const lines = (await sessionStart()).split('\n');
   assert.match(lines[0], new RegExp(`^\\[memory-hub\\] ตัวตนโปรเจกต์นี้ \\[${ID}\\]: acctest: โปรเจกต์`));

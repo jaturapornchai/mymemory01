@@ -87,14 +87,19 @@ export type WriteResult = 'written' | 'unchanged' | 'kept-user-edit';
 
 /**
  * Create or update a machine note. `body` undefined = metadata-only update (keeps the existing body).
- * Existing keys not in `meta` are preserved; an edited file is never touched.
+ * Existing keys not in `meta` are preserved; an edited file is never touched, except `approved`: he accepted a review
+ * proposal that retires/replaces it, so a metadata-only update changes its status but never his text (it stays his edit).
  */
-export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
+export function writeNote(rel: string, meta: Fm, body?: string, opts: { approved?: boolean } = {}): WriteResult {
   const path = join(MEMORY_VAULT, rel);
   let fm: Fm = {}, cur: string | undefined;
   if (existsSync(path)) {
     const old = parseNote(readFileSync(path, 'utf8'));
-    if (isEdited(old.fm, old.body)) return 'kept-user-edit';
+    if (isEdited(old.fm, old.body)) {
+      if (!opts.approved || body !== undefined) return 'kept-user-edit';
+      const safeMeta = Object.fromEntries(Object.entries(meta).map(([k, v]) => [k, Array.isArray(v) ? v.map(vaultSafe) : vaultSafe(v)]));
+      return putNote(rel, path, renderNote({ ...old.fm, ...safeMeta }, old.body)); // his body_sha kept: still his edit
+    }
     fm = old.fm;
     cur = old.body;
   }
@@ -105,7 +110,11 @@ export function writeNote(rel: string, meta: Fm, body?: string): WriteResult {
   const retag: Fm = meta.kind && meta.kind !== fm.kind && !meta.tags && tags.includes(from) ? { tags: tags.map((t) => (t === from ? `memhub/${fmStr(meta.kind)}` : t)) } : {};
   const safeFm = Object.fromEntries(Object.entries({ ...fm, ...retag, ...meta }).map(([k, v]) => [k, Array.isArray(v) ? v.map(vaultSafe) : vaultSafe(v)]));
   const next = renderNote({ ...safeFm, body_sha: sha(nextBody) }, nextBody);
-  if (cur !== undefined && existsSync(path) && readFileSync(path, 'utf8').replace(/\r\n/g, '\n') === next) return 'unchanged';
+  return putNote(rel, path, next);
+}
+
+function putNote(rel: string, path: string, next: string): WriteResult {
+  if (existsSync(path) && readFileSync(path, 'utf8').replace(/\r\n/g, '\n') === next) return 'unchanged';
   beforeMachineWrite(MEMORY_VAULT, rel); // git history: ลุงจืด's pending edits get their own commit before the batch's first write
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;

@@ -196,7 +196,8 @@ async function main() {
       else st.superseded++;
       if (conflictCountByFid.has(n.fid)) st.conflicts += conflictCountByFid.get(n.fid)!;
       if (status === 'active') {
-        const miss = missingPaths(`${n.title}\n${n.coreText}`, n.fm.project ? String(n.fm.project) : null);
+        const miss = missingPaths(`${n.title}\n${n.coreText}`, n.fm.project ? String(n.fm.project) : null,
+          Array.isArray(n.fm.related_projects) ? n.fm.related_projects.map(String) : []);
         if (miss.length) st.stale++;
       }
     }

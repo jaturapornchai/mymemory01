@@ -79,6 +79,7 @@ const VALUE_CASES: [string, string][] = [
   ['HOST = "192.0.2.10" USER = "root" PASS = "' + 'Mn8&cX4zP"', 'Mn8&cX4zP'], // pragma: allowlist secret
   ['MinIO accesskey=`' + 'ak-demo7x`', 'ak-demo7x'], // pragma: allowlist secret
   ['ClickHouse `h:8123` user `admin` pass `' + 'Pq7xLm2w` ok', 'Pq7xLm2w'], // pragma: allowlist secret
+  ['- **Target:** `192.0.2.10:5433` · user `postgres` · pass `' + 'Rt5demoPg` · db `x`', 'Rt5demoPg'], // pragma: allowlist secret
   ['- Secret key: `' + 'Zx9-demo-Key4`', 'Zx9-demo-Key4'], // pragma: allowlist secret
   ['| S3 Secret Key | `' + 'Fk3-demo-Sec8` |', 'Fk3-demo-Sec8'], // pragma: allowlist secret
   ["caddy hash-password --plaintext '" + "Hw4!demoPw')", 'Hw4!demoPw'], // pragma: allowlist secret

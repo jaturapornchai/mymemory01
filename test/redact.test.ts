@@ -29,6 +29,7 @@ const SECRETS: [string, string][] = [
   ['ollama', '67117a0b1c2d3e4f5a6b7c8d9e0f1a2b.' + 'Zx9QwErTyUiOpAsD'], // z.ai GLM: 16 after the dot. pragma: allowlist secret
   ['sk', 'sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a6978'], // ElevenLabs. pragma: allowlist secret
   ['sk', 'mcp_sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f0'], // pragma: allowlist secret
+  ['sk', 'Sk_' + '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a6978'], // typed on a phone: the keyboard capitalised it. pragma: allowlist secret
   ['pem', '-----BEGIN PGP PRIVATE' + ' KEY BLOCK-----\nlQOYBF/abc+def/ghi0123\n-----END PGP PRIVATE KEY BLOCK-----'], // pragma: allowlist secret
 ];
 
@@ -164,6 +165,39 @@ for (const s of KEEP) {
     assert.equal(redact(s).text, s);
   });
 }
+
+// built at runtime: a literal public IPv4 (or a four-part menu code) in this file would trip the secret-scan hook on the repo's own commit
+const ip4 = (...o: number[]) => o.join('.');
+
+test('public IPv4: a server address is masked wherever it stands, and counted', () => {
+  const a = ip4(45, 76, 12, 200), b = ip4(159, 65, 3, 41);
+  const r = redact(`ssh root@${a} "docker ps" แล้ว curl http://${b}:8123/ping · IP: ${a} (VPS) · เซิร์ฟเวอร์ \`${b}\` · ย้ายไปที่ ${a}.`);
+  assert.equal(r.text, 'ssh root@x.x.x.x "docker ps" แล้ว curl http://x.x.x.x:8123/ping · IP: x.x.x.x (VPS) · เซิร์ฟเวอร์ `x.x.x.x` · ย้ายไปที่ x.x.x.x.');
+  assert.equal(r.hits.ip, 5);
+  assert.equal(redact(r.text).text, r.text);
+  for (const edge of [ip4(172, 15, 0, 1), ip4(172, 32, 0, 1), ip4(100, 128, 0, 1), ip4(11, 0, 0, 40)]) assert.equal(redact(`host ${edge} ok`).text, 'host x.x.x.x ok', edge);
+});
+
+test('public IPv4: four small numbers after a login, in a URL or before a port are a host too', () => {
+  const small = ip4(3, 1, 20, 5);
+  assert.equal(redact(`scp a.tar root@${small}:/opt`).text, 'scp a.tar root@x.x.x.x:/opt');
+  assert.equal(redact(`http://${small}/health`).text, 'http://x.x.x.x/health');
+  assert.equal(redact(`Postgres ${small}:5432`).text, 'Postgres x.x.x.x:5432');
+});
+
+test('IPv4 kept: private, loopback, link-local, CGNAT, documentation ranges, public resolvers', () => {
+  for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.1.50', '172.16.0.1', '172.31.255.254', '169.254.10.1', '100.64.0.9', '203.0.113.7', '8.8.8.8', '0.0.0.0', '255.255.255.0']) {
+    const s = `ssh root@${ip} แล้วเปิด http://${ip}:5432/ · host ${ip}.`;
+    assert.equal(redact(s).text, s);
+  }
+});
+
+test('IPv4-shaped but not a host: menu codes, versions and user agents stay', () => {
+  for (const s of [`เมนู ${ip4(7, 10, 1, 1)} menu_chq_in`, `\`${ip4(1, 11, 1, 12)}\`–\`${ip4(2, 1, 26, 1)}\` (ฝากเช็ค)`, `Chrome/${ip4(134, 0, 0, 0)} Safari/537.36`,
+    `--version "${ip4(1, 0, 0, 0)}"`, `ClickHouse version ${ip4(24, 8, 14, 39)} (official build)`, `Linux ${ip4(6, 6, 87, 1)}-microsoft-standard-WSL2`,
+    `หัวข้อ ${ip4(3, 2, 45, 6)}.7`, `v${ip4(1, 2, 3, 45)}`, `opencv-python==${ip4(4, 8, 1, 78)}`])
+    assert.equal(redact(s).text, s);
+});
 
 test('offsite: short / low-entropy key shapes the import rules let through never leave the machine', () => {
   const r = (n: number, a = 'abcdef0123456789') => Array.from({ length: n }, (_, i) => a[(i * 7 + 3) % a.length]).join('');

@@ -19,8 +19,9 @@ process.env.MEMORY_HUB_INTERNAL = '1';
 process.env.MEMHUB_DREAM_LIMIT = '25';
 const { connect, ROOT } = await import('../src/db.ts');
 const { indexFile, indexToolFile } = await import('../src/importer.ts');
-const { dream, consolidate, deepseekRunner, ollamaRunner, filesRunner, buildDigests, renderBatch, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, DREAM_LIMIT } = await import('../src/dream.ts');
+const { dream, consolidate, deepseekRunner, ollamaRunner, filesRunner, buildDigests, renderBatch, packBatches, deepseekPeak, repairSession, repairOp, SchemaA, SchemaB, SchemaC, contradicted, DREAM_LIMIT } = await import('../src/dream.ts');
 const { rebuildSynapses } = await import('../src/synapse.ts');
+const { EMBED_MODEL } = await import('../src/embed.ts');
 const { parseNote, saveNote, writeNote, inheritKind, fileName, sha, MEMORY_VAULT, MEMORY_PROJECT } = await import('../src/notes.ts');
 const { indexVault } = await import('../src/obsidian.ts');
 const { backfill } = await import('../src/embed.ts');
@@ -44,10 +45,13 @@ function session(id: string, day: string, said: string[], append = false) {
   return path;
 }
 
-/** Fake Claude. Pass A: every user line "FACT: x" → a fact citing that turn (+ one bogus T id). Pass B: marker words pick the op. */
+/** Fake Claude. Pass A: every user line "FACT: x" → a fact citing that turn (+ one bogus T id). Pass B: marker words pick the op.
+ *  The contradiction pass (C-): an older fact that pairs LONG with SHORT is stale; it also names an id it was never shown. */
 const calls: string[] = [];
 async function fake(req: LlmReq): Promise<unknown> {
   calls.push(req.id);
+  if (req.id.startsWith('C-')) return { ops: req.user.split(/\n\n/).map((blk) => ({ n: blk.match(/^(N\d+)/)![1],
+    stale: [...[...blk.matchAll(/^\s+(E\d+).*LONG คู่กับ/gm)].map((m) => m[1]), 'E99'], why: 'test' })) };
   if (req.id.startsWith('A-')) {
     const sessions = req.user.split(/^=== /m).slice(1).map((blk) => {
       const s = blk.match(/^(S\d+)/)![1];
@@ -512,9 +516,15 @@ test('default cap: a backlog goes DREAM_LIMIT sessions per run, newest first; ju
   assert.equal(r.status, 'done');
   const done = (await db.query(`SELECT k FROM state WHERE v->>'run' = 'cap' ORDER BY k`)).rows.map((x) => x.k.slice(14));
   assert.deepEqual(done, ids.slice(3)); // the newest DREAM_LIMIT
-  await run('cap-2');
-  const rest = await db.query(`SELECT count(*)::int n FROM state WHERE k = ANY($1) AND v->>'run' = 'cap-2'`, [ids.slice(0, 3).map((x) => `dream:session:${x}`)]);
-  assert.equal(rest.rows[0].n, 3); // the next run picks up the remainder
+  // the session dream starts the same run id again after `done` (prompts/session-dream.md step 4): a new plan with the remainder
+  r = await go();
+  assert.equal(r.status, 'pending');
+  assert.equal(r.stats.sessions, 3);
+  for (let i = 0; r.status === 'pending' && i < 8; i++) { await answerAll(dir); r = await go(); }
+  assert.equal(r.status, 'done');
+  const rest = await db.query(`SELECT count(*)::int n FROM state WHERE k = ANY($1) AND v->>'run' = 'cap'`, [ids.slice(0, 3).map((x) => `dream:session:${x}`)]);
+  assert.equal(rest.rows[0].n, 3);
+  assert.equal((await go()).status, 'done'); // nothing left: no new plan, no request
 });
 
 test('a session the model returns no card for is retried next run, and its later windows do not jump over it', async () => {
@@ -838,4 +848,94 @@ test('review queue: an accepted proposal over a note he edited by hand supersede
   const n = parseNote(readFileSync(path, 'utf8'));
   assert.match(n.body, /deploy \(his words\) from d:\/old\/app/);
   assert.notEqual(n.fm.body_sha, sha(n.body), 'still counts as his edit');
+});
+
+// ---- contradiction pass: his newer words against the older AI-only facts near them ----
+// cos to vec(0): 0.5 → 0.89, 1.2 → 0.64; another `at` = another plane, cos 0 to the vectors of the test before
+const vec = (x: number, at = 0) => `[${Array.from({ length: 1024 }, (_, i) => (i === at ? 1 : i === at + 1 ? x : 0)).join(',')}]`;
+// model_ver = the embed model: the dream's own backfill then leaves these vectors alone, embedder reachable or not
+const setVec = (fids: string[], x: number, at = 0) =>
+  db.query(`UPDATE chunks c SET embedding = $2::halfvec, model_ver = $3 FROM facts f WHERE f.source_id = c.source_id AND f.fid = ANY($1)`, [fids, vec(x, at), EMBED_MODEL]);
+/** A note the dream wrote from an assistant turn: AI-only (the turn it cites is no turn of his). */
+const aiFact = (fid: string, name: string, text: string, fm: Record<string, string> = {}) =>
+  writeNote(`facts/demo/${fid} ${name}.md`, { memhub: 'fact', id: fid, kind: 'fact', scope: 'project', project: 'd:/demo', status: 'active', run: 'contra-old',
+    valid_at: '2026-09-01T00:00:00.000Z', created_at: '2026-09-01T00:00:00.000Z', source_uuids: [`${fid}-assistant-turn`], ...fm }, `${text}\n`);
+const saved = (text: string, at: string, kind = 'decision') => {
+  const rel = saveNote(text, { project: 'd:/demo', kind, now: new Date(at), reindex: false, commit: false });
+  return String(parseNote(readFileSync(join(MEMORY_VAULT, rel), 'utf8')).fm.id);
+};
+const contraFrom = (iso: string) => db.query(`INSERT INTO state (k, v) VALUES ('dream:contra', jsonb_build_object('upto', $1::text))
+  ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [iso]);
+
+test('contradiction pass: his newer words retire the older AI-only facts they contradict; nothing else is asked or touched', async () => {
+  await contraFrom('2026-09-25T06:00:00.000Z'); // the notes of the tests above are not this test's business
+  const nFid = saved('contratest: บอทเล่น SHORT อย่างเดียว ไม่มีขา LONG', '2026-09-25T12:00:00Z');
+  aiFact('Fc0a7a001', 'contratest pair', 'contratest: บอทเปิด LONG คู่กับ SHORT ทุกไม้');
+  aiFact('Fc0a7a002', 'contratest record', 'contratest: backtest ขา LONG ขาดทุนช่วงทดสอบ'); // near, a record of what happened: asked, kept
+  aiFact('Fc0a7a003', 'contratest far', 'contratest: บอทเปิด LONG คู่กับ SHORT ในบัญชีทดลอง'); // below the floor
+  aiFact('Fc0a7a004', 'contratest newer', 'contratest: บอทเปิด LONG คู่กับ SHORT รอบใหม่', { valid_at: '2026-09-25T18:00:00.000Z' }); // newer than his words
+  aiFact('Fc0a7a005', 'contratest other', 'contratest: บอทเปิด LONG คู่กับ SHORT อีกโปรเจกต์', { project: 'd:/other' });
+  aiFact('Fc0a7a006', 'contratest pinned', 'contratest: บอทเปิด LONG คู่กับ SHORT ที่ปักหมุด', { pinned: 'true' });
+  aiFact('Fc0a7a007', 'contratest edited', 'contratest: บอทเปิด LONG คู่กับ SHORT ที่เขาแก้');
+  const edited = join(MEMORY_VAULT, 'facts/demo/Fc0a7a007 contratest edited.md');
+  writeFileSync(edited, readFileSync(edited, 'utf8').replace('ที่เขาแก้', 'ที่เขาแก้เอง'));
+  const hisOld = saved('contratest: บอทเปิด LONG คู่กับ SHORT ตามที่สั่งไว้เดิม', '2026-09-02T00:00:00Z'); // his own older words: not AI-only
+  await indexVault(db, MEMORY_VAULT);
+  await setVec([nFid], 0);
+  await setVec(['Fc0a7a001', 'Fc0a7a002', 'Fc0a7a004', 'Fc0a7a005', 'Fc0a7a006', 'Fc0a7a007', hisOld], 0.5);
+  await setVec(['Fc0a7a003'], 1.2);
+
+  const asked: LlmReq[] = [];
+  const llm = async (req: LlmReq) => { asked.push(req); return fake(req); };
+  const to = new Date('2026-09-26T00:00:00Z');
+  const r = await contradicted(db, { llm, to, now: to });
+  assert.deepEqual(r.pending, []);
+  assert.equal(asked.length, 1);
+  assert.match(asked[0].id, /^C-/);
+  assert.match(asked[0].user, /^N1 \[decision, demo, valid 2026-09-25\]: contratest: บอทเล่น SHORT อย่างเดียว ไม่มีขา LONG\n  E\d \[fact, valid 2026-09-01\]: contratest: /);
+  for (const w of ['ทุกไม้', 'ช่วงทดสอบ']) assert.ok(asked[0].user.includes(w), `asked about: ${w}`);
+  for (const w of ['บัญชีทดลอง', 'รอบใหม่', 'อีกโปรเจกต์', 'ที่ปักหมุด', 'ที่เขาแก้', 'ตามที่สั่งไว้เดิม']) assert.ok(!asked[0].user.includes(w), `never asked about: ${w}`);
+  assert.deepEqual(r.retired, [{ n: nFid, e: 'Fc0a7a001', why: 'test' }], 'the id it was never shown (E99) is ignored');
+  const gone = (await db.query(`SELECT s.status, f.superseded_by, f.invalid_at FROM facts f JOIN sources s ON s.id = f.source_id WHERE f.fid = 'Fc0a7a001'`)).rows[0];
+  assert.deepEqual([gone.status, gone.superseded_by, gone.invalid_at.toISOString()], ['superseded', nFid, '2026-09-25T12:00:00.000Z']);
+  for (const fid of ['Fc0a7a002', 'Fc0a7a003', 'Fc0a7a004', 'Fc0a7a005', 'Fc0a7a006', 'Fc0a7a007', hisOld, nFid])
+    assert.equal((await statusOf(fid)).status, 'active', fid);
+  assert.match(SchemaC.safeParse({ ops: [{ n: 'N1', stale: ['F1'] }] }).error!.issues[0].path.join('.'), /stale/);
+
+  // a later run starts after the newest fact it judged: nothing new, no question
+  const again = await contradicted(db, { llm, to: new Date('2026-09-26T01:00:00Z'), now: to });
+  assert.deepEqual([asked.length, again.retired, again.pending], [1, [], []]);
+});
+
+test('contradiction pass: a files-runner dream asks it after the last batch; the rerun applies the answer and leaves later notes to the next run', async () => {
+  await contraFrom('2026-09-26T06:00:00.000Z');
+  const nFid = saved('contrarun: กฎใหม่ให้เล่น SHORT อย่างเดียว', '2026-09-26T12:00:00Z', 'rule');
+  aiFact('Fc0a7b001', 'contrarun pair', 'contrarun: กฎคือเปิด LONG คู่กับ SHORT', { kind: 'rule' }); // a rule the dream recorded yields to his newer words
+  aiFact('Fc0a7b002', 'contrarun hedge', 'contrarun: ทุกไม้ต้องมี LONG คู่กับ SHORT เพื่อกันความเสี่ยง');
+  await indexVault(db, MEMORY_VAULT);
+  await setVec([nFid], 0, 2); // plane 2: the notes the test above left active are not near
+  await setVec(['Fc0a7b001'], 0.5, 2);
+  await setVec(['Fc0a7b002'], 1.2, 2); // far from the rule
+  await indexFile(db, session('contrarun-1', '2026-09-26', ['FACT: contrarun ใช้พอร์ต 5999 สำหรับทดสอบ']));
+  const dir = join(tmp, 'contrarun');
+  const go = (now: string) => dream(db, { llm: filesRunner(dir), run: 'contrarun', force: true, now: new Date(now), log: () => {} });
+  let r = await go('2026-09-27T00:00:00Z');
+  for (let i = 0; i < 6 && r.status === 'pending' && !r.pending!.some((p) => p.startsWith('C-')); i++) { await answerAll(dir); r = await go('2026-09-27T00:00:00Z'); }
+  assert.equal(r.status, 'pending');
+  assert.equal(r.pending!.length, 1, 'every batch is promoted, then one question');
+  assert.equal((await statusOf('Fc0a7b001')).status, 'active', 'asked, not answered yet');
+  // he saves another note while the question waits: the pass is frozen with the plan, so the rerun asks nothing new
+  const later = saved('contrarun: ไม่ต้องกันความเสี่ยงด้วยขา LONG แล้ว', '2026-09-27T00:30:00Z');
+  await indexVault(db, MEMORY_VAULT);
+  await setVec([later], 1.2, 2); // the same vector as Fc0a7b002
+  await answerAll(dir);
+  r = await go('2026-09-27T01:00:00Z');
+  assert.equal(r.status, 'done');
+  assert.equal(r.stats.RETIRE, 1, JSON.stringify(r.stats));
+  assert.deepEqual(await statusOf('Fc0a7b001'), { status: 'superseded', superseded_by: nFid, review_target: null });
+  assert.equal((await statusOf('Fc0a7b002')).status, 'active');
+  const rec = readFileSync(join(process.env.MEMHUB_DREAM_RUNS!, 'contrarun.json'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
+  assert.deepEqual(rec.retired, [{ n: nFid, e: 'Fc0a7b001', why: 'test' }]);
+  const next = await contradicted(db, { llm: fake, to: new Date('2026-09-27T02:00:00Z') });
+  assert.deepEqual(next.retired, [{ n: later, e: 'Fc0a7b002', why: 'test' }], 'the note saved meanwhile is judged by the next run, not skipped');
 });

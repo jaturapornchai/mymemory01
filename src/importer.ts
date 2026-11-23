@@ -357,7 +357,7 @@ export const clean = (t: string, personal = false) => { // PG text can't hold NU
 
 /** A new redact rule never cleans rows indexed before it (memory_search returns stored text as is). redact.ts changed →
  *  every source whose stored text the current rules would still change gets size -1, so this sync's index pass re-imports it
- *  from the raw archive. ponytail: file hash (a comment edit rescans too), known list included; a relaxed rule's old markers stay: import --force. */
+ *  from the raw archive. Code chunks and the search log have no raw file: recleanInPlace. ponytail: file hash (a comment edit rescans too), known list included; a relaxed rule's old markers stay: import --force. */
 export async function requeueUnredacted(db: pg.Pool): Promise<number | 'unchanged'> {
   const ver = REDACT_VER;
   if ((await db.query(`SELECT v->>'ver' v FROM state WHERE k = 'redact'`)).rows[0]?.v === ver) return 'unchanged';
@@ -371,9 +371,36 @@ export async function requeueUnredacted(db: pg.Pool): Promise<number | 'unchange
     }
   }
   if (dirty.size) await db.query(`UPDATE sources SET size = -1, sha256 = '' WHERE id = ANY($1::bigint[])`, [[...dirty]]);
-  await db.query(`INSERT INTO state (k, v) VALUES ('redact', jsonb_build_object('ver', $1::text, 'requeued', $2::int, 'at', now()))
-    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [ver, dirty.size]);
+  const rewritten = await recleanInPlace(db);
+  await db.query(`INSERT INTO state (k, v) VALUES ('redact', jsonb_build_object('ver', $1::text, 'requeued', $2::int, 'rewritten', $3::int, 'at', now()))
+    ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [ver, dirty.size, rewritten]);
   return dirty.size;
+}
+
+/** Stored text with no raw file to re-import from (a code chunk hangs on a git blob, the search log on nothing): the current
+ *  rules rewrite the rows they would still change, in place. */
+async function recleanInPlace(db: pg.Pool): Promise<number> {
+  const PAGE = 5000;
+  let n = 0;
+  for (let blob = '', line0 = -1; ;) {
+    const { rows } = await db.query('SELECT blob, line0, text FROM code_chunks WHERE (blob, line0) > ($1, $2) ORDER BY blob, line0 LIMIT $3', [blob, line0, PAGE]);
+    const d = rows.map((r) => ({ ...r, next: redact(r.text).text })).filter((r) => r.next !== r.text);
+    if (d.length) await db.query(`UPDATE code_chunks c SET text = v.t, words = v.w::tsvector
+      FROM unnest($1::text[], $2::int[], $3::text[], $4::text[]) v(b, l, t, w) WHERE c.blob = v.b AND c.line0 = v.l`,
+      [d.map((r) => r.blob), d.map((r) => r.line0), d.map((r) => r.next), d.map((r) => toTsvector(words(r.next)))]);
+    n += d.length;
+    if (rows.length < PAGE) break;
+    ({ blob, line0 } = rows.at(-1));
+  }
+  for (let after = '0'; ;) {
+    const { rows } = await db.query('SELECT id, query FROM access_log WHERE id > $1 AND query IS NOT NULL ORDER BY id LIMIT $2', [after, PAGE]);
+    const d = rows.map((r) => ({ id: r.id, next: redact(r.query).text, was: r.query })).filter((r) => r.next !== r.was);
+    if (d.length) await db.query('UPDATE access_log a SET query = v.q FROM unnest($1::bigint[], $2::text[]) v(id, q) WHERE a.id = v.id', [d.map((r) => r.id), d.map((r) => r.next)]);
+    n += d.length;
+    if (rows.length < PAGE) break;
+    after = rows.at(-1).id;
+  }
+  return n;
 }
 
 export type SourceMeta = {

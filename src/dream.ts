@@ -110,7 +110,7 @@ export const deepseekRunner = (model = process.env.MEMHUB_DEEPSEEK_MODEL ?? 'dee
   if (!key) throw new Error('MEMHUB_DEEPSEEK_KEY is not set (.env)');
   if (process.env.MEMHUB_ANTHROPIC_ONLY === '1') throw new Error('refusing deepseek: MEMHUB_ANTHROPIC_ONLY=1');
   // thinking is on by default (billed as output); max_tokens defaults to 8K, too small for a 12-session pass A in Thai (thinking: up to 18K seen)
-  const body = JSON.stringify({ model, thinking: { type: req.id.startsWith('A-') ? 'enabled' : 'disabled' }, temperature: 0, max_tokens: 65536,
+  const body = JSON.stringify({ model, thinking: { type: /^[AC]-/.test(req.id) ? 'enabled' : 'disabled' }, temperature: 0, max_tokens: 65536,
     response_format: { type: 'json_object' }, messages: offsiteMessages(req) });
   return offsiteJson('deepseek', 'https://api.deepseek.com/chat/completions', key, body, retryMs, (r, ms) => {
     const u = r.usage ?? {};
@@ -130,7 +130,7 @@ export const ollamaRunner = (model = process.env.MEMHUB_OLLAMA_MODEL ?? 'kimi-k3
   const key = process.env.MEMHUB_OLLAMA_KEY;
   if (!key) throw new Error('MEMHUB_OLLAMA_KEY is not set (.env)');
   if (process.env.MEMHUB_ANTHROPIC_ONLY === '1') throw new Error('refusing ollama: MEMHUB_ANTHROPIC_ONLY=1');
-  const body = JSON.stringify({ model, stream: false, think: req.id.startsWith('A-'), options: { temperature: 0, num_predict: 65536 }, messages: offsiteMessages(req) });
+  const body = JSON.stringify({ model, stream: false, think: /^[AC]-/.test(req.id), options: { temperature: 0, num_predict: 65536 }, messages: offsiteMessages(req) });
   return ollamaSlot(() => offsiteJson('ollama', 'https://ollama.com/api/chat', key, body, retryMs, (r, ms) => {
     const cached = r.prompt_eval_cached_count ?? 0;
     log(`  ${req.id}: in ${(r.prompt_eval_count ?? 0) - cached} + cache ${cached}, out ${r.eval_count ?? '?'} tokens, ${ms} ms`);
@@ -209,6 +209,9 @@ export const SchemaB = z.object({
     links: z.array(z.object({ to: z.string().regex(/^E\d+$/), rel: z.enum(['supports', 'related']) })).max(3).optional(),
     why: z.string().max(160).optional(),
   })),
+});
+export const SchemaC = z.object({
+  ops: z.array(z.object({ n: z.string().regex(/^N\d+$/), stale: z.array(z.string().regex(/^E\d+$/)).max(8), why: z.string().max(160).optional() })),
 });
 // DeepSeek's JSON mode has no schema (pilot: one over-long title dropped a whole session): clip at word/cluster boundary, drop only bad facts
 const SessionA = SchemaA.shape.sessions.element;
@@ -395,14 +398,14 @@ export type DreamStats = Record<string, number>;
 export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done' | 'pending' | 'skipped' | 'locked'; stats: DreamStats; pending?: string[] }> {
   const log = o.log ?? console.log;
   const now = o.now ?? new Date();
-  const stats: DreamStats = { sessions: 0, batches: 0, cards: 0, proposed: 0, rejected_ids: 0, dropped: 0, ADD: 0, NOOP: 0, UPDATE: 0, SUPERSEDE: 0, pending_review: 0, kept_user_edit: 0 };
+  const stats: DreamStats = { sessions: 0, batches: 0, cards: 0, proposed: 0, rejected_ids: 0, dropped: 0, ADD: 0, NOOP: 0, UPDATE: 0, SUPERSEDE: 0, RETIRE: 0, pending_review: 0, kept_user_edit: 0 };
   const lock = await db.connect();
   try {
     if (!(await lock.query(`SELECT pg_try_advisory_lock(hashtext(current_schema() || ':memhub-dream')) ok`)).rows[0].ok) return { status: 'locked', stats };
     // The plan (turn ranges + batches) is frozen per run id, so a files-runner run resumes with the same digests →
     // the same request ids, whatever ลุงจืด said in the meantime.
     const planKey = `dream:plan:${o.run}`;
-    let plan: { ranges: Range[]; batches: string[][]; at?: string; stats?: DreamStats; missed?: string[]; resultsA?: unknown[] } | undefined =
+    let plan: { ranges: Range[]; batches: string[][]; at?: string; stats?: DreamStats; missed?: string[]; resultsA?: unknown[]; contraTo?: string } | undefined =
       (await db.query('SELECT v FROM state WHERE k = $1', [planKey])).rows[0]?.v;
     let batches: Batch[];
     if (plan?.ranges) {
@@ -467,9 +470,17 @@ export async function dream(db: pg.Pool, o: DreamOpts): Promise<{ status: 'done'
       // a files runner stops at every pass-B request: kept with the plan, the run record counts the whole run, not its last invocation
       await db.query('UPDATE state SET v = $2 WHERE k = $1', [planKey, JSON.stringify({ ...plan, stats, missed: [...missed] })]);
     }
+    // Every batch is promoted: his newer words against the older AI-only notes (contradicted). Its end is frozen with the plan
+    // like the batches, so a files-runner rerun asks the same questions whatever he saved in the meantime.
+    plan = { ...plan, stats, missed: [...missed], contraTo: plan.contraTo ?? now.toISOString() };
+    await db.query('UPDATE state SET v = $2 WHERE k = $1', [planKey, JSON.stringify(plan)]);
+    const contra = await contradicted(db, { llm: o.llm, to: new Date(plan.contraTo!), now });
+    if (contra.pending.length) return { status: 'pending', stats, pending: contra.pending };
+    stats.RETIRE = contra.retired.length;
+    if (contra.retired.length) log(`dream contradictions: ${contra.retired.length} older AI-only note(s) retired`);
     await db.query(PLANS_DONE, [planKey]);
     mkdirSync(RUNS_DIR, { recursive: true });
-    appendFileSync(join(RUNS_DIR, `${o.run}.json`), JSON.stringify({ run: o.run, at: now.toISOString(), stats, batches: record }) + '\n');
+    appendFileSync(join(RUNS_DIR, `${o.run}.json`), JSON.stringify({ run: o.run, at: now.toISOString(), stats, batches: record, retired: contra.retired }) + '\n');
     await consolidate(db, now);
     return { status: 'done', stats };
   } finally {
@@ -699,6 +710,79 @@ async function promoteBatch(db: pg.Pool, o: DreamOpts, b: Batch, rawA: unknown, 
   for (const d of b.digests) if (!missed.has(d.sessionId)) await markDone(db, d.sessionId, { run: o.run, card: d.card, upto: d.upto });
   log(`dream batch: ${b.digests.length} sessions, ${cands.length} candidate facts${noCard.length ? `, ${noCard.length} without a card (retried next run)` : ''}`);
   return { sessions: b.digests.map((d) => d.sessionId), candidates: cands.map((c) => ({ n: c.n, text: c.text, kind: c.kind, uuids: c.uuids, op: ops.get(c.n)?.op, target: ops.get(c.n)?.target?.fid })) };
+}
+
+// ---------------- contradiction pass ----------------
+
+const CONTRA = { floor: 0.7, near: 5, facts: 40, chars: 1200 }; // cosine floor, older notes per fact, facts a run, chars of a note shown
+export type Retired = { n: string; e: string; why: string };
+type Pair = Record<string, any>; // one (newer fact, older note) row of the query below
+
+/** His newer words against the older AI-only facts near them: which of those does the newer fact make untrue now? Pass B judges a
+ *  dreamed fact against five neighbours and names one target, and a memory_save note is never judged at all, so a note an AI wrote
+ *  stayed current beside the decision of his that reversed it. Every fact is asked about once (the watermark `dream:contra`),
+ *  oldest first, `max` facts a run. Retired: a note the dream wrote that he neither edited nor pinned, of the same project; his
+ *  own older words are no candidates. */
+export async function contradicted(db: pg.Pool, o: { llm: Llm; to: Date; now?: Date; max?: number }): Promise<{ pending: string[]; retired: Retired[] }> {
+  const now = o.now ?? new Date();
+  const from: string | null = (await db.query(`SELECT v->>'upto' upto FROM state WHERE k = 'dream:contra'`)).rows[0]?.upto ?? null;
+  const rows: Pair[] = (await db.query(
+    `WITH v AS MATERIALIZED (SELECT f.fid, f.kind, coalesce(f.project, '') project, f.valid_at, f.created_at, f.pinned, f.edited, f.run, ${SAID('f')} said, s.path,
+        (SELECT c.embedding FROM chunks c WHERE c.source_id = s.id AND c.embedding IS NOT NULL ORDER BY c.seq_from, c.id LIMIT 1) e,
+        (SELECT t.text_redacted FROM turns t WHERE t.source_id = s.id ORDER BY t.seq LIMIT 1) body
+      FROM facts f JOIN sources s ON s.id = f.source_id WHERE coalesce(s.status, 'active') = 'active' AND f.kind NOT IN ('card', 'insight')),
+    p AS (SELECT n.fid n, n.kind nkind, n.project, n.valid_at nvalid, n.created_at ncreated, n.body nbody, o.fid e, o.kind ekind, o.valid_at evalid, o.body ebody, o.path epath,
+        row_number() OVER (PARTITION BY n.fid ORDER BY n.e <=> o.e, o.fid) k
+      FROM v n JOIN v o ON o.project = n.project AND o.valid_at < n.valid_at AND NOT o.said AND NOT o.pinned AND NOT o.edited AND o.run IS NOT NULL
+      WHERE n.said AND n.created_at <= $2 AND ($1::timestamptz IS NULL OR n.created_at > $1::timestamptz) AND n.e <=> o.e <= $3)
+    SELECT * FROM p WHERE k <= $4 ORDER BY ncreated, n, k`, [from, o.to, 1 - CONTRA.floor, CONTRA.near])).rows;
+  const groups = [...Map.groupBy(rows, (r) => r.n as string).values()];
+  let cut = Math.min(groups.length, o.max ?? CONTRA.facts);
+  while (cut > 0 && cut < groups.length && +groups[cut][0].ncreated === +groups[cut - 1][0].ncreated) cut++; // one dream batch = one created_at, and the watermark is a time
+  const upto = cut < groups.length ? new Date(groups[cut - 1][0].ncreated).toISOString() : o.to.toISOString();
+  const text = (body: unknown) => String(clip(String(body ?? '').replace(/^# [^\n]*\n/, '').split('\n\n- ')[0].trim(), CONTRA.chars)).replace(/\s*\n\s*/g, ' ');
+  const packs: Pair[][][] = [[]];
+  let size = 0;
+  for (const g of groups.slice(0, cut)) {
+    const len = g.reduce((a, r) => a + text(r.ebody).length + 40, text(g[0].nbody).length + 60);
+    if (size + len > BATCH_CHARS && packs.at(-1)!.length) { packs.push([]); size = 0; }
+    packs.at(-1)!.push(g);
+    size += len;
+  }
+  const pending: string[] = [], retired: Retired[] = [];
+  const answers = await Promise.all(packs.filter((p) => p.length).map(async (pack) => {
+    const eid = new Map<string, string>();
+    const lines = pack.map((g, i) => `N${i + 1} [${g[0].nkind}, ${projectName(g[0].project) || 'global'}, valid ${BKK(g[0].nvalid)}]: ${text(g[0].nbody)}\n` +
+      g.map((r) => `  ${eid.get(r.e) ?? eid.set(r.e, `E${eid.size + 1}`).get(r.e)} [${r.ekind}, valid ${BKK(r.evalid)}]: ${text(r.ebody)}`).join('\n'));
+    try {
+      return { pack, eid, raw: await o.llm({ id: `C-${sha(lines.join('\n'))}`, system: PROMPT('dream-contradict'), user: lines.join('\n\n'), schema: jsonSchema(SchemaC) }) };
+    } catch (e) {
+      if (!(e instanceof Pending)) throw e;
+      pending.push(e.message);
+      return null;
+    }
+  }));
+  if (pending.length) return { pending, retired };
+  const vault = MEMORY_VAULT.replace(/\\/g, '/'), gone = new Set<string>();
+  for (const a of answers) {
+    const fidOf = new Map([...a!.eid].map(([fid, id]) => [id, fid]));
+    for (const x of z.object({ ops: z.array(z.unknown()) }).safeParse(a!.raw).data?.ops ?? []) {
+      const r = SchemaC.shape.ops.element.safeParse(x);
+      if (!r.success) continue;
+      for (const id of r.data.stale) {
+        const row = a!.pack[Number(r.data.n.slice(1)) - 1]?.find((k) => k.e === fidOf.get(id)); // only an E listed under that N
+        if (!row || gone.has(row.e)) continue;
+        const res = writeNote(row.epath.replace(/\\/g, '/').slice(vault.length + 1), { status: 'superseded', superseded_by: row.n,
+          expired_at: now.toISOString(), invalid_at: new Date(row.nvalid).toISOString(), review_target: '' });
+        if (res !== 'written') continue; // he edited it since the index read it: his
+        gone.add(row.e);
+        retired.push({ n: row.n, e: row.e, why: r.data.why ?? '' });
+      }
+    }
+  }
+  if (retired.length) { await indexVault(db, MEMORY_VAULT); await resolveLinks(db); }
+  await db.query(`INSERT INTO state (k, v) VALUES ('dream:contra', jsonb_build_object('upto', $1::text)) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v`, [upto]);
+  return { pending, retired };
 }
 
 // ---------------- nightly consolidation (no LLM) ----------------

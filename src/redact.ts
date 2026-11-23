@@ -35,7 +35,7 @@ const RULES: Rule[] = [
   { kind: 'digitalocean', re: /\bdo[opr]_v1_[0-9a-f]{64}\b/g },
   { kind: 'ark', re: /\bark-(?=(?:[\w-]*\d){4})[0-9a-z-]{30,}/gi }, // BytePlus/Volcengine Ark keys (hex+dash: entropy rule skips them)
   { kind: 'ollama', re: /\b[0-9a-f]{32}\.[A-Za-z0-9_-]{16,}/g }, // Ollama cloud keys, Zhipu GLM / z.ai (16 after the dot)
-  { kind: 'sk', re: /\b(?:mcp_)?sk_[0-9a-f]{32,}\b/g }, // ElevenLabs sk_ + 48 hex, mcp_sk_ + 32 hex: pure hex, so entropy skips them
+  { kind: 'sk', re: /\b(?:mcp_)?sk_[0-9a-f]{32,}\b/gi }, // ElevenLabs sk_ + 48 hex, mcp_sk_ + 32 hex: pure hex, so entropy skips them (Sk_: a phone keyboard capitalised one)
   { kind: 'syn', re: /\bsyn_[0-9a-f]{32}\b/gi }, // syn_ + 32 hex: pure hex, so the entropy rule skips it (one reached the index)
   // natural language: password `x` / รหัสผ่าน "x" (quoted value, no = or :)
   { kind: 'kv', re: /(\b(?:password|passwd|pwd)\s+(?:is\s+)?|(?:รหัสผ่าน|พาสเวิร์ด)\s*(?:คือ\s*)?)[`'"]([^`'"\s]{3,})[`'"]/gi, group: 2 },
@@ -79,6 +79,19 @@ const RULES: Rule[] = [
 const PLACEHOLDER =
   /^(?:\*+|x{3,}|<.*>|\$.*|%.*%|\{.*|process\.env.*|os\.environ.*|getenv.*|env\..*|string|number|boolean|bool|str|int|null|none|nil|undefined|true|false|required|optional|any|empty|redacted.*|\[redacted.*|\[private\]|z\..*|type|text|varchar.*|\.\.\.)$/i;
 const PASSWORDISH = /pass|pwd|pin/i;
+
+// A public IPv4 locates ลุงจืด's servers, so the index masks it the way the vault does (notes.vaultSafe): x.x.x.x. Private,
+// loopback, link-local, CGNAT and documentation ranges, the public resolvers and impossible octets locate nothing and stay:
+// the allow list of the secret-scan hook. A sentence-ending dot still ends the address; a fifth part makes it a section number.
+export const IPV4 = /(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)/g;
+export const LOCAL_IP = /^(?:0|10|127|2(?:2[4-9]|[3-5]\d))\.|^(?:169\.254|192\.168|192\.0\.2|198\.51\.100|203\.0\.113)\.|^172\.(?:1[6-9]|2\d|3[01])\.|^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|^(?:1\.1\.1\.1|1\.0\.0\.1|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9)$|(?:^|\.)(?:25[6-9]|2[6-9]\d|[3-9]\d\d)(?:\.|$)/;
+/** Chats are full of four dotted numbers that are no host (a BC menu code, a version, a user agent): mask only what reads as one. */
+function isHost(ip: string, before: string, after: string): boolean {
+  if (LOCAL_IP.test(ip)) return false;
+  if (/(?:@|:\/\/)$/.test(before) || /^:\d{2,5}(?!\d)/.test(after)) return true; // a login, a URL, a port: a host whatever the numbers
+  if (/\.0\.0$/.test(ip) || /(?:version\W{0,3}|==)$/i.test(before) || /^-[a-z]/i.test(after)) return false; // browser version / network, "version: …", a pip pin, a kernel release
+  return ip.split('.').some((o) => Number(o) > 31); // all four ≤ 31: a menu code or a small version far more often than a host
+}
 
 // '/' excluded: paths/URLs are the main false positive; base64 secrets still leave ≥28-char pieces.
 // '=' only as trailing base64 padding, so KEY=value splits and each side is judged alone.
@@ -133,6 +146,9 @@ export function redact(input: string): RedactResult {
       return `${prefix}[REDACTED:${kind}]`;
     });
   }
+
+  text = text.replace(IPV4, (ip, off: number, all: string) =>
+    isHost(ip, all.slice(Math.max(0, off - 12), off), all.slice(off + ip.length, off + ip.length + 7)) ? (hit('ip'), 'x.x.x.x') : ip);
 
   text = text.replace(ENTROPY_CANDIDATE, (tok, off: number, all: string) =>
     looksSecret(tok) && !/^.[a-z]{1,5}/i.test(all.slice(off + tok.length)) ? (hit('entropy'), '[REDACTED:entropy]') : tok, // name.ext = file

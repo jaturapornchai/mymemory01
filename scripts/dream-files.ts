@@ -2,7 +2,7 @@
 //   node scripts/dream-files.ts unpack <x.request.json>            → x.system.md, x.user.txt, x.schema.json next to it
 //   node scripts/dream-files.ts answer <x.request.json> <ans.json> → validate (schema + ids) and write x.result.json
 import { readFileSync, writeFileSync } from 'node:fs';
-import { SchemaA, SchemaB } from '../src/dream.ts';
+import { SchemaA, SchemaB, SchemaC } from '../src/dream.ts';
 
 const [cmd, reqPath, ansPath] = process.argv.slice(2);
 const req = JSON.parse(readFileSync(reqPath, 'utf8'));
@@ -15,7 +15,7 @@ if (cmd === 'unpack') {
 } else if (cmd === 'answer') {
   const ans = JSON.parse(readFileSync(ansPath, 'utf8'));
   const isA = req.id.startsWith('A-');
-  const r = (isA ? SchemaA : SchemaB).safeParse(ans);
+  const r = (isA ? SchemaA : req.id.startsWith('C-') ? SchemaC : SchemaB).safeParse(ans);
   if (!r.success) { console.error('SCHEMA ERRORS:\n' + JSON.stringify(r.error.issues.slice(0, 15), null, 1)); process.exit(1); }
   const ctrl: string[] = []; // "D:\books" in JSON is D: + backspace + "ooks": the backslash must be written \\
   JSON.stringify(ans, (_k, v) => { if (typeof v === 'string' && /[\x00-\x09\x0b-\x1f]/.test(v)) ctrl.push(JSON.stringify(v).slice(0, 80)); return v; });

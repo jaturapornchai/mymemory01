@@ -33,7 +33,8 @@ cd /d/memoryhub && node --no-warnings src/cli.ts dream --runner files 2>&1 | tee
 
 The JSON line `{"run": …, "status": …, "stats": …}` decides the next step:
 
-- `skipped` (fewer than 5 finished chats waiting), `done` or `locked`: report it in one line and stop.
+- `skipped` (fewer than 5 finished chats waiting), `done` or `locked`: nothing (more) to dream. On the first plan of
+  tonight report it in one line and stop; on a later plan (step 4 sent you back here) go to step 5.
 - `pending`: keep the `run` value as RUN. The lines under `pending requests` are the request files, all in
   `tmp/dream/RUN/`. Go to step 3.
 - an error instead of JSON: report its first line and stop.
@@ -97,15 +98,19 @@ cd /d/memoryhub && node --no-warnings src/cli.ts dream --runner files --run RUN 
 ```
 
 - `pending` again: back to step 3. The first round asks one request per batch (ids `A-…`); after that each batch
-  asks one more (ids `B-…`), one round at a time.
-- `done`: go to step 5.
+  asks one more (ids `B-…`), one round at a time. When every batch is done the plan may ask one last round
+  (ids `C-…`): his newer facts against older notes an AI wrote. Answer it the same way.
+- `done`: one plan is finished, but a plan takes at most 40 chats (newest first) and more may be waiting. Go back to
+  step 2 and start the next plan: the same command, the run id stays the same. Go to step 5 instead when
+  `date +%H%M` is between `0245` and `0445` (the 03:30 nightly takes the rest), or after 5 plans tonight (200 chats;
+  the rest waits for the nightly or tomorrow).
 - `skipped`: another run (the 03:30 nightly) finished meanwhile and took the chats, so this run has nothing left.
   Go to step 5 and say so.
 - `locked`: another dream is running right now. Report it and stop; do not retry.
 - A line `vault history: secret-scan hook blocked …` next to the JSON line is not an error of the run: the notes are
   written and indexed, the vault's own git history left those files out. The status still decides; quote that line
   in the report.
-- More than 40 rounds, or the same request id pending twice after an `ok`: stop and report.
+- More than 40 rounds in one plan, or the same request id pending twice after an `ok`: stop and report.
 
 ## 5. Clean up and report
 
@@ -115,5 +120,5 @@ The request files hold chat text and nothing else removes them. Drop the run fol
 cd /d/memoryhub && find tmp/dream -mindepth 1 -maxdepth 1 -type d -name '*-files' -mtime +7 -exec rm -rf {} +
 ```
 
-Then one or two Thai lines: the run id, how many chats (`stats.sessions`), and ADD / UPDATE / SUPERSEDE / NOOP from
-`stats`.
+Then one or two Thai lines: the run id, how many chats (`stats.sessions`), and ADD / UPDATE / SUPERSEDE / NOOP / RETIRE from
+`stats`. With more than one plan tonight, say how many plans and add up the numbers of every `done` line.

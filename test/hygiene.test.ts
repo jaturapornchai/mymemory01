@@ -226,3 +226,19 @@ test('requeueUnredacted: a row stored before a new redact rule is re-queued once
   const t = (await db.query('SELECT text_redacted FROM turns WHERE session_id = $1', [C])).rows[0].text_redacted;
   assert.ok(!t.includes(pw) && t.includes('[REDACTED:kv]'), t);
 });
+
+test('requeueUnredacted: text with no raw file behind it (code chunks, the search log) is rewritten where it stands', async () => {
+  const ip = [45, 76, 12, 200].join('.'); // built at runtime: a literal public IP would trip the secret-scan hook on this repo's commit
+  await db.query(`INSERT INTO code_chunks (blob, line0, text, words) VALUES ('b10b', 1, $1, 'stale'::tsvector), ('b10b', 40, 'const port = 8080;', 'port'::tsvector)`,
+    [`const HOST = 'root@${ip}';`]);
+  await db.query(`INSERT INTO access_log (kind, chunk_id, query) VALUES ('search', 'c1', $1), ('search', 'c2', 'deploy ยังไง'), ('get', 'c3', NULL)`, [`ssh ${ip} ไม่ได้`]);
+  await db.query("DELETE FROM state WHERE k = 'redact'");
+  await requeueUnredacted(db);
+  const code = (await db.query(`SELECT text, words::text w FROM code_chunks WHERE blob = 'b10b' ORDER BY line0`)).rows;
+  assert.deepEqual(code.map((r) => r.text), ["const HOST = 'root@x.x.x.x';", 'const port = 8080;']);
+  assert.ok(code[0].w.includes('host') && !code[0].w.includes('stale'), code[0].w); // search words follow the new text
+  assert.equal(code[1].w, "'port'", 'a clean row is not written');
+  assert.deepEqual((await db.query(`SELECT query FROM access_log WHERE chunk_id IN ('c1', 'c2', 'c3') ORDER BY chunk_id`)).rows.map((r) => r.query),
+    ['ssh x.x.x.x ไม่ได้', 'deploy ยังไง', null]);
+  assert.equal((await db.query(`SELECT v->>'rewritten' n FROM state WHERE k = 'redact'`)).rows[0].n, '2');
+});

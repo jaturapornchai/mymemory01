@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { clean } from './importer.ts';
+import { IPV4, LOCAL_IP } from './redact.ts';
 import { beforeMachineWrite, commitBatch } from './vault-git.ts';
 
 export const MEMORY_VAULT = process.env.MEMHUB_MEMORY_VAULT ?? 'D:/obsidian-vault/memory-hub';
@@ -19,16 +20,14 @@ export const noteUuid = (path: string) => 'obs:' + createHash('sha256').update(p
 
 // The vault's git runs ลุงจืด's global secret-scan hook (~/.githooks/secret-scan.pl): a public IP, a real email or a URI with a
 // password in a note blocks its commit for good. So machine notes (body, frontmatter, file name) mask exactly those shapes, with
-// the hook's own allow lists; the session archive keeps the originals (memory_search still finds them in the chats).
-const IP = /(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])/g;
-const OK_IP = /^(?:0|10|127|2(?:2[4-9]|[3-5]\d))\.|^(?:169\.254|192\.168|192\.0\.2|198\.51\.100|203\.0\.113)\.|^172\.(?:1[6-9]|2\d|3[01])\.|^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|^(?:1\.1\.1\.1|1\.0\.0\.1|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9)$|(?:^|\.)(?:25[6-9]|2[6-9]\d|[3-9]\d\d)(?:\.|$)/;
+// the hook's own allow lists. Wider than redact(): the hook reads any four dotted numbers as an IP, a menu code too (redact.IPV4).
 const EMAIL = /\b[A-Za-z0-9._%+-]+(@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b/g;
 const OK_EMAIL = /^(?:no-?reply|git)@|@(?:[\w.-]+\.)?(?:example\.(?:com|org|net)|users\.noreply\.github\.com)$|\.(?:example|test|invalid|localhost|local|png|jpe?g|gif|svg|webp|ico|js|mjs|ts|tsx|css|json|md|html?)$|^(?:x{6,}|your|example|changeme|placeholder|dummy|fake|sample|test|redacted)/i;
 const URI_PW = /\b((?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb|rediss?|amqps?|mssql|sqlserver|clickhouse|ftp|smtps?):\/\/[^/\s:@'"`]+):[^@\s'"`/]{3,}@/gi;
 /** Public IP → x.x.x.x, email → ***@its-domain, URI password (even a redacted one) dropped. */
 export const vaultSafe = (s: string) => s.replace(URI_PW, '$1@')
   .replace(EMAIL, (e, at) => (OK_EMAIL.test(e) ? e : `***${at}`))
-  .replace(IP, (ip) => (OK_IP.test(ip) ? ip : 'x.x.x.x'));
+  .replace(IPV4, (ip) => (LOCAL_IP.test(ip) ? ip : 'x.x.x.x'));
 
 /** Obsidian-safe file name (Thai kept); trailing .md stripped so adding .md never makes .md.md. */
 export const fileName = (s: string, max = 80) =>
